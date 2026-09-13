@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
-
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -30,14 +29,21 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linkvault.app.auth.AccountClient
+import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxRepository
+import com.linkvault.app.storage.OutboxState
+import java.text.DateFormat
+import java.util.Date
 
 @Composable
 fun LibraryScreen(
     client: AccountClient,
+    outbox: OutboxRepository,
     entryId: String,
     initialUrl: String?,
     sharedText: String,
@@ -49,8 +55,8 @@ fun LibraryScreen(
     val viewModelKey = remember(client, ownerId, entryId) {
         "library:${System.identityHashCode(client)}:${ownerId ?: "signed-out"}:$entryId"
     }
-    val factory = remember(client, ownerId, initialUrl, sharedText) {
-        LibraryViewModel.factory(client, ownerId, initialUrl, sharedText)
+    val factory = remember(client, outbox, ownerId, initialUrl, sharedText) {
+        LibraryViewModel.factory(client, outbox, ownerId, initialUrl, sharedText)
     }
     val libraryViewModel: LibraryViewModel = viewModel(
         key = viewModelKey,
@@ -60,6 +66,9 @@ fun LibraryScreen(
 
     LaunchedEffect(libraryViewModel, initialUrl, sharedText) {
         libraryViewModel.updateSharedInput(initialUrl, sharedText)
+    }
+    LaunchedEffect(libraryViewModel, state.receiptsAwaitingAcknowledgement) {
+        libraryViewModel.acknowledgeSavedReceipts(state.receiptsAwaitingAcknowledgement)
     }
 
     Column(
@@ -110,12 +119,12 @@ fun LibraryScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 Text(
-                    text = "M1 보관함은 온라인 전용이에요.",
+                    text = "저장 요청은 먼저 이 기기에 안전하게 보관돼요.",
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
                 Text(
-                    text = "자동 메타데이터 수집과 분류는 이후 단계에서 연결됩니다.",
+                    text = "연결되면 로그인한 내 계정의 서버 보관함으로 전송합니다.",
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
             }
@@ -129,6 +138,18 @@ fun LibraryScreen(
             )
 
             LibraryAvailability.Ready -> {
+                if (state.outboxEntries.isNotEmpty()) {
+                    OutboxContent(
+                        entries = state.outboxEntries,
+                        edit = state.edit,
+                        onRetry = libraryViewModel::retryOperation,
+                        onDiscard = libraryViewModel::discardOperation,
+                        onReconfirmSave = libraryViewModel::reconfirmExpiredSave,
+                        onLoadLatest = libraryViewModel::loadLatestForEdit,
+                    )
+                    HorizontalDivider()
+                }
+
                 when (val detail = state.detail) {
                     LibraryDetailState.None -> {
                         if (initialUrl != null) {
@@ -142,6 +163,7 @@ fun LibraryScreen(
                                     onSave = libraryViewModel::save,
                                     onRetrySave = libraryViewModel::retrySave,
                                     onEditAfterFailure = libraryViewModel::editAfterSaveFailure,
+                                    onReconfirmSave = libraryViewModel::reconfirmExpiredSave,
                                 )
                                 HorizontalDivider()
                             } else {
@@ -168,9 +190,17 @@ fun LibraryScreen(
                     )
 
                     is LibraryDetailState.Loaded -> DetailContent(
-                        item = detail.item,
+                        detail = detail,
+                        edit = state.edit,
                         onBackToList = libraryViewModel::closeDetail,
                         onOpenOriginal = onOpenOriginal,
+                        onBeginEdit = libraryViewModel::beginEdit,
+                        onEditTitleChange = libraryViewModel::updateEditTitle,
+                        onEditNoteChange = libraryViewModel::updateEditNote,
+                        onSaveEdit = libraryViewModel::saveEdit,
+                        onCancelEdit = libraryViewModel::cancelEdit,
+                        onLoadLatest = libraryViewModel::loadLatestForEdit,
+                        onConfirmAgain = libraryViewModel::confirmEditAgain,
                     )
                 }
             }
@@ -208,6 +238,7 @@ private fun SaveFormContent(
     onSave: () -> Unit,
     onRetrySave: () -> Unit,
     onEditAfterFailure: () -> Unit,
+    onReconfirmSave: (String) -> Unit,
 ) {
     val form = state.form
     val validationIssues = remember(form) { validateLibrarySaveForm(form) }
@@ -217,8 +248,9 @@ private fun SaveFormContent(
         is LibrarySaveStatus.Invalid,
         -> true
 
-        is LibrarySaveStatus.Failed -> !saveStatus.canRetrySameRequest
+        is LibrarySaveStatus.Failed -> saveStatus.requestId == null
         LibrarySaveStatus.Saving,
+        is LibrarySaveStatus.Queued,
         is LibrarySaveStatus.Saved,
         -> false
     }
@@ -229,7 +261,7 @@ private fun SaveFormContent(
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
         )
-        Text("아래 원문 URL을 실제 서버에 보관합니다. 버튼을 눌러 확인해 주세요.")
+        Text("저장 요청을 이 기기에 먼저 보관한 뒤 서버로 안전하게 전송합니다.")
         SelectionContainer {
             Text(
                 text = form.initialUrl.orEmpty(),
@@ -284,24 +316,41 @@ private fun SaveFormContent(
 
         when (saveStatus) {
             LibrarySaveStatus.Idle -> Unit
-            LibrarySaveStatus.Saving -> LoadingMessage("서버에 보관하고 있어요.")
+            LibrarySaveStatus.Saving -> LoadingMessage("저장 요청을 이 기기에 보관하고 있어요.")
+            is LibrarySaveStatus.Queued -> Text(
+                text = "저장 요청을 이 기기에 보관했어요. 연결되면 서버에 전송합니다.",
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+            )
+
             is LibrarySaveStatus.Invalid -> Unit
             is LibrarySaveStatus.Failed -> {
                 Text(saveStatus.message, color = MaterialTheme.colorScheme.error)
-                if (saveStatus.canRetrySameRequest) {
-                    Text("응답이 확실하지 않아 요청 ID와 내용을 그대로 보관했습니다.")
-                    Button(
-                        onClick = onRetrySave,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("같은 요청 다시 시도")
+                when {
+                    saveStatus.needsReconfirmation && saveStatus.requestId != null -> {
+                        Button(
+                            onClick = { onReconfirmSave(saveStatus.requestId) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("저장을 다시 확인")
+                        }
                     }
-                    OutlinedButton(
-                        onClick = onEditAfterFailure,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("입력 수정")
+
+                    saveStatus.canRetrySameRequest -> {
+                        Text("같은 요청 ID와 저장 내용을 그대로 다시 전송합니다.")
+                        Button(
+                            onClick = onRetrySave,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("같은 요청 다시 시도")
+                        }
                     }
+                }
+                OutlinedButton(
+                    onClick = onEditAfterFailure,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("입력 수정")
                 }
             }
 
@@ -319,8 +368,9 @@ private fun SaveFormContent(
             }
         }
 
-        val showSaveButton = saveStatus !is LibrarySaveStatus.Saved &&
-            !(saveStatus is LibrarySaveStatus.Failed && saveStatus.canRetrySameRequest)
+        val showSaveButton = saveStatus is LibrarySaveStatus.Idle ||
+            saveStatus is LibrarySaveStatus.Invalid ||
+            (saveStatus is LibrarySaveStatus.Failed && saveStatus.requestId == null)
         if (showSaveButton) {
             Button(
                 onClick = onSave,
@@ -328,6 +378,123 @@ private fun SaveFormContent(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("서버에 보관")
+            }
+        }
+    }
+}
+
+@Composable
+private fun OutboxContent(
+    entries: List<OutboxEntry>,
+    edit: LibraryEditUiState?,
+    onRetry: (String) -> Unit,
+    onDiscard: (String) -> Unit,
+    onReconfirmSave: (String) -> Unit,
+    onLoadLatest: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(
+            text = "이 기기의 저장 요청",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+        )
+        entries.forEach { entry ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = if (entry.method == "PATCH") "제목·메모 수정" else "새 링크 보관",
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(entry.state.queueMessage())
+                    entry.errorMessage?.takeUnless(String::isBlank)?.let { message ->
+                        if (entry.state == OutboxState.FAILED) {
+                            Text(message, color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    when (entry.state) {
+                        OutboxState.FAILED -> {
+                            Button(
+                                onClick = { onRetry(entry.requestId) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("다시 시도")
+                            }
+                            OutlinedButton(
+                                onClick = { onDiscard(entry.requestId) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("요청 버리기")
+                            }
+                        }
+
+                        OutboxState.CONFLICT -> {
+                            if (entry.method == "PATCH" &&
+                                edit?.status?.requestIdForScreen() == entry.requestId
+                            ) {
+                                Button(
+                                    onClick = onLoadLatest,
+                                    enabled = edit.status !is LibraryEditStatus.LoadingLatest,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("최신 내용 확인")
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { onDiscard(entry.requestId) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("요청 버리기")
+                            }
+                        }
+
+                        OutboxState.EXPIRED -> {
+                            if (entry.method == "POST") {
+                                Button(
+                                    onClick = { onReconfirmSave(entry.requestId) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("저장을 다시 확인")
+                                }
+                            } else if (edit?.status?.requestIdForScreen() == entry.requestId) {
+                                Button(
+                                    onClick = onLoadLatest,
+                                    enabled = edit.status !is LibraryEditStatus.LoadingLatest,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("최신 내용 확인")
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { onDiscard(entry.requestId) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("요청 버리기")
+                            }
+                        }
+
+                        OutboxState.PENDING,
+                        OutboxState.RETRY,
+                        OutboxState.WAITING_LOGIN,
+                        -> OutlinedButton(
+                            onClick = { onDiscard(entry.requestId) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("요청 버리기")
+                        }
+
+                        OutboxState.RUNNING,
+                        OutboxState.SAVED,
+                        -> Unit
+                    }
+                }
             }
         }
     }
@@ -348,13 +515,28 @@ private fun LibraryListContent(
             fontWeight = FontWeight.Bold,
         )
 
+        if (state.isShowingCache) {
+            val timestamp = state.cacheFetchedAt?.let(::formatCachedAt) ?: "동기화 시각 확인 불가"
+            Text(
+                text = "이 기기의 마지막 동기화 자료 · $timestamp",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+
         if (state.isListLoading && state.items.isEmpty()) {
             LoadingMessage("서버에서 보관함을 불러오고 있어요.")
         } else if (state.listError != null && state.items.isEmpty()) {
             ListFailure(message = state.listError, onRetry = onRetry)
         } else {
             if (state.items.isEmpty()) {
-                Text("서버에 보관된 링크가 아직 없어요.")
+                Text(
+                    if (state.isShowingCache) {
+                        "이 기기에 동기화된 링크가 아직 없어요."
+                    } else {
+                        "서버에 보관된 링크가 아직 없어요."
+                    },
+                )
             } else {
                 state.items.forEach { item ->
                     LibraryItemCard(
@@ -370,8 +552,14 @@ private fun LibraryListContent(
             }
 
             if (state.isListLoading && state.items.isNotEmpty()) {
-                LoadingMessage("다음 링크를 불러오고 있어요.")
-            } else if (state.hasMore && state.listError == null) {
+                LoadingMessage(
+                    if (state.isShowingCache) {
+                        "서버의 최신 보관함을 확인하고 있어요."
+                    } else {
+                        "다음 링크를 불러오고 있어요."
+                    },
+                )
+            } else if (!state.isShowingCache && state.hasMore && state.listError == null) {
                 OutlinedButton(
                     onClick = onLoadMore,
                     modifier = Modifier.fillMaxWidth(),
@@ -432,7 +620,9 @@ private fun LibraryItemCard(
                 }
                 OutlinedButton(
                     onClick = { onOpenDetail(item.id) },
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("detail-${item.id}"),
                 ) {
                     Text("상세")
                 }
@@ -489,13 +679,29 @@ private fun DetailFailureContent(
 
 @Composable
 private fun DetailContent(
-    item: LibraryItemDetail,
+    detail: LibraryDetailState.Loaded,
+    edit: LibraryEditUiState?,
     onBackToList: () -> Unit,
     onOpenOriginal: (String) -> Unit,
+    onBeginEdit: () -> Unit,
+    onEditTitleChange: (String) -> Unit,
+    onEditNoteChange: (String) -> Unit,
+    onSaveEdit: () -> Unit,
+    onCancelEdit: () -> Unit,
+    onLoadLatest: () -> Unit,
+    onConfirmAgain: () -> Unit,
 ) {
+    val item = detail.item
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         TextButton(onClick = onBackToList) {
             Text("보관함 목록")
+        }
+        if (detail.isCached) {
+            Text(
+                text = "이 기기의 마지막 동기화 자료 · ${detail.fetchedAt?.let(::formatCachedAt) ?: "동기화 시각 확인 불가"}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
         SelectionContainer {
             Text(
@@ -510,6 +716,33 @@ private fun DetailContent(
         DetailValue("설명", item.description)
         DetailValue("공유 텍스트", item.sharedText)
         DetailValue("본문", item.bodyText)
+
+        if (edit == null) {
+            Button(
+                onClick = onBeginEdit,
+                enabled = item.version != null,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("제목·메모 수정")
+            }
+            if (item.version == null) {
+                Text(
+                    text = "수정하려면 서버 버전이 포함된 최신 상세 정보가 필요해요.",
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        } else {
+            EditContent(
+                edit = edit,
+                onTitleChange = onEditTitleChange,
+                onNoteChange = onEditNoteChange,
+                onSave = onSaveEdit,
+                onCancel = onCancelEdit,
+                onLoadLatest = onLoadLatest,
+                onConfirmAgain = onConfirmAgain,
+            )
+        }
+
         Text(
             text = "서버 처리 상태",
             style = MaterialTheme.typography.titleMedium,
@@ -537,6 +770,190 @@ private fun DetailContent(
 }
 
 @Composable
+private fun EditContent(
+    edit: LibraryEditUiState,
+    onTitleChange: (String) -> Unit,
+    onNoteChange: (String) -> Unit,
+    onSave: () -> Unit,
+    onCancel: () -> Unit,
+    onLoadLatest: () -> Unit,
+    onConfirmAgain: () -> Unit,
+) {
+    val issues = remember(edit.form) { validateLibraryEditForm(edit.form) }
+    val canEdit = edit.status is LibraryEditStatus.Idle ||
+        edit.status is LibraryEditStatus.Invalid ||
+        (edit.status is LibraryEditStatus.Failed && edit.status.requestId == null)
+
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "제목·메모 수정",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            OutlinedTextField(
+                value = edit.form.title,
+                onValueChange = onTitleChange,
+                enabled = canEdit,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("제목") },
+                supportingText = {
+                    Text("${edit.form.title.codePointLength()} / $LIBRARY_TITLE_MAX_CODE_POINTS · 비우면 삭제")
+                },
+                isError = issues.any { it.field == LibraryFormField.TITLE },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                value = edit.form.note,
+                onValueChange = onNoteChange,
+                enabled = canEdit,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("나중에 찾을 메모") },
+                supportingText = {
+                    Text("${edit.form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS · 비우면 삭제")
+                },
+                isError = issues.any { it.field == LibraryFormField.NOTE },
+                minLines = 3,
+                maxLines = 7,
+            )
+            issues.forEach { issue ->
+                Text(issue.message, color = MaterialTheme.colorScheme.error)
+            }
+
+            when (val status = edit.status) {
+                LibraryEditStatus.Idle -> Unit
+                LibraryEditStatus.Queuing -> LoadingMessage("수정 요청을 이 기기에 보관하고 있어요.")
+                is LibraryEditStatus.Invalid -> status.issues.forEach { issue ->
+                    if (issue !in issues) Text(issue.message, color = MaterialTheme.colorScheme.error)
+                }
+
+                is LibraryEditStatus.Queued -> Text(
+                    text = "수정 요청을 이 기기에 보관했어요. 연결되면 서버에 전송합니다.",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+
+                is LibraryEditStatus.Failed -> Text(
+                    text = status.message,
+                    color = MaterialTheme.colorScheme.error,
+                )
+
+                is LibraryEditStatus.Blocked -> {
+                    Text(
+                        text = if (status.reason == LibraryEditBlockReason.VERSION_CONFLICT) {
+                            "변경 충돌"
+                        } else {
+                            "수정 요청 만료"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        if (status.reason == LibraryEditBlockReason.VERSION_CONFLICT) {
+                            "다른 변경이 먼저 저장됐어요. 자동으로 덮어쓰지 않습니다."
+                        } else {
+                            "수정 요청이 24시간을 지나 만료됐어요. 최신 내용을 먼저 확인해야 합니다."
+                        },
+                    )
+                    DraftComparison(edit.form, latest = null)
+                    Button(
+                        onClick = onLoadLatest,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("최신 내용 확인")
+                    }
+                }
+
+                is LibraryEditStatus.LoadingLatest -> {
+                    DraftComparison(edit.form, latest = null)
+                    LoadingMessage("서버의 최신 내용을 불러오고 있어요.")
+                }
+
+                is LibraryEditStatus.ReadyToConfirm -> {
+                    Text(
+                        text = if (status.reason == LibraryEditBlockReason.VERSION_CONFLICT) {
+                            "변경 충돌 비교"
+                        } else {
+                            "만료된 요청 다시 확인"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    DraftComparison(edit.form, status.latest)
+                    Text("아래 버튼을 눌러야 새 요청 ID와 최신 버전으로 저장합니다.")
+                    Button(
+                        onClick = onConfirmAgain,
+                        enabled = issues.isEmpty(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("다시 저장")
+                    }
+                }
+
+                is LibraryEditStatus.Saved -> {
+                    Text(
+                        text = status.message,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    OutlinedButton(
+                        onClick = onCancel,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("수정 닫기")
+                    }
+                }
+            }
+
+            edit.latestError?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+
+            if (canEdit) {
+                Button(
+                    onClick = onSave,
+                    enabled = issues.isEmpty(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("수정 요청 보관")
+                }
+                OutlinedButton(
+                    onClick = onCancel,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("수정 취소")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DraftComparison(form: LibraryEditForm, latest: LibraryItemDetail?) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("내가 저장하려던 제목", fontWeight = FontWeight.SemiBold)
+        SelectionContainer { Text(form.title.ifEmpty { "삭제" }) }
+        Text("내가 저장하려던 메모", fontWeight = FontWeight.SemiBold)
+        SelectionContainer { Text(form.note.ifEmpty { "삭제" }) }
+        if (latest != null) {
+            HorizontalDivider()
+            Text("서버의 최신 제목", fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(latest.userTitle?.takeUnless(String::isEmpty) ?: "없음") }
+            Text("서버의 최신 메모", fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(latest.note?.takeUnless(String::isEmpty) ?: "없음") }
+        }
+    }
+}
+
+@Composable
 private fun DetailValue(label: String, value: String?) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(label, fontWeight = FontWeight.SemiBold)
@@ -556,3 +973,30 @@ private fun LoadingMessage(message: String) {
         Text(message)
     }
 }
+
+private fun OutboxState.queueMessage(): String = when (this) {
+    OutboxState.PENDING -> "전송 대기 중"
+    OutboxState.RUNNING -> "서버에 전송 중"
+    OutboxState.RETRY -> "연결되면 다시 전송"
+    OutboxState.WAITING_LOGIN -> "로그인 후 전송"
+    OutboxState.FAILED -> "서버 저장 실패"
+    OutboxState.CONFLICT -> "변경 충돌"
+    OutboxState.EXPIRED -> "요청 만료 · 다시 확인 필요"
+    OutboxState.SAVED -> "서버 저장 완료"
+}
+
+private fun LibraryEditStatus.requestIdForScreen(): String? = when (this) {
+    is LibraryEditStatus.Queued -> requestId
+    is LibraryEditStatus.Failed -> requestId
+    is LibraryEditStatus.Blocked -> requestId
+    is LibraryEditStatus.LoadingLatest -> requestId
+    is LibraryEditStatus.ReadyToConfirm -> requestId
+    LibraryEditStatus.Idle,
+    LibraryEditStatus.Queuing,
+    is LibraryEditStatus.Invalid,
+    is LibraryEditStatus.Saved,
+    -> null
+}
+
+private fun formatCachedAt(timestamp: Long): String =
+    DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))

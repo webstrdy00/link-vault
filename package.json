@@ -7,7 +7,8 @@
     "test:db": "supabase test db",
     "test:api": "deno test --config supabase/functions/library-api/deno.json supabase/functions/library-api/handler_test.ts",
     "test:integration": "node scripts/member-integration.mjs",
-    "test:emulator-integration": "node scripts/emulator-integration.mjs"
+    "test:emulator-integration": "node scripts/emulator-integration.mjs",
+    "test:offline-integration": "node scripts/offline-integration.mjs"
   },
   "devDependencies": {
     "deno": "2.9.6",

@@ -1,8 +1,13 @@
 import {
   InvalidItemUrlError,
+  type ItemCategoryReference,
   type ItemPreparationInput,
+  type ItemUpdateInput,
+  type ItemUpdateSnapshot,
   type PreparedItem,
+  type PreparedItemUpdate,
   prepareItem,
+  prepareItemUpdate,
 } from "./item-preparation.ts";
 
 const MAX_BOOTSTRAP_BODY_BYTES = 8 * 1024;
@@ -42,6 +47,19 @@ export interface CreateItemCall {
   prepared: PreparedItem;
 }
 
+export interface CategoryLookupCall {
+  ownerId: string;
+  categoryIds: string[];
+}
+
+export interface UpdateItemCall {
+  ownerId: string;
+  itemId: string;
+  requestId: string;
+  body: ItemUpdateInput;
+  prepared: PreparedItemUpdate | null;
+}
+
 export interface RpcFailure {
   code?: string;
   message?: string;
@@ -56,6 +74,8 @@ export interface MemberGateway {
   verifyUser(accessToken: string): Promise<AuthVerification>;
   rpc(call: RpcCall): Promise<RpcResult>;
   createItem(call: CreateItemCall): Promise<RpcResult>;
+  lookupCategories(call: CategoryLookupCall): Promise<RpcResult>;
+  updateItem(call: UpdateItemCall): Promise<RpcResult>;
 }
 
 type Route =
@@ -217,18 +237,80 @@ export function createHandler(
           "Item id must be a UUID.",
         );
       }
-      const rpcResult = await callCallerRpc(gateway, {
+      if (method === "GET") {
+        const rpcResult = await callCallerRpc(gateway, {
+          authorization,
+          functionName: "library_get_item",
+          args: { p_item_id: route.itemId },
+        });
+        if (rpcResult.error !== null) {
+          throw mapRpcFailure(rpcResult.error);
+        }
+        if (!isObject(rpcResult.data)) {
+          throw dependencyUnavailableError();
+        }
+        return jsonResponse(rpcResult.data, 200, requestId);
+      }
+
+      requireValidRequestId(hasValidIncomingRequestId);
+      const rawBody = await readJson(request, MAX_ITEM_BODY_BYTES);
+      const body = validateItemUpdateBody(rawBody);
+      const snapshotResult = await callCallerRpc(gateway, {
         authorization,
         functionName: "library_get_item",
         args: { p_item_id: route.itemId },
       });
-      if (rpcResult.error !== null) {
-        throw mapRpcFailure(rpcResult.error);
+      let prepared: PreparedItemUpdate | null = null;
+      if (snapshotResult.error !== null) {
+        if (!isRpcGuard(snapshotResult.error, "ITEM_NOT_FOUND")) {
+          throw mapRpcFailure(snapshotResult.error);
+        }
+      } else {
+        if (!isItemUpdateSnapshot(snapshotResult.data)) {
+          throw dependencyUnavailableError();
+        }
+        const selectedCategories = await categoriesForUpdate(
+          gateway,
+          verification.userId,
+          snapshotResult.data,
+          body,
+        );
+        try {
+          prepared = await prepareItemUpdate(
+            snapshotResult.data,
+            body,
+            selectedCategories,
+          );
+        } catch {
+          throw dependencyUnavailableError();
+        }
       }
-      if (!isObject(rpcResult.data)) {
+
+      let updateResult: RpcResult;
+      try {
+        updateResult = await gateway.updateItem({
+          ownerId: verification.userId,
+          itemId: route.itemId,
+          requestId: incomingRequestId!,
+          body,
+          prepared,
+        });
+      } catch {
         throw dependencyUnavailableError();
       }
-      return jsonResponse(rpcResult.data, 200, requestId);
+      if (updateResult.error !== null) {
+        throw mapRpcFailure(updateResult.error);
+      }
+      if (isVersionConflictUpdateResult(updateResult.data)) {
+        throw mapRpcFailure({
+          code: "P0001",
+          message: updateResult.data.error_code,
+        });
+      }
+      if (!isUpdateResult(updateResult.data)) {
+        throw dependencyUnavailableError();
+      }
+      return jsonResponse(updateResult.data.item, 200, requestId);
     } catch (error) {
       const apiError = error instanceof ApiError
         ? error
@@ -268,8 +350,9 @@ function methodsFor(route: Route): string[] {
   switch (route.kind) {
     case "health":
     case "me":
-    case "itemDetail":
       return ["GET"];
+    case "itemDetail":
+      return ["GET", "PATCH"];
     case "bootstrap":
       return ["POST"];
     case "items":
@@ -388,29 +471,45 @@ function validateItemBody(value: unknown): ItemPreparationInput {
   validateOptionalString(value, "shared_text", MAX_TEXT_CHARACTERS);
   validateOptionalString(value, "note", MAX_TEXT_CHARACTERS);
 
-  if (Object.hasOwn(value, "category_ids")) {
-    if (!Array.isArray(value.category_ids)) {
-      throw invalidItemBodyError("category_ids must be an array.");
-    }
-    if (value.category_ids.length > MAX_CATEGORY_IDS) {
-      throw invalidItemBodyError(
-        `category_ids must contain at most ${MAX_CATEGORY_IDS} values.`,
-      );
-    }
-    const seen = new Set<string>();
-    for (const categoryId of value.category_ids) {
-      if (typeof categoryId !== "string" || !isUuid(categoryId)) {
-        throw invalidItemBodyError("category_ids must contain only UUIDs.");
-      }
-      const comparableId = categoryId.toLowerCase();
-      if (seen.has(comparableId)) {
-        throw invalidItemBodyError("category_ids must not contain duplicates.");
-      }
-      seen.add(comparableId);
-    }
-  }
+  validateCategoryIds(value);
 
   return value as unknown as ItemPreparationInput;
+}
+
+function validateItemUpdateBody(value: unknown): ItemUpdateInput {
+  if (!isObject(value)) {
+    throw invalidItemBodyError("Request body must be a JSON object.");
+  }
+  const allowedKeys = new Set([
+    "expected_version",
+    "title",
+    "note",
+    "category_ids",
+  ]);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) {
+    throw invalidItemBodyError("Request body contains an unknown field.");
+  }
+  if (
+    !Number.isInteger(value.expected_version) ||
+    (value.expected_version as number) < 1 ||
+    (value.expected_version as number) > MAX_POSTGRES_INTEGER
+  ) {
+    throw invalidItemBodyError("expected_version must be a positive integer.");
+  }
+  if (
+    !Object.hasOwn(value, "title") &&
+    !Object.hasOwn(value, "note") &&
+    !Object.hasOwn(value, "category_ids")
+  ) {
+    throw invalidItemBodyError(
+      "At least one of title, note, or category_ids is required.",
+    );
+  }
+
+  validateOptionalNullableString(value, "title", MAX_TITLE_CHARACTERS);
+  validateOptionalNullableString(value, "note", MAX_TEXT_CHARACTERS);
+  validateCategoryIds(value);
+  return value as unknown as ItemUpdateInput;
 }
 
 function validateOptionalString(
@@ -430,6 +529,109 @@ function validateOptionalString(
       `${field} must be a string of at most ${maxCharacters} characters.`,
     );
   }
+}
+
+function validateOptionalNullableString(
+  value: Record<string, unknown>,
+  field: "title" | "note",
+  maxCharacters: number,
+): void {
+  if (!Object.hasOwn(value, field) || value[field] === null) {
+    return;
+  }
+  const fieldValue = value[field];
+  if (
+    typeof fieldValue !== "string" ||
+    codePointLength(fieldValue) > maxCharacters
+  ) {
+    throw invalidItemBodyError(
+      `${field} must be null or a string of at most ${maxCharacters} characters.`,
+    );
+  }
+}
+
+function validateCategoryIds(value: Record<string, unknown>): void {
+  if (!Object.hasOwn(value, "category_ids")) {
+    return;
+  }
+  if (!Array.isArray(value.category_ids)) {
+    throw invalidItemBodyError("category_ids must be an array.");
+  }
+  if (value.category_ids.length > MAX_CATEGORY_IDS) {
+    throw invalidItemBodyError(
+      `category_ids must contain at most ${MAX_CATEGORY_IDS} values.`,
+    );
+  }
+  const seen = new Set<string>();
+  for (const categoryId of value.category_ids) {
+    if (typeof categoryId !== "string" || !isUuid(categoryId)) {
+      throw invalidItemBodyError("category_ids must contain only UUIDs.");
+    }
+    const comparableId = categoryId.toLowerCase();
+    if (seen.has(comparableId)) {
+      throw invalidItemBodyError("category_ids must not contain duplicates.");
+    }
+    seen.add(comparableId);
+  }
+}
+
+async function categoriesForUpdate(
+  gateway: MemberGateway,
+  ownerId: string,
+  snapshot: ItemUpdateSnapshot,
+  body: ItemUpdateInput,
+): Promise<ItemCategoryReference[]> {
+  if (!Object.hasOwn(body, "category_ids")) {
+    return snapshot.category_refs;
+  }
+  if (body.category_ids!.length === 0) {
+    return [];
+  }
+
+  let result: RpcResult;
+  try {
+    result = await gateway.lookupCategories({
+      ownerId,
+      categoryIds: body.category_ids!,
+    });
+  } catch {
+    throw dependencyUnavailableError();
+  }
+  if (result.error !== null || !Array.isArray(result.data)) {
+    throw dependencyUnavailableError();
+  }
+
+  const byId = new Map<string, ItemCategoryReference>();
+  for (const value of result.data) {
+    if (
+      !isObject(value) || typeof value.id !== "string" ||
+      !isUuid(value.id) || typeof value.name !== "string"
+    ) {
+      throw dependencyUnavailableError();
+    }
+    const id = value.id.toLowerCase();
+    if (byId.has(id)) {
+      throw dependencyUnavailableError();
+    }
+    byId.set(id, { id: value.id, name: value.name });
+  }
+
+  const categories: ItemCategoryReference[] = [];
+  for (const categoryId of body.category_ids!) {
+    const category = byId.get(categoryId.toLowerCase());
+    if (category === undefined) {
+      throw new ApiError(
+        400,
+        "INVALID_CATEGORY_IDS",
+        "category_ids contains an invalid category.",
+      );
+    }
+    categories.push(category);
+  }
+  if (categories.length !== byId.size) {
+    throw dependencyUnavailableError();
+  }
+  return categories;
 }
 
 function readPagination(url: URL): { limit: number; offset: number } {
@@ -592,6 +794,12 @@ function mapRpcFailure(error: RpcFailure): ApiError {
           "URL_HASH_COLLISION",
           "The URL could not be matched safely.",
         );
+      case "VERSION_CONFLICT":
+        return new ApiError(
+          409,
+          "VERSION_CONFLICT",
+          "The item changed before this update was applied.",
+        );
       case "ITEM_DELETED":
         return new ApiError(410, "ITEM_DELETED", "The item was deleted.");
       case "RATE_LIMITED":
@@ -604,6 +812,10 @@ function mapRpcFailure(error: RpcFailure): ApiError {
     }
   }
   return dependencyUnavailableError();
+}
+
+function isRpcGuard(error: RpcFailure, message: string): boolean {
+  return error.code === "P0001" && error.message === message;
 }
 
 function isCreateResult(
@@ -619,6 +831,80 @@ function isListResult(
 ): value is { items: unknown[]; has_more: boolean } {
   return isObject(value) && Array.isArray(value.items) &&
     typeof value.has_more === "boolean";
+}
+
+function isUpdateResult(
+  value: unknown,
+): value is { http_status: 200; item: object } {
+  return isObject(value) && value.http_status === 200 && isObject(value.item);
+}
+
+function isVersionConflictUpdateResult(
+  value: unknown,
+): value is { http_status: 409; error_code: "VERSION_CONFLICT" } {
+  return isObject(value) &&
+    Object.keys(value).length === 2 &&
+    Object.hasOwn(value, "http_status") &&
+    value.http_status === 409 &&
+    Object.hasOwn(value, "error_code") &&
+    value.error_code === "VERSION_CONFLICT";
+}
+
+function isItemUpdateSnapshot(value: unknown): value is ItemUpdateSnapshot {
+  if (
+    !isObject(value) || !Number.isInteger(value.version) ||
+    (value.version as number) < 1 ||
+    (value.version as number) > MAX_POSTGRES_INTEGER ||
+    typeof value.url !== "string" ||
+    !isNullableString(value.user_title) ||
+    !isNullableString(value.fetched_title) ||
+    !isNullableString(value.shared_text) ||
+    !isNullableString(value.description) ||
+    !isNullableString(value.body_text) ||
+    !isNullableString(value.note) ||
+    !Array.isArray(value.category_refs) ||
+    ![
+      "queued",
+      "running",
+      "ready",
+      "partial",
+      "unsupported",
+      "failed",
+    ].includes(value.metadata_state as string) ||
+    !["not_requested", "queued", "running", "ready", "failed"].includes(
+      value.ocr_state as string,
+    ) ||
+    !isObject(value.extraction_meta) ||
+    !isActiveAsset(value.active_asset)
+  ) {
+    return false;
+  }
+  return value.category_refs.every((category) =>
+    isObject(category) && typeof category.id === "string" &&
+    isUuid(category.id) && typeof category.name === "string"
+  );
+}
+
+function isActiveAsset(
+  value: unknown,
+): value is ItemUpdateSnapshot["active_asset"] {
+  if (value === null) {
+    return true;
+  }
+  if (!isObject(value)) {
+    return false;
+  }
+  return (
+    !Object.hasOwn(value, "ocr_text") || isNullableString(value.ocr_text)
+  ) &&
+    (
+      !Object.hasOwn(value, "ocr_truncated") ||
+      typeof value.ocr_truncated === "boolean"
+    );
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

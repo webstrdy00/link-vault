@@ -1,17 +1,20 @@
 import { assert, assertEquals, assertMatch } from "@std/assert";
 import {
   type AuthVerification,
+  type CategoryLookupCall,
   createHandler,
   type CreateItemCall,
   type MemberGateway,
   type RpcCall,
   type RpcResult,
+  type UpdateItemCall,
 } from "./handler.ts";
 
 const VALID_REQUEST_ID = "5e51d680-b8d8-4f7a-a29f-d764f2965aa2";
 const VALID_ITEM_ID = "3d8752d2-47bb-4f4c-b2c7-7a3590eb02a9";
 const VERIFIED_USER_ID = "0a6c0d3a-0f92-4608-9a32-dad06348d885";
 const VALID_CATEGORY_ID = "264c6a49-04a0-45c4-954f-773f97c0c4bb";
+const SECOND_CATEGORY_ID = "71baadfe-6a88-43a3-b0fb-f111f18ef97f";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -25,9 +28,19 @@ class FakeGateway implements MemberGateway {
     data: { http_status: 201, duplicate: false, item: { id: VALID_ITEM_ID } },
     error: null,
   };
+  categoryResult: RpcResult = { data: [], error: null };
+  updateResult: RpcResult = {
+    data: {
+      http_status: 200,
+      item: { id: VALID_ITEM_ID, version: 2 },
+    },
+    error: null,
+  };
   verifiedTokens: string[] = [];
   rpcCalls: RpcCall[] = [];
   createCalls: CreateItemCall[] = [];
+  categoryCalls: CategoryLookupCall[] = [];
+  updateCalls: UpdateItemCall[] = [];
 
   verifyUser(accessToken: string): Promise<AuthVerification> {
     this.verifiedTokens.push(accessToken);
@@ -42,6 +55,16 @@ class FakeGateway implements MemberGateway {
   createItem(call: CreateItemCall): Promise<RpcResult> {
     this.createCalls.push(call);
     return Promise.resolve(this.createResult);
+  }
+
+  lookupCategories(call: CategoryLookupCall): Promise<RpcResult> {
+    this.categoryCalls.push(call);
+    return Promise.resolve(this.categoryResult);
+  }
+
+  updateItem(call: UpdateItemCall): Promise<RpcResult> {
+    this.updateCalls.push(call);
+    return Promise.resolve(this.updateResult);
   }
 }
 
@@ -195,6 +218,13 @@ Deno.test("known paths return 405 for wrong methods and unknown paths return 404
   ));
   assertEquals(itemsWrongMethod.status, 405);
   assertEquals(itemsWrongMethod.headers.get("allow"), "GET, POST");
+
+  const detailWrongMethod = await handler(request(
+    `/library-api/v1/items/${VALID_ITEM_ID}`,
+    { method: "POST" },
+  ));
+  assertEquals(detailWrongMethod.status, 405);
+  assertEquals(detailWrongMethod.headers.get("allow"), "GET, PATCH");
 
   const unknownRoute = await handler(request("/library-api/v1/items/a/b"));
   assertEquals(unknownRoute.status, 404);
@@ -598,6 +628,349 @@ Deno.test("GET item detail validates UUID and uses the caller JWT RPC", async ()
   }]);
 });
 
+Deno.test("PATCH item requires a positive expected version and one editable field", async () => {
+  const invalidBodies: unknown[] = [
+    {},
+    { expected_version: null, title: "new" },
+    { expected_version: 0, title: "new" },
+    { expected_version: -1, title: "new" },
+    { expected_version: 1.5, title: "new" },
+    { expected_version: 2_147_483_648, title: "new" },
+    { expected_version: 1 },
+    { expected_version: 1, category_ids: null },
+    { expected_version: 1, category_ids: "not-an-array" },
+    { expected_version: 1, title: [] },
+    { expected_version: 1, note: {} },
+  ];
+
+  for (const body of invalidBodies) {
+    const gateway = new FakeGateway();
+    const response = await createHandler(gateway)(updateRequest(body));
+    assertEquals(response.status, 400, JSON.stringify(body));
+    assertEquals(await errorCode(response), "INVALID_BODY");
+    assertEquals(gateway.rpcCalls, []);
+    assertEquals(gateway.updateCalls, []);
+  }
+});
+
+Deno.test("PATCH item rejects immutable, identity, and prepared fields", async () => {
+  for (
+    const field of [
+      "url",
+      "shared_text",
+      "owner_id",
+      "owner",
+      "prepared",
+      "normalized_fields",
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    const response = await createHandler(gateway)(updateRequest({
+      expected_version: 1,
+      title: "new",
+      [field]: "forbidden",
+    }));
+
+    assertEquals(response.status, 400, field);
+    assertEquals(await errorCode(response), "INVALID_BODY");
+    assertEquals(gateway.rpcCalls, []);
+    assertEquals(gateway.updateCalls, []);
+  }
+});
+
+Deno.test("PATCH item distinguishes null, string, and omitted text fields", async () => {
+  const cases = [
+    {
+      body: { expected_version: 4, title: null },
+      title: "",
+      note: "기존 안드로이드 메모",
+    },
+    {
+      body: { expected_version: 4, title: "새 엑셀 제목" },
+      title: "새 엑셀 제목",
+      note: "기존 안드로이드 메모",
+    },
+    {
+      body: { expected_version: 4, note: null },
+      title: "기존 카톡 제목",
+      note: "",
+    },
+  ];
+
+  for (const testCase of cases) {
+    const gateway = new FakeGateway();
+    gateway.rpcResult = { data: itemSnapshot(), error: null };
+
+    const response = await createHandler(gateway)(updateRequest(testCase.body));
+
+    assertEquals(response.status, 200);
+    assertEquals(gateway.updateCalls.length, 1);
+    const call = gateway.updateCalls[0];
+    assertEquals(call.body, testCase.body);
+    assertEquals(
+      call.prepared?.normalized_fields.user_title,
+      testCase.title,
+    );
+    assertEquals(call.prepared?.normalized_fields.note, testCase.note);
+    assertEquals(
+      call.prepared?.normalized_fields.categories,
+      "업무 자료",
+    );
+    assertEquals(gateway.categoryCalls, []);
+  }
+});
+
+Deno.test("PATCH preparation rebuilds every source and removes stale aliases", async () => {
+  const gateway = new FakeGateway();
+  gateway.rpcResult = { data: itemSnapshot(), error: null };
+
+  const response = await createHandler(gateway)(updateRequest({
+    expected_version: 4,
+    title: null,
+  }));
+
+  assertEquals(response.status, 200);
+  const prepared = gateway.updateCalls[0].prepared!;
+  assertEquals(prepared.snapshot_version, 4);
+  assertEquals(
+    prepared.normalized_url,
+    "https://blog.naver.com/PostView.naver?Keep=A#part",
+  );
+  assertEquals(prepared.source, "naver_blog");
+  assertEquals(prepared.display_fallback, "공유 원문 첫 줄");
+  assertEquals(prepared.metadata_allowed, true);
+  assertEquals(prepared.normalized_fields, {
+    user_title: "",
+    fetched_title: "확보한 여행 제목",
+    note: "기존 안드로이드 메모",
+    ocr: "사진 속 쇼핑 정보",
+    shared: "공유 원문 첫 줄 둘째 줄",
+    description: "설명 텍스트",
+    body: "본문 텍스트",
+    categories: "업무 자료",
+    url: "https://blog.naver.com/postview.naver?keep=a#part",
+  });
+  assertEquals(prepared.alias_concepts.user_title, []);
+  assertEquals(prepared.alias_concepts.note, ["android"]);
+  assertEquals(prepared.cue_state, "available");
+  assertEquals(prepared.cue_flags, ["truncated"]);
+});
+
+Deno.test("PATCH item resolves selected category names as the verified owner in request order", async () => {
+  const gateway = new FakeGateway();
+  const verifiedOwnerId = "37c657a6-23db-4dce-8839-3390b3898343";
+  gateway.verification = {
+    status: "verified",
+    userId: verifiedOwnerId,
+  };
+  gateway.rpcResult = { data: itemSnapshot(), error: null };
+  gateway.categoryResult = {
+    data: [
+      { id: SECOND_CATEGORY_ID, name: "둘째" },
+      { id: VALID_CATEGORY_ID, name: "첫째" },
+    ],
+    error: null,
+  };
+  gateway.updateResult = {
+    data: {
+      http_status: 200,
+      item: { id: VALID_ITEM_ID, version: 5, user_title: "기존 카톡 제목" },
+    },
+    error: null,
+  };
+
+  const response = await createHandler(gateway)(updateRequest({
+    expected_version: 4,
+    category_ids: [VALID_CATEGORY_ID, SECOND_CATEGORY_ID],
+  }));
+
+  assertEquals(response.status, 200);
+  assertEquals(await response.json(), {
+    id: VALID_ITEM_ID,
+    version: 5,
+    user_title: "기존 카톡 제목",
+  });
+  assertEquals(gateway.categoryCalls, [{
+    ownerId: verifiedOwnerId,
+    categoryIds: [VALID_CATEGORY_ID, SECOND_CATEGORY_ID],
+  }]);
+  assertEquals(
+    gateway.updateCalls[0].prepared?.normalized_fields.categories,
+    "첫째 둘째",
+  );
+  assertEquals(gateway.updateCalls[0].ownerId, verifiedOwnerId);
+  assertEquals(gateway.updateCalls[0].itemId, VALID_ITEM_ID);
+  assertEquals(gateway.updateCalls[0].requestId, VALID_REQUEST_ID);
+});
+
+Deno.test("PATCH item treats an explicit empty category array as a direct clear", async () => {
+  const gateway = new FakeGateway();
+  gateway.rpcResult = { data: itemSnapshot(), error: null };
+
+  const response = await createHandler(gateway)(updateRequest({
+    expected_version: 4,
+    category_ids: [],
+  }));
+
+  assertEquals(response.status, 200);
+  assertEquals(gateway.categoryCalls, []);
+  assertEquals(
+    gateway.updateCalls[0].prepared?.normalized_fields.categories,
+    "",
+  );
+  assertEquals(gateway.updateCalls[0].body.category_ids, []);
+});
+
+Deno.test("PATCH item rejects category ids absent from the owned lookup", async () => {
+  const gateway = new FakeGateway();
+  gateway.rpcResult = { data: itemSnapshot(), error: null };
+  gateway.categoryResult = {
+    data: [{ id: VALID_CATEGORY_ID, name: "첫째" }],
+    error: null,
+  };
+
+  const response = await createHandler(gateway)(updateRequest({
+    expected_version: 4,
+    category_ids: [VALID_CATEGORY_ID, SECOND_CATEGORY_ID],
+  }));
+
+  assertEquals(response.status, 400);
+  assertEquals(await errorCode(response), "INVALID_CATEGORY_IDS");
+  assertEquals(gateway.updateCalls, []);
+});
+
+Deno.test("PATCH forwards stale expected versions and missing snapshots to the trusted update RPC", async () => {
+  const staleGateway = new FakeGateway();
+  staleGateway.rpcResult = {
+    data: { ...itemSnapshot(), version: 9 },
+    error: null,
+  };
+  const staleResponse = await createHandler(staleGateway)(updateRequest({
+    expected_version: 4,
+    note: "재전송",
+  }));
+
+  assertEquals(staleResponse.status, 200);
+  assertEquals(staleGateway.updateCalls[0].body.expected_version, 4);
+  assertEquals(staleGateway.updateCalls[0].prepared?.snapshot_version, 9);
+
+  const missingGateway = new FakeGateway();
+  missingGateway.rpcResult = {
+    data: null,
+    error: { code: "P0001", message: "ITEM_NOT_FOUND" },
+  };
+  missingGateway.updateResult = {
+    data: null,
+    error: { code: "P0001", message: "ITEM_DELETED" },
+  };
+  const missingResponse = await createHandler(missingGateway)(updateRequest({
+    expected_version: 4,
+    note: "재전송",
+  }));
+
+  assertEquals(missingResponse.status, 410);
+  assertEquals(await errorCode(missingResponse), "ITEM_DELETED");
+  assertEquals(missingGateway.categoryCalls, []);
+  assertEquals(missingGateway.updateCalls.length, 1);
+  assertEquals(missingGateway.updateCalls[0].prepared, null);
+});
+
+Deno.test("PATCH maps an exact committed version-conflict result to the normal error envelope", async () => {
+  const gateway = new FakeGateway();
+  gateway.rpcResult = { data: itemSnapshot(), error: null };
+  gateway.updateResult = {
+    data: { http_status: 409, error_code: "VERSION_CONFLICT" },
+    error: null,
+  };
+
+  const response = await createHandler(gateway)(updateRequest({
+    expected_version: 3,
+    note: "충돌한 메모",
+  }));
+
+  assertEquals(response.status, 409);
+  assertEquals(await response.json(), {
+    error: {
+      code: "VERSION_CONFLICT",
+      message: "The item changed before this update was applied.",
+      retryable: false,
+    },
+    request_id: VALID_REQUEST_ID,
+  });
+  assertEquals(gateway.updateCalls.length, 1);
+});
+
+Deno.test("PATCH rejects malformed committed conflict results as dependency failures", async () => {
+  const malformedResults: unknown[] = [
+    {
+      http_status: 409,
+      error_code: "VERSION_CONFLICT",
+      item_id: VALID_ITEM_ID,
+    },
+    { http_status: 409, error_code: "IDEMPOTENCY_MISMATCH" },
+    { http_status: 409 },
+    { http_status: "409", error_code: "VERSION_CONFLICT" },
+  ];
+
+  for (const data of malformedResults) {
+    const gateway = new FakeGateway();
+    gateway.rpcResult = { data: itemSnapshot(), error: null };
+    gateway.updateResult = { data, error: null };
+
+    const response = await createHandler(gateway)(updateRequest({
+      expected_version: 3,
+      note: "충돌한 메모",
+    }));
+
+    assertEquals(response.status, 503, JSON.stringify(data));
+    assertEquals(
+      await errorCode(response),
+      "DEPENDENCY_UNAVAILABLE",
+      JSON.stringify(data),
+    );
+  }
+});
+
+Deno.test("PATCH item enforces request ids and its 64 KiB streamed limit", async () => {
+  for (const suppliedId of [null, "not-a-uuid"]) {
+    const invalidIdGateway = new FakeGateway();
+    const headers = new Headers({
+      authorization: "Bearer caller-access-token",
+      "content-type": "application/json",
+    });
+    if (suppliedId !== null) {
+      headers.set("x-request-id", suppliedId);
+    }
+    const invalidIdResponse = await createHandler(invalidIdGateway)(request(
+      `/library-api/v1/items/${VALID_ITEM_ID}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ expected_version: 1, title: "new" }),
+      },
+    ));
+    assertEquals(invalidIdResponse.status, 400);
+    assertEquals(await errorCode(invalidIdResponse), "INVALID_REQUEST_ID");
+    assertEquals(invalidIdGateway.rpcCalls, []);
+  }
+
+  const oversizedGateway = new FakeGateway();
+  const oversizedResponse = await createHandler(oversizedGateway)(
+    new Request(
+      `https://example.test/library-api/v1/items/${VALID_ITEM_ID}`,
+      {
+        method: "PATCH",
+        headers: authenticatedJsonHeaders(),
+        body: byteStream(40_000, 30_000),
+      },
+    ),
+  );
+  assertEquals(oversizedResponse.status, 413);
+  assertEquals(await errorCode(oversizedResponse), "PAYLOAD_TOO_LARGE");
+  assertEquals(oversizedGateway.rpcCalls, []);
+  assertEquals(oversizedGateway.updateCalls, []);
+});
+
 Deno.test("RPC policy failures map to stable statuses and rate limits carry Retry-After", async () => {
   const cases = [
     { message: "UNAUTHENTICATED", status: 401 },
@@ -612,6 +985,7 @@ Deno.test("RPC policy failures map to stable statuses and rate limits carry Retr
     { message: "ITEM_LIMIT_REACHED", status: 409 },
     { message: "IDEMPOTENCY_MISMATCH", status: 409 },
     { message: "URL_HASH_COLLISION", status: 409 },
+    { message: "VERSION_CONFLICT", status: 409 },
     { message: "ITEM_DELETED", status: 410 },
     { message: "RATE_LIMITED", status: 429 },
   ];
@@ -688,6 +1062,47 @@ function itemRequest(body: unknown): Request {
     headers: authenticatedJsonHeaders(),
     body: JSON.stringify(body),
   });
+}
+
+function updateRequest(body: unknown): Request {
+  return request(`/functions/v1/library-api/v1/items/${VALID_ITEM_ID}`, {
+    method: "PATCH",
+    headers: authenticatedJsonHeaders(),
+    body: JSON.stringify(body),
+  });
+}
+
+function itemSnapshot(): Record<string, unknown> {
+  return {
+    id: VALID_ITEM_ID,
+    version: 4,
+    url: "HTTPS://Blog.NAVER.com:443/PostView.naver?Keep=A#part",
+    display_title: "기존 카톡 제목",
+    source: "naver_blog",
+    note_excerpt: "기존 안드로이드 메모",
+    category_refs: [
+      { id: VALID_CATEGORY_ID, name: "업무 자료", origin: "manual" },
+    ],
+    has_attachment: true,
+    metadata_state: "ready",
+    ocr_state: "ready",
+    classification_state: "manual",
+    cue_state: "available",
+    cue_flags: [],
+    match_type: null,
+    user_title: "기존 카톡 제목",
+    fetched_title: "확보한 여행 제목",
+    shared_text: "공유 원문 첫 줄\n둘째 줄",
+    description: "설명 텍스트",
+    body_text: "본문 텍스트",
+    note: "기존 안드로이드 메모",
+    extraction_meta: { body_truncated: true },
+    active_asset: {
+      id: "8ff75967-3313-4a63-8131-e606dd63b087",
+      ocr_text: "사진 속 쇼핑 정보",
+      ocr_truncated: false,
+    },
+  };
 }
 
 function authenticatedJsonHeaders(): Headers {

@@ -1,0 +1,554 @@
+package com.linkvault.app.storage
+
+import android.content.Context
+import androidx.room.ColumnInfo
+import androidx.room.Dao
+import androidx.room.Database
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.PrimaryKey
+import androidx.room.Query
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.Transaction
+import androidx.room.TypeConverter
+import androidx.room.TypeConverters
+import androidx.room.withTransaction
+import kotlinx.coroutines.flow.Flow
+
+@Entity(
+    tableName = "outbox",
+    indices = [
+        Index(value = ["owner_id", "state", "next_attempt_at"]),
+        Index(value = ["owner_id", "expires_at"]),
+    ],
+)
+data class OutboxEntry(
+    @PrimaryKey
+    @ColumnInfo(name = "request_id")
+    val requestId: String,
+    @ColumnInfo(name = "owner_id")
+    val ownerId: String,
+    val method: String,
+    val path: String,
+    @ColumnInfo(name = "payload_json")
+    val payloadJson: String,
+    val state: OutboxState,
+    @ColumnInfo(name = "attempt_count")
+    val attemptCount: Int,
+    @ColumnInfo(name = "created_at")
+    val createdAt: Long,
+    @ColumnInfo(name = "expires_at")
+    val expiresAt: Long,
+    @ColumnInfo(name = "next_attempt_at")
+    val nextAttemptAt: Long,
+    @ColumnInfo(name = "result_json")
+    val resultJson: String? = null,
+    @ColumnInfo(name = "error_code")
+    val errorCode: String? = null,
+    @ColumnInfo(name = "error_message")
+    val errorMessage: String? = null,
+    @ColumnInfo(name = "lease_until")
+    val leaseUntil: Long? = null,
+)
+
+enum class OutboxState {
+    PENDING,
+    RUNNING,
+    RETRY,
+    WAITING_LOGIN,
+    FAILED,
+    CONFLICT,
+    EXPIRED,
+    SAVED,
+}
+
+@Entity(
+    tableName = "cached_items",
+    primaryKeys = ["owner_id", "item_id", "is_detail"],
+    indices = [Index(value = ["owner_id", "is_detail", "server_created_at", "item_id"])],
+)
+data class CachedItem(
+    @ColumnInfo(name = "owner_id")
+    val ownerId: String,
+    @ColumnInfo(name = "item_id")
+    val itemId: String,
+    @ColumnInfo(name = "response_json")
+    val responseJson: String,
+    @ColumnInfo(name = "server_version")
+    val serverVersion: Long,
+    @ColumnInfo(name = "server_created_at")
+    val serverCreatedAt: String,
+    @ColumnInfo(name = "fetched_at")
+    val fetchedAt: Long,
+    @ColumnInfo(name = "is_detail")
+    val isDetail: Boolean,
+)
+
+@Entity(tableName = "pending_inputs")
+data class PendingInput(
+    @PrimaryKey
+    @ColumnInfo(name = "local_id")
+    val localId: String,
+    val text: String,
+    @ColumnInfo(name = "selected_url")
+    val selectedUrl: String?,
+    @ColumnInfo(name = "created_at")
+    val createdAt: Long,
+    @ColumnInfo(name = "expires_at")
+    val expiresAt: Long,
+)
+
+class RequestIdConflictException(requestId: String) : IllegalStateException(
+    "Request ID $requestId is already bound to a different request.",
+)
+
+@Dao
+abstract class OutboxDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    protected abstract suspend fun insertIfAbsent(entry: OutboxEntry): Long
+
+    @Query("SELECT * FROM outbox WHERE request_id = :requestId")
+    abstract suspend fun findByRequestId(requestId: String): OutboxEntry?
+
+    @Transaction
+    open suspend fun insertImmutable(entry: OutboxEntry) {
+        if (insertIfAbsent(entry) != -1L) return
+        val existing = findByRequestId(entry.requestId)
+            ?: throw IllegalStateException("The outbox row changed while it was being inserted.")
+        if (
+            existing.ownerId != entry.ownerId ||
+            existing.method != entry.method ||
+            existing.path != entry.path ||
+            existing.payloadJson != entry.payloadJson
+        ) {
+            throw RequestIdConflictException(entry.requestId)
+        }
+    }
+
+    @Query(
+        """
+        SELECT * FROM outbox
+        WHERE owner_id = :ownerId
+        ORDER BY created_at ASC, request_id ASC
+        """,
+    )
+    abstract fun observe(ownerId: String): Flow<List<OutboxEntry>>
+
+    @Query(
+        """
+        SELECT * FROM outbox
+        WHERE owner_id = :ownerId
+          AND expires_at > :now
+          AND (
+            (state IN ('pending', 'retry') AND next_attempt_at <= :now)
+            OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= :now)
+          )
+        ORDER BY created_at ASC, request_id ASC
+        LIMIT 1
+        """,
+    )
+    protected abstract suspend fun nextClaimCandidate(ownerId: String, now: Long): OutboxEntry?
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = 'running',
+            attempt_count = attempt_count + 1,
+            lease_until = :leaseUntil,
+            error_code = NULL,
+            error_message = NULL
+        WHERE request_id = :requestId
+          AND owner_id = :ownerId
+          AND expires_at > :now
+          AND (
+            (state IN ('pending', 'retry') AND next_attempt_at <= :now)
+            OR (state = 'running' AND lease_until IS NOT NULL AND lease_until <= :now)
+          )
+        """,
+    )
+    protected abstract suspend fun claimCandidate(
+        ownerId: String,
+        requestId: String,
+        now: Long,
+        leaseUntil: Long,
+    ): Int
+
+    @Transaction
+    open suspend fun claimNext(ownerId: String, now: Long, leaseUntil: Long): OutboxEntry? {
+        val candidate = nextClaimCandidate(ownerId, now) ?: return null
+        if (claimCandidate(ownerId, candidate.requestId, now, leaseUntil) != 1) return null
+        return findByRequestId(candidate.requestId)
+    }
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = 'expired', lease_until = NULL,
+            error_code = 'REQUEST_EXPIRED',
+            error_message = 'Automatic retry expired. User confirmation is required.'
+        WHERE owner_id = :ownerId
+          AND expires_at <= :now
+          AND state IN ('pending', 'running', 'retry', 'waiting_login')
+          AND (state != 'running' OR lease_until IS NULL OR lease_until <= :now)
+        """,
+    )
+    abstract suspend fun expireAutomaticRequests(ownerId: String, now: Long): Int
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = 'saved', result_json = :resultJson,
+            error_code = NULL, error_message = NULL, lease_until = NULL
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state = 'running'
+          AND lease_until = :leaseUntil
+        """,
+    )
+    abstract suspend fun completeSaved(
+        ownerId: String,
+        requestId: String,
+        leaseUntil: Long,
+        resultJson: String,
+    ): Int
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = :state, next_attempt_at = :nextAttemptAt,
+            error_code = :errorCode, error_message = :errorMessage,
+            lease_until = NULL
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state = 'running'
+          AND lease_until = :leaseUntil
+        """,
+    )
+    abstract suspend fun completeFailure(
+        ownerId: String,
+        requestId: String,
+        leaseUntil: Long,
+        state: OutboxState,
+        nextAttemptAt: Long,
+        errorCode: String?,
+        errorMessage: String?,
+    ): Int
+
+    @Query(
+        """
+        DELETE FROM outbox
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state = 'saved'
+        """,
+    )
+    abstract suspend fun acknowledge(ownerId: String, requestId: String): Int
+
+    @Query("DELETE FROM outbox WHERE owner_id = :ownerId AND request_id = :requestId")
+    abstract suspend fun discard(ownerId: String, requestId: String): Int
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = 'expired', lease_until = NULL,
+            error_code = 'REQUEST_EXPIRED',
+            error_message = 'Automatic retry expired. User confirmation is required.'
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state IN ('retry', 'failed')
+          AND expires_at <= :now
+        """,
+    )
+    protected abstract suspend fun expireManualRetry(
+        ownerId: String,
+        requestId: String,
+        now: Long,
+    ): Int
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = CASE WHEN state = 'failed' THEN 'pending' ELSE 'retry' END,
+            next_attempt_at = CASE WHEN state = 'failed' THEN :now ELSE next_attempt_at END,
+            error_code = NULL, error_message = NULL, lease_until = NULL
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state IN ('retry', 'failed')
+          AND expires_at > :now
+        """,
+    )
+    protected abstract suspend fun retryManual(
+        ownerId: String,
+        requestId: String,
+        now: Long,
+    ): Int
+
+    @Transaction
+    open suspend fun retry(ownerId: String, requestId: String, now: Long) {
+        if (retryManual(ownerId, requestId, now) == 1) return
+        if (expireManualRetry(ownerId, requestId, now) == 1) return
+        val existing = findByRequestId(requestId)
+        if (existing != null && existing.ownerId == ownerId) {
+            throw IllegalStateException("Only retryable or failed requests can be retried.")
+        }
+    }
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM outbox
+        WHERE owner_id = :ownerId
+          AND state IN ('pending', 'running', 'retry', 'waiting_login')
+        """,
+    )
+    abstract suspend fun pendingCount(ownerId: String): Int
+
+    @Query("SELECT COUNT(*) FROM outbox WHERE state != 'saved'")
+    abstract suspend fun retainedCount(): Int
+
+    @Query(
+        """
+        UPDATE outbox
+        SET state = 'pending', next_attempt_at = :now,
+            error_code = NULL, error_message = NULL, lease_until = NULL
+        WHERE owner_id = :ownerId
+          AND state = 'waiting_login'
+          AND expires_at > :now
+        """,
+    )
+    abstract suspend fun resumeWaitingLogin(ownerId: String, now: Long): Int
+
+    @Query(
+        """
+        SELECT MIN(
+            CASE
+                WHEN state = 'running' THEN COALESCE(lease_until, expires_at)
+                ELSE MIN(next_attempt_at, expires_at)
+            END
+        )
+        FROM outbox
+        WHERE owner_id = :ownerId
+          AND state IN ('pending', 'running', 'retry')
+        """,
+    )
+    abstract suspend fun nextWakeAt(ownerId: String): Long?
+
+    @Query("SELECT DISTINCT owner_id FROM outbox")
+    abstract suspend fun ownerIds(): List<String>
+
+    @Query("DELETE FROM outbox WHERE owner_id = :ownerId")
+    abstract suspend fun deleteOwner(ownerId: String): Int
+
+    @Query("DELETE FROM outbox")
+    abstract suspend fun deleteAll(): Int
+}
+
+@Dao
+abstract class CachedItemDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    protected abstract suspend fun insertIfAbsent(item: CachedItem): Long
+
+    @Query(
+        """
+        UPDATE cached_items
+        SET response_json = :responseJson,
+            server_version = :serverVersion,
+            server_created_at = :serverCreatedAt,
+            fetched_at = :fetchedAt
+        WHERE owner_id = :ownerId
+          AND item_id = :itemId
+          AND is_detail = :isDetail
+          AND server_version <= :serverVersion
+        """,
+    )
+    protected abstract suspend fun updateIfNotOlder(
+        ownerId: String,
+        itemId: String,
+        isDetail: Boolean,
+        responseJson: String,
+        serverVersion: Long,
+        serverCreatedAt: String,
+        fetchedAt: Long,
+    ): Int
+
+    @Transaction
+    open suspend fun upsert(item: CachedItem) {
+        if (insertIfAbsent(item) != -1L) return
+        updateIfNotOlder(
+            ownerId = item.ownerId,
+            itemId = item.itemId,
+            isDetail = item.isDetail,
+            responseJson = item.responseJson,
+            serverVersion = item.serverVersion,
+            serverCreatedAt = item.serverCreatedAt,
+            fetchedAt = item.fetchedAt,
+        )
+    }
+
+    @Query("DELETE FROM cached_items WHERE owner_id = :ownerId AND is_detail = 0")
+    protected abstract suspend fun deleteList(ownerId: String): Int
+
+    @Query(
+        """
+        DELETE FROM cached_items
+        WHERE owner_id = :ownerId
+          AND is_detail = 0
+          AND item_id NOT IN (:retainedItemIds)
+        """,
+    )
+    protected abstract suspend fun deleteListExcept(
+        ownerId: String,
+        retainedItemIds: List<String>,
+    ): Int
+
+    @Transaction
+    open suspend fun cacheList(ownerId: String, items: List<CachedItem>, replace: Boolean) {
+        require(items.all { it.ownerId == ownerId && !it.isDetail }) {
+            "List cache rows must belong to the requested owner and must not be detail rows."
+        }
+        items.forEach { upsert(it) }
+        if (replace) {
+            val retainedItemIds = items.map(CachedItem::itemId).distinct()
+            if (retainedItemIds.isEmpty()) {
+                deleteList(ownerId)
+            } else {
+                deleteListExcept(ownerId, retainedItemIds)
+            }
+        }
+    }
+
+    @Query(
+        """
+        SELECT * FROM cached_items
+        WHERE owner_id = :ownerId AND is_detail = 0
+        ORDER BY server_created_at DESC, item_id DESC
+        """,
+    )
+    abstract fun observeList(ownerId: String): Flow<List<CachedItem>>
+
+    @Query(
+        """
+        SELECT * FROM cached_items
+        WHERE owner_id = :ownerId AND item_id = :itemId AND is_detail = 1
+        """,
+    )
+    abstract suspend fun readDetail(ownerId: String, itemId: String): CachedItem?
+
+    @Query("DELETE FROM cached_items WHERE owner_id = :ownerId")
+    abstract suspend fun deleteOwner(ownerId: String): Int
+
+    @Query("DELETE FROM cached_items")
+    abstract suspend fun deleteAll(): Int
+}
+
+@Dao
+abstract class PendingInputDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    protected abstract suspend fun insertIfAbsent(input: PendingInput): Long
+
+    @Query(
+        """
+        UPDATE pending_inputs
+        SET text = :text, selected_url = :selectedUrl,
+            created_at = :createdAt, expires_at = :expiresAt
+        WHERE local_id = :localId
+        """,
+    )
+    protected abstract suspend fun updateDraft(
+        localId: String,
+        text: String,
+        selectedUrl: String?,
+        createdAt: Long,
+        expiresAt: Long,
+    ): Int
+
+    @Transaction
+    open suspend fun saveDraft(input: PendingInput) {
+        if (insertIfAbsent(input) == -1L) {
+            updateDraft(
+                localId = input.localId,
+                text = input.text,
+                selectedUrl = input.selectedUrl,
+                createdAt = input.createdAt,
+                expiresAt = input.expiresAt,
+            )
+        }
+    }
+
+    @Query(
+        """
+        SELECT * FROM pending_inputs
+        WHERE local_id = :localId AND expires_at > :now
+        """,
+    )
+    abstract suspend fun readActive(localId: String, now: Long): PendingInput?
+
+    @Query("DELETE FROM pending_inputs WHERE local_id = :localId")
+    abstract suspend fun delete(localId: String): Int
+
+    @Query("DELETE FROM pending_inputs WHERE expires_at <= :now")
+    abstract suspend fun deleteExpired(now: Long): Int
+
+    @Query(
+        """
+        DELETE FROM pending_inputs
+        WHERE text = :text AND created_at <= :createdAt
+        """,
+    )
+    abstract suspend fun deleteMatchingCapture(text: String, createdAt: Long): Int
+
+    @Query("DELETE FROM pending_inputs")
+    abstract suspend fun deleteAll(): Int
+
+    @Query("SELECT * FROM pending_inputs WHERE local_id = :localId")
+    abstract suspend fun read(localId: String): PendingInput?
+}
+
+class VaultConverters {
+    @TypeConverter
+    fun outboxStateToStorage(state: OutboxState): String = state.name.lowercase()
+
+    @TypeConverter
+    fun outboxStateFromStorage(value: String): OutboxState =
+        OutboxState.valueOf(value.uppercase())
+}
+
+@Database(
+    entities = [OutboxEntry::class, CachedItem::class, PendingInput::class],
+    version = 1,
+    exportSchema = true,
+)
+@TypeConverters(VaultConverters::class)
+abstract class VaultDatabase : RoomDatabase() {
+    abstract fun outboxDao(): OutboxDao
+    abstract fun cachedItemDao(): CachedItemDao
+    abstract fun pendingInputDao(): PendingInputDao
+
+    suspend fun clearOwner(ownerId: String) {
+        withTransaction {
+            outboxDao().deleteOwner(ownerId)
+            cachedItemDao().deleteOwner(ownerId)
+            pendingInputDao().deleteAll()
+        }
+    }
+
+    suspend fun clearAllOwners() {
+        withTransaction {
+            outboxDao().deleteAll()
+            cachedItemDao().deleteAll()
+            pendingInputDao().deleteAll()
+        }
+    }
+
+    companion object {
+        private const val DATABASE_NAME = "link_vault.db"
+
+        fun create(context: Context): VaultDatabase = Room.databaseBuilder(
+            context.applicationContext,
+            VaultDatabase::class.java,
+            DATABASE_NAME,
+        ).build()
+    }
+}

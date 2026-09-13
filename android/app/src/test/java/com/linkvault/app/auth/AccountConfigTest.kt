@@ -6,6 +6,15 @@ import org.junit.Test
 
 class AccountConfigTest {
     @Test
+    fun `retry after accepts seconds and rounds future dates upwards`() {
+        assertEquals(60, parseRetryAfter("60", 0))
+        assertEquals(1, parseRetryAfter("Thu, 01 Jan 1970 00:00:01 GMT", 1))
+        assertEquals(0, parseRetryAfter("Thu, 01 Jan 1970 00:00:01 GMT", 2000))
+        assertEquals(null, parseRetryAfter("-1", 0))
+        assertEquals(null, parseRetryAfter("not a deadline", 0))
+    }
+
+    @Test
     fun `https configuration is accepted and normalized`() {
         val result = validateAccountConfig(
             url = "  https://project.supabase.co/  ",

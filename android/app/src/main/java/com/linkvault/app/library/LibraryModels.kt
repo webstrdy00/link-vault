@@ -5,9 +5,12 @@ import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 const val LIBRARY_URL_MAX_CODE_POINTS = 4096
@@ -60,6 +63,42 @@ data class LibrarySaveOperation(
         requestId = requestId,
     )
 }
+
+data class LibraryEditForm(
+    val title: String,
+    val note: String,
+)
+
+sealed interface LibraryEditPreparation {
+    data class Valid(val operation: LibraryEditOperation) : LibraryEditPreparation
+    data class Invalid(val issues: List<LibraryFormIssue>) : LibraryEditPreparation
+}
+
+data class LibraryEditOperation(
+    val ownerId: String,
+    val itemId: String,
+    val requestId: String,
+    val expectedVersion: Long,
+    val originalTitle: String?,
+    val originalNote: String?,
+    val form: LibraryEditForm,
+    val body: String,
+) {
+    fun requestArguments() = LibraryRequestArguments(
+        path = "/items/$itemId",
+        method = "PATCH",
+        body = body,
+        requestId = requestId,
+    )
+}
+
+data class LibraryEditPatch(
+    val expectedVersion: Long,
+    val changesTitle: Boolean,
+    val title: String?,
+    val changesNote: Boolean,
+    val note: String?,
+)
 
 fun validateLibrarySaveForm(form: LibrarySaveForm): List<LibraryFormIssue> = buildList {
     val url = form.initialUrl
@@ -144,6 +183,99 @@ fun prepareLibrarySave(
             requestId = requestId,
             body = body,
         ),
+    )
+}
+
+fun validateLibraryEditForm(form: LibraryEditForm): List<LibraryFormIssue> = buildList {
+    if (form.title.codePointLength() > LIBRARY_TITLE_MAX_CODE_POINTS) {
+        add(
+            LibraryFormIssue(
+                LibraryFormField.TITLE,
+                "제목은 최대 ${LIBRARY_TITLE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
+            ),
+        )
+    }
+    if (form.note.codePointLength() > LIBRARY_NOTE_MAX_CODE_POINTS) {
+        add(
+            LibraryFormIssue(
+                LibraryFormField.NOTE,
+                "메모는 최대 ${LIBRARY_NOTE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
+            ),
+        )
+    }
+}
+
+fun prepareLibraryEdit(
+    ownerId: String,
+    itemId: String,
+    requestId: String,
+    expectedVersion: Long,
+    originalTitle: String?,
+    originalNote: String?,
+    form: LibraryEditForm,
+): LibraryEditPreparation {
+    val issues = validateLibraryEditForm(form).toMutableList()
+    if (ownerId.isBlank()) {
+        issues += LibraryFormIssue(
+            LibraryFormField.TITLE,
+            "로그인 계정을 확인하지 못했어요. 다시 로그인해 주세요.",
+        )
+    }
+    if (itemId.isBlank() || expectedVersion < 0L || !requestId.isCanonicalUuid()) {
+        issues += LibraryFormIssue(
+            LibraryFormField.TITLE,
+            "수정 요청을 만들지 못했어요. 최신 내용을 다시 확인해 주세요.",
+        )
+    }
+
+    val desiredTitle = form.title.takeUnless(String::isEmpty)
+    val desiredNote = form.note.takeUnless(String::isEmpty)
+    val changesTitle = desiredTitle != originalTitle
+    val changesNote = desiredNote != originalNote
+    if (!changesTitle && !changesNote) {
+        issues += LibraryFormIssue(
+            LibraryFormField.TITLE,
+            "변경된 제목이나 메모가 없어요.",
+        )
+    }
+    if (issues.isNotEmpty()) return LibraryEditPreparation.Invalid(issues)
+
+    val body = buildJsonObject {
+        put("expected_version", expectedVersion)
+        if (changesTitle) {
+            put("title", desiredTitle?.let(::JsonPrimitive) ?: JsonNull)
+        }
+        if (changesNote) {
+            put("note", desiredNote?.let(::JsonPrimitive) ?: JsonNull)
+        }
+    }.toString()
+    return LibraryEditPreparation.Valid(
+        LibraryEditOperation(
+            ownerId = ownerId,
+            itemId = itemId,
+            requestId = requestId,
+            expectedVersion = expectedVersion,
+            originalTitle = originalTitle,
+            originalNote = originalNote,
+            form = form,
+            body = body,
+        ),
+    )
+}
+
+internal fun parseLibraryEditPatch(payloadJson: String): LibraryEditPatch {
+    val payload = libraryJson.parseToJsonElement(payloadJson) as? JsonObject
+        ?: throw IllegalArgumentException("Edit payload must be an object.")
+    val expectedVersion = (payload["expected_version"] as? JsonPrimitive)?.longOrNull
+        ?: throw IllegalArgumentException("Edit payload is missing expected_version.")
+    val changesTitle = payload.containsKey("title")
+    val changesNote = payload.containsKey("note")
+    return LibraryEditPatch(
+        expectedVersion = expectedVersion,
+        changesTitle = changesTitle,
+        title = payload.nullableString("title"),
+        changesNote = changesNote,
+        note = payload.nullableString("note"),
     )
 }
 
@@ -235,6 +367,9 @@ internal fun parseLibrarySaveResponse(response: JsonObject): LibrarySaveResult {
 internal fun parseLibraryDetailResponse(response: JsonObject): LibraryItemDetail =
     libraryJson.decodeFromJsonElement(response)
 
+internal fun parseLibrarySummaryResponse(response: JsonObject): LibraryItemSummary =
+    libraryJson.decodeFromJsonElement(response)
+
 internal fun String.codePointLength(): Int = codePointCount(0, length)
 
 private fun String.isValidLibraryUrl(): Boolean {
@@ -257,4 +392,11 @@ private fun String.isCanonicalUuid(): Boolean = try {
     UUID.fromString(this).toString().equals(this, ignoreCase = true)
 } catch (_: IllegalArgumentException) {
     false
+}
+
+private fun JsonObject.nullableString(key: String): String? {
+    val element = this[key] ?: return null
+    if (element === JsonNull) return null
+    return (element as? JsonPrimitive)?.content
+        ?: throw IllegalArgumentException("$key must be a string or null.")
 }

@@ -49,6 +49,29 @@ const gateway: MemberGateway = {
     });
     return rpcResult(data, error);
   },
+
+  async lookupCategories(call) {
+    if (call.categoryIds.length === 0) {
+      return { data: [], error: null };
+    }
+    const { data, error } = await serviceClient
+      .from("categories")
+      .select("id,name")
+      .eq("owner_id", call.ownerId)
+      .in("id", call.categoryIds);
+    return rpcResult(data, error);
+  },
+
+  async updateItem(call) {
+    const { data, error } = await serviceClient.rpc("library_update_item", {
+      p_owner_id: call.ownerId,
+      p_item_id: call.itemId,
+      p_request_id: call.requestId,
+      p_body: call.body,
+      p_prepared: call.prepared,
+    });
+    return rpcResult(data, error);
+  },
 };
 
 Deno.serve(createHandler(gateway));

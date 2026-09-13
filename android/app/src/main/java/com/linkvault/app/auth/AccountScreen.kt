@@ -3,6 +3,7 @@ package com.linkvault.app.auth
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -30,16 +31,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.linkvault.app.storage.OutboxRepository
 
 @Composable
 fun AccountScreen(
     client: AccountClient,
+    outbox: OutboxRepository,
     onBack: () -> Unit,
 ) {
-    val factory = remember(client) { AccountViewModel.factory(client) }
+    val factory = remember(client, outbox) { AccountViewModel.factory(client, outbox) }
     val accountViewModel: AccountViewModel = viewModel(factory = factory)
     val state by accountViewModel.uiState.collectAsState()
     val activity = LocalContext.current.findActivity()
+    val confirmationVisible = state is AccountUiState.ConfirmLogout
+
+    BackHandler(enabled = confirmationVisible) {
+        accountViewModel.cancelLogout()
+    }
 
     Column(
         modifier = Modifier
@@ -52,7 +60,9 @@ fun AccountScreen(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TextButton(onClick = onBack) {
+            TextButton(
+                onClick = if (confirmationVisible) accountViewModel::cancelLogout else onBack,
+            ) {
                 Text("뒤로")
             }
             Text(
@@ -78,6 +88,7 @@ fun AccountScreen(
                         accountViewModel.login(activity)
                     }
                 },
+                onClearDeviceData = accountViewModel::requestLogout,
             )
 
             AccountUiState.PendingApproval -> PendingApprovalContent(
@@ -88,16 +99,16 @@ fun AccountScreen(
                         accountViewModel.retry(activity)
                     }
                 },
-                onLogout = accountViewModel::logout,
+                onLogout = accountViewModel::requestLogout,
             )
 
             is AccountUiState.Active -> ActiveContent(
                 summary = currentState.summary,
-                onLogout = accountViewModel::logout,
+                onLogout = accountViewModel::requestLogout,
             )
 
             AccountUiState.Deleting -> DeletingContent(
-                onLogout = accountViewModel::logout,
+                onLogout = accountViewModel::requestLogout,
             )
 
             is AccountUiState.Error -> ErrorContent(
@@ -109,9 +120,18 @@ fun AccountScreen(
                         accountViewModel.retry(activity)
                     }
                 },
+                onClearDeviceData = accountViewModel::requestLogout,
+                hasSession = client.hasSession(),
             )
 
             is AccountUiState.Unconfigured -> UnconfiguredContent(currentState.message)
+
+            is AccountUiState.ConfirmLogout -> ConfirmLogoutContent(
+                state = currentState,
+                onConfirm = accountViewModel::confirmLogout,
+                onRetryCheck = accountViewModel::retryLogoutConfirmation,
+                onCancel = accountViewModel::cancelLogout,
+            )
         }
     }
 }
@@ -140,6 +160,7 @@ private fun LoadingContent(
 private fun LoginContent(
     message: String?,
     onLogin: () -> Unit,
+    onClearDeviceData: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -148,6 +169,10 @@ private fun LoginContent(
             fontWeight = FontWeight.Bold,
         )
         Text("서비스를 이용하려면 Google 로그인이 필요해요.")
+        Text(
+            text = "계정을 바꾸면 이전 입력·대기 요청·기기 캐시가 삭제돼요.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         message?.let {
             Text(
                 text = it,
@@ -159,6 +184,12 @@ private fun LoginContent(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("Google로 로그인")
+        }
+        OutlinedButton(
+            onClick = onClearDeviceData,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("기기 대기 자료 정리")
         }
     }
 }
@@ -238,6 +269,8 @@ private fun DeletingContent(onLogout: () -> Unit) {
 private fun ErrorContent(
     state: AccountUiState.Error,
     onRetry: () -> Unit,
+    onClearDeviceData: () -> Unit,
+    hasSession: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -257,6 +290,12 @@ private fun ErrorContent(
                 Text("다시 시도")
             }
         }
+        OutlinedButton(
+            onClick = onClearDeviceData,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (hasSession) "로그아웃" else "기기 대기 자료 정리")
+        }
     }
 }
 
@@ -270,6 +309,67 @@ private fun UnconfiguredContent(message: String) {
         )
         Text(message, color = MaterialTheme.colorScheme.error)
         Text("앱 빌드에 Supabase와 Google OAuth 설정을 추가해야 로그인할 수 있어요.")
+    }
+}
+
+@Composable
+private fun ConfirmLogoutContent(
+    state: AccountUiState.ConfirmLogout,
+    onConfirm: () -> Unit,
+    onRetryCheck: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = if (state.expectedSessionOwner == null) {
+                "기기 대기 자료를 정리할까요?"
+            } else {
+                "로그아웃할까요?"
+            },
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        if (state.canConfirm) {
+            Text(
+                "서버 저장을 마치지 않은 요청 ${state.pendingCount}개를 포함해 기기에 남은 자료가 삭제됩니다.",
+            )
+        } else {
+            Text("대기 중인 저장 요청 수를 확인해야 로그아웃할 수 있어요.")
+        }
+        Text(
+            "임시 공유 입력, 동기화 캐시, 수정 충돌 자료, 아직 서버에 저장되지 않은 요청은 삭제 후 복구할 수 없어요.",
+            color = MaterialTheme.colorScheme.error,
+        )
+        state.message?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.error)
+        }
+        if (state.canConfirm) {
+            Button(
+                onClick = onConfirm,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    if (state.expectedSessionOwner == null) {
+                        "기기 대기 자료 정리"
+                    } else {
+                        "로그아웃 및 기기 자료 삭제"
+                    },
+                )
+            }
+        } else {
+            Button(
+                onClick = onRetryCheck,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("대기 요청 다시 확인")
+            }
+        }
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("취소")
+        }
     }
 }
 

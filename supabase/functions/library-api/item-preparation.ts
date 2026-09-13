@@ -8,6 +8,37 @@ export interface ItemPreparationInput {
   category_ids?: string[];
 }
 
+export interface ItemUpdateInput {
+  expected_version: number;
+  title?: string | null;
+  note?: string | null;
+  category_ids?: string[];
+}
+
+export interface ItemCategoryReference {
+  id: string;
+  name: string;
+}
+
+export interface ItemUpdateSnapshot {
+  version: number;
+  url: string;
+  user_title: string | null;
+  fetched_title: string | null;
+  shared_text: string | null;
+  description: string | null;
+  body_text: string | null;
+  note: string | null;
+  category_refs: ItemCategoryReference[];
+  metadata_state: string;
+  ocr_state: string;
+  extraction_meta: Record<string, unknown>;
+  active_asset: null | {
+    ocr_text?: string | null;
+    ocr_truncated?: boolean;
+  };
+}
+
 type SearchField =
   | "user_title"
   | "fetched_title"
@@ -33,12 +64,16 @@ export interface PreparedItem {
   metadata_allowed: boolean;
 }
 
+export interface PreparedItemUpdate extends PreparedItem {
+  snapshot_version: number;
+}
+
 interface AliasRule {
   id: string;
   forms: string[];
 }
 
-type IndexItem = Partial<Record<SearchField, string>> & {
+type IndexItem = Partial<Record<SearchField, string | null>> & {
   processing?: boolean;
   metadata_failed?: boolean;
   ocr_failed?: boolean;
@@ -92,6 +127,59 @@ export async function prepareItem(
     cue_state: cue.state,
     cue_flags: cue.flags,
     metadata_allowed: metadataAllowed,
+  };
+}
+
+export async function prepareItemUpdate(
+  snapshot: ItemUpdateSnapshot,
+  body: ItemUpdateInput,
+  selectedCategories: ItemCategoryReference[],
+): Promise<PreparedItemUpdate> {
+  const { normalizedUrl, parsed } = normalizeUrl(snapshot.url);
+  const metadataAllowed = parsed.protocol === "https:" &&
+    parsed.port === "" && metadataHosts.has(parsed.hostname);
+  const userTitle = Object.hasOwn(body, "title")
+    ? body.title
+    : snapshot.user_title;
+  const note = Object.hasOwn(body, "note") ? body.note : snapshot.note;
+  const indexItem: IndexItem = {
+    user_title: userTitle,
+    fetched_title: snapshot.fetched_title,
+    note,
+    ocr: snapshot.active_asset?.ocr_text,
+    shared: snapshot.shared_text,
+    description: snapshot.description,
+    body: snapshot.body_text,
+    categories: selectedCategories.map((category) => category.name).join(" "),
+    url: normalizedUrl,
+    processing: snapshot.metadata_state === "queued" ||
+      snapshot.metadata_state === "running" ||
+      snapshot.ocr_state === "queued" ||
+      snapshot.ocr_state === "running",
+    metadata_failed: snapshot.metadata_state === "failed",
+    ocr_failed: snapshot.ocr_state === "failed",
+    truncated: snapshot.active_asset?.ocr_truncated === true ||
+      snapshot.extraction_meta.title_truncated === true ||
+      snapshot.extraction_meta.description_truncated === true ||
+      snapshot.extraction_meta.body_truncated === true,
+  };
+  const index = buildIndex(indexItem);
+  const cue = cues(indexItem);
+
+  return {
+    normalized_url: normalizedUrl,
+    url_hash: await sha256(normalizedUrl),
+    source: sourceFor(parsed.hostname),
+    display_fallback: displayFallback(
+      snapshot.shared_text ?? undefined,
+      parsed.hostname,
+    ),
+    normalized_fields: index.fields,
+    alias_concepts: index.concepts,
+    cue_state: cue.state,
+    cue_flags: cue.flags,
+    metadata_allowed: metadataAllowed,
+    snapshot_version: snapshot.version,
   };
 }
 

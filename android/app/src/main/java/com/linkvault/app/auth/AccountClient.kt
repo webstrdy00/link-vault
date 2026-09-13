@@ -59,6 +59,8 @@ class AccountClient(
     key: String,
     googleWebClientId: String,
     debug: Boolean,
+    private val beforeSignOut: suspend () -> Unit,
+    private val onSessionOwner: suspend (ownerId: String) -> Unit,
 ) {
     private val configuration = validateAccountConfig(url, key, googleWebClientId, debug)
     private val credentialManager = CredentialManager.create(context.applicationContext)
@@ -105,14 +107,25 @@ class AccountClient(
 
     fun sessionUserId(): String? = sessionBoundary.ownerId()
 
+    suspend fun <T> withSessionOwner(expectedOwnerId: String, block: suspend () -> T): T =
+        sessionBoundary.locked {
+            val origin = currentOrigin() ?: throw AccountAuthenticationRequiredException()
+            if (origin.ownerId != expectedOwnerId) throw sessionChanged()
+            block()
+        }
+
     suspend fun restoreAccount(): AccountAccess? {
         val auth = requireSupabase().auth
         val hasRestoredSession = try {
             sessionBoundary.locked {
                 when (val status = auth.sessionStatus.value) {
                     is SessionStatus.Authenticated -> {
+                        if (status.session.expiresAt <= kotlinx.datetime.Clock.System.now()) {
+                            return@locked restoreStoredSession(auth)
+                        }
                         val ownerId = status.session.user?.id
                             ?: throw invalidSdkSession()
+                        prepareLocalOwner(ownerId)
                         val origin = currentOrigin() ?: commitLogin(ownerId)
                         if (origin.ownerId != ownerId) {
                             auth.clearSession()
@@ -198,6 +211,7 @@ class AccountClient(
                     clearCurrent()
                     throw invalidSdkSession()
                 }
+                prepareLocalOwner(ownerId)
                 commitLogin(ownerId)
             }
         } catch (error: SessionBoundaryChangedException) {
@@ -247,6 +261,7 @@ class AccountClient(
     }
 
     suspend fun libraryRequest(
+        expectedOwnerId: String,
         path: String,
         method: String = "GET",
         body: String? = null,
@@ -264,7 +279,7 @@ class AccountClient(
         }
         body?.let { validateJsonObject(it) }
 
-        val response = authorizedRequest { accessToken ->
+        val response = authorizedRequest(expectedOwnerId) { accessToken ->
             val httpResponse = requireHttpClient().request(
                 "${requireConfig().url}$FUNCTIONS_PATH$safePath",
             ) {
@@ -277,7 +292,11 @@ class AccountClient(
                     setBody(body)
                 }
             }
-            RawResponse(httpResponse.status, httpResponse.bodyAsText())
+            RawResponse(
+                httpResponse.status,
+                httpResponse.bodyAsText(),
+                parseRetryAfter(httpResponse.headers[HttpHeaders.RetryAfter]),
+            )
         }
         return acceptResponse(response) { rawResponse ->
             if (!rawResponse.status.isSuccess()) throw apiException(rawResponse)
@@ -298,6 +317,16 @@ class AccountClient(
         var failure: Exception? = null
         withContext(NonCancellable) {
             sessionBoundary.locked {
+                try {
+                    beforeSignOut()
+                } catch (error: Exception) {
+                    throw AccountClientException(
+                        message = "기기 대기 자료를 정리하지 못해 로그아웃하지 않았어요. 다시 시도해 주세요.",
+                        retryable = true,
+                        code = "LOCAL_DATA_CLEAR_FAILED",
+                        cause = error,
+                    )
+                }
                 try {
                     auth.signOut()
                 } catch (error: Exception) {
@@ -328,10 +357,11 @@ class AccountClient(
     }
 
     private suspend fun authorizedRequest(
+        expectedOwnerId: String? = null,
         request: suspend (accessToken: String) -> RawResponse,
     ): BoundResponse {
         val auth = requireSupabase().auth
-        val initialCredential = captureCredential(auth)
+        val initialCredential = captureCredential(auth, expectedOwnerId)
         var response = performRequest(initialCredential, request)
         if (response.status != HttpStatusCode.Unauthorized) {
             return BoundResponse(initialCredential.origin, response)
@@ -418,9 +448,10 @@ class AccountClient(
         )
     }
 
-    private suspend fun captureCredential(auth: Auth): BoundCredential = try {
+    private suspend fun captureCredential(auth: Auth, expectedOwnerId: String?): BoundCredential = try {
         sessionBoundary.locked {
             val origin = currentOrigin() ?: throw AccountAuthenticationRequiredException()
+            if (expectedOwnerId != null && origin.ownerId != expectedOwnerId) throw sessionChanged()
             when (val status = auth.sessionStatus.value) {
                 is SessionStatus.Authenticated -> {
                     val ownerId = status.session.user?.id ?: throw invalidSdkSession()
@@ -522,6 +553,24 @@ class AccountClient(
         throw sessionChanged()
     }
 
+    private suspend fun SessionBoundary.prepareLocalOwner(ownerId: String) {
+        if (currentOrigin()?.ownerId?.let { it != ownerId } == true) clearCurrent()
+        try {
+            onSessionOwner(ownerId)
+        } catch (error: CancellationException) {
+            clearCurrent()
+            throw error
+        } catch (error: Exception) {
+            clearCurrent()
+            throw AccountClientException(
+                message = "이 기기의 계정 자료를 준비하지 못했어요. 다시 시도해 주세요.",
+                retryable = true,
+                code = "LOCAL_ACCOUNT_STORAGE_UNAVAILABLE",
+                cause = error,
+            )
+        }
+    }
+
     private suspend fun SessionBoundary.restoreStoredSession(auth: Auth): Boolean {
         val storedSession = try {
             auth.sessionManager.loadSession()
@@ -539,10 +588,14 @@ class AccountClient(
             if (currentOrigin() != null) clearCurrent()
             throw invalidSdkSession()
         }
+        prepareLocalOwner(storedOwnerId)
         val origin = beginRestore(storedOwnerId)
         try {
             withTimeout(AUTH_SESSION_OPERATION_TIMEOUT_MILLIS) {
                 auth.importSession(storedSession, autoRefresh = false)
+                if (storedSession.expiresAt <= kotlinx.datetime.Clock.System.now()) {
+                    auth.refreshCurrentSession()
+                }
             }
         } catch (error: TimeoutCancellationException) {
             markRecoverable(origin)
@@ -639,6 +692,7 @@ class AccountClient(
         retryable = envelope?.error?.retryable ?: (response.status.value >= 500),
         code = envelope?.error?.code,
         requestId = envelope?.requestId,
+        retryAfterSeconds = response.retryAfterSeconds,
     )
 
     private fun decodeApiError(body: String): ApiErrorEnvelope? = try {
@@ -750,6 +804,7 @@ open class AccountClientException(
     override val message: String,
     val retryable: Boolean,
     val code: String? = null,
+    val retryAfterSeconds: Int? = null,
     val requestId: String? = null,
     cause: Throwable? = null,
 ) : Exception(message, cause)
@@ -954,7 +1009,23 @@ private fun RestException.isDefinitiveRefreshFailure(): Boolean {
 private data class RawResponse(
     val status: HttpStatusCode,
     val body: String,
+    val retryAfterSeconds: Int? = null,
 )
+
+internal fun parseRetryAfter(value: String?, nowMillis: Long = System.currentTimeMillis()): Int? {
+    val header = value?.trim() ?: return null
+    header.toLongOrNull()?.let { seconds ->
+        return if (seconds < 0) null else seconds.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }
+    return runCatching {
+        val deadline = java.time.ZonedDateTime.parse(
+            header,
+            java.time.format.DateTimeFormatter.RFC_1123_DATE_TIME,
+        ).toInstant().toEpochMilli()
+        ((deadline - nowMillis).coerceAtLeast(0) + 999L)
+            .div(1000L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+    }.getOrNull()
+}
 
 private data class BoundCredential(
     val origin: SessionOrigin,

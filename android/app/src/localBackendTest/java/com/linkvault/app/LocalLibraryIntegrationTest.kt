@@ -45,6 +45,7 @@ class LocalLibraryIntegrationTest {
             install(Auth)
         }
         try {
+            ApplicationProvider.getApplicationContext<LinkVaultApplication>().accountClient.signOut()
             sessionClient.auth.awaitInitialization()
             sessionClient.auth.signInWith(Email) {
                 this.email = email

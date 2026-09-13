@@ -178,6 +178,100 @@ try {
     detail.status === 200 && detail.body.note === itemBody.note,
     "duplicate save does not overwrite original note",
   );
+  const patchItem = (account, body, id = randomUUID()) =>
+    request(`/functions/v1/library-api/v1/items/${saved.body.item.id}`, {
+      token: account.token,
+      method: "PATCH",
+      body,
+      headers: { "X-Request-Id": id },
+    });
+  const editId = randomUUID();
+  const editBody = {
+    expected_version: detail.body.version,
+    note: "엑셀 수정 메모",
+    title: null,
+  };
+  const edited = await patchItem(a, editBody, editId);
+  check(
+    edited.status === 200 && edited.body.note === editBody.note &&
+      edited.body.user_title === null,
+    "PATCH updates note and clears the optional title",
+  );
+  const replayedEdit = await patchItem(a, editBody, editId);
+  check(
+    replayedEdit.status === 200 &&
+      replayedEdit.body.version === edited.body.version,
+    "successful PATCH replay wins before stale version checking",
+  );
+  const changedEdit = await patchItem(a, {
+    ...editBody,
+    note: "changed request",
+  }, editId);
+  check(
+    changedEdit.status === 409 &&
+      changedEdit.body.error.code === "IDEMPOTENCY_MISMATCH",
+    "PATCH request ID cannot be reused for changed input",
+  );
+  const staleEditId = randomUUID();
+  const staleEdit = await patchItem(a, editBody, staleEditId);
+  check(
+    staleEdit.status === 409 &&
+      staleEdit.body.error.code === "VERSION_CONFLICT",
+    "new stale-version edit stops instead of overwriting",
+  );
+  const rewrittenConflict = await patchItem(a, {
+    ...editBody,
+    expected_version: edited.body.version,
+  }, staleEditId);
+  check(
+    rewrittenConflict.status === 409 &&
+      rewrittenConflict.body.error.code === "IDEMPOTENCY_MISMATCH",
+    "a conflicted request cannot change its body while reusing the same ID",
+  );
+  const concurrentEdits = await Promise.all([
+    patchItem(a, {
+      expected_version: edited.body.version,
+      note: "경쟁 메모 하나",
+    }),
+    patchItem(a, {
+      expected_version: edited.body.version,
+      note: "경쟁 메모 둘",
+    }),
+  ]);
+  check(
+    concurrentEdits.filter((result) => result.status === 200).length === 1 &&
+      concurrentEdits.filter((result) => result.status === 409).length === 1,
+    "two edits of the same version commit only one winner",
+  );
+  const winner = concurrentEdits.find((result) => result.status === 200);
+  const cleared = await patchItem(a, {
+    expected_version: winner.body.version,
+    note: null,
+  });
+  check(
+    cleared.status === 200 && cleared.body.note === null,
+    "explicit null clears the stored note",
+  );
+  const indexAfterClear = await request(
+    `/rest/v1/item_search?item_id=eq.${saved.body.item.id}&select=normalized_fields,alias_concepts`,
+    { token: a.token },
+  );
+  check(
+    indexAfterClear.status === 200 && indexAfterClear.body.length === 1 &&
+      indexAfterClear.body[0].normalized_fields.note === "" &&
+      indexAfterClear.body[0].alias_concepts.note.length === 0,
+    "note clearing removes normalized text and alias concepts in the same write",
+  );
+  const foreignEdit = await patchItem(b, {
+    expected_version: cleared.body.version,
+    note: "foreign",
+  });
+  check(foreignEdit.status === 404, "another account cannot edit the item");
+  const forbiddenUrl = await patchItem(a, {
+    expected_version: cleared.body.version,
+    url: "https://example.org/replacement",
+  });
+  check(forbiddenUrl.status === 400, "PATCH cannot replace the original URL");
   const forbiddenDetail = await request(
     `/functions/v1/library-api/v1/items/${saved.body.item.id}`,
     { token: b.token },

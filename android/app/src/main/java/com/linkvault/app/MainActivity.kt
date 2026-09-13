@@ -27,6 +27,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -45,14 +46,51 @@ import com.linkvault.app.library.LibraryScreen
 import com.linkvault.app.capture.CaptureInput
 import com.linkvault.app.capture.InvalidUrlReason
 import java.util.UUID
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private var capture by mutableStateOf(IncomingCapture())
     private var nextSequence by mutableIntStateOf(0)
+    private var draftTouched = false
+    private var recoveryError by mutableStateOf<String?>(null)
+    private var handledLogoutGeneration = 0L
+    private val app get() = application as LinkVaultApplication
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+        val currentLogout = app.logoutGeneration.value
+        val staleState = savedInstanceState != null &&
+            savedInstanceState.getLong("capture_logout_generation", 0L) != currentLogout
+        super.onCreate(if (staleState) null else savedInstanceState)
+        handledLogoutGeneration = currentLogout
+        if (staleState) setIntent(Intent(this, MainActivity::class.java))
         capture = readIncomingCapture(intent, sequence = 0)
+        val isShare = intent?.action == Intent.ACTION_SEND || intent?.action == Intent.ACTION_SEND_MULTIPLE
+        val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
+        if (fromHistory && savedInstanceState == null) capture = IncomingCapture()
+        if (isShare && !staleState && savedInstanceState == null && !fromHistory) {
+            draftTouched = true
+            app.persistCapture(capture.text, null)
+        } else if (savedInstanceState == null || staleState) {
+            lifecycleScope.launch {
+                try {
+                    val pending = app.outboxRepository.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID)
+                    if (!draftTouched && capture.sequence == 0 && pending != null) {
+                        nextSequence += 1
+                        capture = IncomingCapture(
+                            text = pending.text,
+                            selectedUrl = pending.selectedUrl,
+                            sequence = nextSequence,
+                        )
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    recoveryError = "기기에 보관한 입력을 불러오지 못했어요."
+                }
+            }
+        }
 
         setContent {
             MaterialTheme {
@@ -66,11 +104,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putLong("capture_logout_generation", handledLogoutGeneration)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) return
+        draftTouched = true
         nextSequence += 1
         capture = readIncomingCapture(intent, sequence = nextSequence)
+        app.persistCapture(capture.text, null)
     }
 
     @Composable
@@ -84,18 +130,35 @@ class MainActivity : ComponentActivity() {
         var libraryUrl by rememberSaveable { mutableStateOf<String?>(null) }
         var librarySharedText by rememberSaveable { mutableStateOf("") }
         var input by rememberSaveable { mutableStateOf(capture.text) }
-        var selectedUrl by rememberSaveable { mutableStateOf<String?>(null) }
+        var selectedUrl by rememberSaveable { mutableStateOf(capture.selectedUrl) }
         var inputLimitExceeded by rememberSaveable {
             mutableStateOf(capture.text.length > CaptureInput.MAX_INPUT_LENGTH)
         }
         var openError by rememberSaveable { mutableStateOf<String?>(null) }
+        val logoutGeneration by app.logoutGeneration.collectAsState()
+        val draftError by app.draftError.collectAsState()
+
+        LaunchedEffect(logoutGeneration) {
+            if (logoutGeneration != handledLogoutGeneration) {
+                input = ""
+                selectedUrl = null
+                showLibrary = false
+                libraryUrl = null
+                librarySharedText = ""
+                inputLimitExceeded = false
+                openError = null
+                draftTouched = true
+                setIntent(Intent(this@MainActivity, MainActivity::class.java))
+                handledLogoutGeneration = logoutGeneration
+            }
+        }
 
         LaunchedEffect(capture.sequence) {
             if (capture.sequence > 0) {
                 showAccount = false
                 showLibrary = false
                 input = capture.text
-                selectedUrl = null
+                selectedUrl = capture.selectedUrl
                 inputLimitExceeded = capture.text.length > CaptureInput.MAX_INPUT_LENGTH
                 openError = null
             }
@@ -173,10 +236,12 @@ class MainActivity : ComponentActivity() {
             OutlinedTextField(
                 value = input,
                 onValueChange = { newValue ->
+                    draftTouched = true
                     input = newValue
                     selectedUrl = null
                     inputLimitExceeded = newValue.length > CaptureInput.MAX_INPUT_LENGTH
                     openError = null
+                    app.persistCapture(newValue, null)
                 },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("공유 텍스트 또는 원문 URL") },
@@ -188,6 +253,18 @@ class MainActivity : ComponentActivity() {
                     { Text(message) }
                 },
             )
+
+            (draftError ?: recoveryError)?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+            Button(onClick = {
+                draftTouched = true
+                input = ""
+                selectedUrl = null
+                inputLimitExceeded = false
+                openError = null
+                app.persistCapture("", null)
+            }) { Text("입력 지우기") }
 
             if (parsed.urls.isNotEmpty()) {
                 HorizontalDivider()
@@ -214,6 +291,8 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     selectedUrl = url
                                     openError = null
+                                    draftTouched = true
+                                    app.persistCapture(input, url)
                                 },
                             ),
                         color = if (selected) {
@@ -284,6 +363,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     LibraryScreen(
                         client = (application as LinkVaultApplication).accountClient,
+                        outbox = app.outboxRepository,
                         entryId = libraryEntryId,
                         initialUrl = libraryUrl,
                         sharedText = librarySharedText,
@@ -307,6 +387,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
                     AccountScreen(
                         client = (application as LinkVaultApplication).accountClient,
+                        outbox = app.outboxRepository,
                         onBack = { showAccount = false },
                     )
                 }
@@ -361,6 +442,7 @@ class MainActivity : ComponentActivity() {
 
 private data class IncomingCapture(
     val text: String = "",
+    val selectedUrl: String? = null,
     val imageCount: Int = 0,
     val isImageShare: Boolean = false,
     val sequence: Int = 0,

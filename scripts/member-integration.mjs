@@ -1,0 +1,380 @@
+import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+
+// Credentials stay in this process. Never emit the local status response or tokens.
+const config = JSON.parse(execSync("npx --no-install supabase status -o json", {
+  encoding: "utf8",
+  stdio: ["ignore", "pipe", "pipe"],
+}));
+const base = config.API_URL;
+assert.equal(
+  new URL(base).hostname,
+  "127.0.0.1",
+  "This test only mutates local Supabase",
+);
+assert.equal(new URL(base).port, "54321");
+const serviceKey = config.SERVICE_ROLE_KEY;
+const anonKey = config.ANON_KEY;
+const createdUsers = [];
+let checks = 0;
+
+async function request(
+  path,
+  { token = anonKey, method = "GET", body, headers = {} } = {},
+) {
+  const response = await fetch(`${base}${path}`, {
+    method,
+    headers: {
+      apikey: anonKey,
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...headers,
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(15000),
+  });
+  const text = await response.text();
+  return { status: response.status, body: text ? JSON.parse(text) : null };
+}
+function check(condition, label) {
+  assert.ok(condition, label);
+  checks++;
+  console.log(`PASS ${label}`);
+}
+async function user() {
+  const email = `member-${randomUUID()}@example.test`;
+  const password = `Local-fixture-${randomUUID()}!`;
+  const created = await request("/auth/v1/admin/users", {
+    token: serviceKey,
+    method: "POST",
+    body: { email, password, email_confirm: true },
+  });
+  assert.equal(created.status, 200, "create local fixture user");
+  createdUsers.push(created.body.id);
+  // Real local GoTrue sessions, not forged JWTs. Password is a test fixture only;
+  // the Android product exposes Google login exclusively.
+  const session = await request("/auth/v1/token?grant_type=password", {
+    method: "POST",
+    body: { email, password },
+  });
+  assert.equal(session.status, 200, "issue real local test session");
+  return { id: created.body.id, token: session.body.access_token };
+}
+async function approve(account) {
+  const result = await request("/rest/v1/beta_members", {
+    token: serviceKey,
+    method: "POST",
+    body: {
+      owner_id: account.id,
+      enabled: true,
+      approved_at: new Date().toISOString(),
+    },
+  });
+  assert.equal(result.status, 201, "approve local fixture member");
+}
+function bootstrap(account, id = randomUUID()) {
+  return request("/functions/v1/library-api/v1/bootstrap", {
+    token: account.token,
+    method: "POST",
+    body: {},
+    headers: { "X-Request-Id": id },
+  });
+}
+
+try {
+  const health = await request("/functions/v1/library-api/v1/health");
+  check(
+    health.status === 200 && health.body.status === "ok",
+    "Edge function health",
+  );
+  const invalid = await request("/functions/v1/library-api/v1/me", {
+    token: "not-a-jwt",
+  });
+  check(invalid.status === 401, "invalid JWT rejected by real auth");
+  const a = await user();
+  const b = await user();
+  const pending = await request("/functions/v1/library-api/v1/me", {
+    token: a.token,
+  });
+  check(
+    pending.status === 200 && pending.body.state === "pending_approval",
+    "unapproved account has minimum state",
+  );
+  const denied = await bootstrap(a);
+  check(
+    denied.status === 403 && denied.body.error.code === "BETA_ACCESS_REQUIRED",
+    "bootstrap requires beta approval",
+  );
+  await approve(a);
+  await approve(b);
+  const requestId = randomUUID();
+  const [first, repeated] = await Promise.all([
+    bootstrap(a, requestId),
+    bootstrap(a, requestId),
+  ]);
+  check(
+    first.status === 200 && repeated.status === 200,
+    "concurrent bootstrap succeeds idempotently",
+  );
+  check(
+    first.body.profile.id === a.id && repeated.body.profile.id === a.id,
+    "bootstrap binds caller identity",
+  );
+  check(
+    first.body.categories.length === 8 && repeated.body.categories.length === 8,
+    "exactly eight system categories",
+  );
+  check(first.body.usage.active_item_count === 0, "new member usage is empty");
+  await bootstrap(b);
+  const itemRequest = randomUUID();
+  const itemBody = {
+    url: "https://example.com/article?utm_source=integration&id=17#section",
+    title: "통합 검증 링크",
+    note: "카톡 프사 설정",
+  };
+  const createItem = (account, body, id = randomUUID()) =>
+    request("/functions/v1/library-api/v1/items", {
+      token: account.token,
+      method: "POST",
+      body,
+      headers: { "X-Request-Id": id },
+    });
+  const [saved, replay] = await Promise.all([
+    createItem(a, itemBody, itemRequest),
+    createItem(a, itemBody, itemRequest),
+  ]);
+  check(
+    saved.status === 201 && replay.status === 201,
+    "concurrent save retry commits once",
+  );
+  check(
+    saved.body.item.id === replay.body.item.id,
+    "save retry returns same item identity",
+  );
+  const duplicate = await createItem(a, {
+    url: "https://EXAMPLE.COM:443/article?utm_source=integration&id=17#section",
+    note: "should not overwrite previous note",
+  });
+  check(
+    duplicate.status === 200 && duplicate.body.duplicate === true,
+    "normalized URL duplicate detected",
+  );
+  const mismatched = await createItem(
+    a,
+    { ...itemBody, note: "different" },
+    itemRequest,
+  );
+  check(
+    mismatched.status === 409 &&
+      mismatched.body.error.code === "IDEMPOTENCY_MISMATCH",
+    "changed request body cannot reuse request ID",
+  );
+  const detail = await request(
+    `/functions/v1/library-api/v1/items/${saved.body.item.id}`,
+    { token: a.token },
+  );
+  check(
+    detail.status === 200 && detail.body.note === itemBody.note,
+    "duplicate save does not overwrite original note",
+  );
+  const forbiddenDetail = await request(
+    `/functions/v1/library-api/v1/items/${saved.body.item.id}`,
+    { token: b.token },
+  );
+  check(
+    forbiddenDetail.status === 404,
+    "other account item detail not disclosed",
+  );
+  const fakeOwner = await createItem(a, { ...itemBody, owner_id: b.id });
+  check(fakeOwner.status === 400, "client supplied owner rejected");
+  const forgedWrite = await request("/rest/v1/rpc/library_create_item", {
+    token: a.token,
+    method: "POST",
+    body: {
+      p_owner_id: b.id,
+      p_request_id: randomUUID(),
+      p_body: itemBody,
+      p_prepared: {},
+    },
+  });
+  check(
+    forgedWrite.status === 403,
+    "derived-data write RPC restricted to server",
+  );
+  const savedB = await createItem(b, {
+    url: "https://example.com/private-b",
+    note: "B only",
+  });
+  check(savedB.status === 201, "second member saves own item");
+  const listed = await request(
+    "/functions/v1/library-api/v1/items?limit=20&offset=0",
+    { token: a.token },
+  );
+  check(
+    listed.status === 200 && listed.body.items.length === 1 &&
+      listed.body.items[0].id === saved.body.item.id,
+    "list contains only caller saved item",
+  );
+  const hiddenB = await request(
+    `/rest/v1/item_search?owner_id=eq.${b.id}&select=item_id`,
+    { token: a.token },
+  );
+  check(
+    hiddenB.status === 200 && hiddenB.body.length === 0,
+    "search derivatives are also owner isolated",
+  );
+  const invalidPage = await request(
+    "/functions/v1/library-api/v1/items?limit=51",
+    { token: a.token },
+  );
+  check(invalidPage.status === 400, "list page limit enforced");
+  const resetFixtureRateWindow = async () => {
+    // Advance only this fixture's rate window administratively so the test need
+    // not wait ten real minutes to reach 99 actual rows. Clients cannot do this.
+    const reset = await request(
+      `/rest/v1/api_rate_buckets?owner_id=eq.${a.id}`,
+      {
+        token: serviceKey,
+        method: "DELETE",
+      },
+    );
+    assert.equal(reset.status, 204);
+  };
+  for (let index = 0; index < 98; index++) {
+    if (index % 10 === 0) await resetFixtureRateWindow();
+    const seeded = await createItem(a, {
+      url: `https://example.com/quota-${index}`,
+    });
+    assert.equal(seeded.status, 201, "create actual quota fixture row");
+    if (index === 9) {
+      const rateLimited = await createItem(a, {
+        url: "https://example.com/rate-rejected",
+      });
+      check(
+        rateLimited.status === 429,
+        "eleventh new save in one minute is rate limited",
+      );
+    }
+  }
+  await resetFixtureRateWindow();
+  const quotaRace = await Promise.all([
+    createItem(a, { url: "https://example.com/quota-race-one" }),
+    createItem(a, { url: "https://example.com/quota-race-two" }),
+  ]);
+  check(
+    quotaRace.filter((result) => result.status === 201).length === 1 &&
+      quotaRace.filter((result) =>
+          result.status === 409 &&
+          result.body.error.code === "ITEM_LIMIT_REACHED"
+        ).length === 1,
+    "two concurrent saves at 99 items admit only one",
+  );
+  const quotaUsage = await request("/functions/v1/library-api/v1/me", {
+    token: a.token,
+  });
+  check(
+    quotaUsage.status === 200 &&
+      quotaUsage.body.usage.active_item_count === 100,
+    "usage stays at one hundred after the quota race",
+  );
+  const quotaPage = await request(
+    "/functions/v1/library-api/v1/items?limit=50&offset=50",
+    { token: a.token },
+  );
+  check(
+    quotaPage.status === 200 && quotaPage.body.items.length === 50 &&
+      !quotaPage.body.has_more,
+    "one hundred actual rows paginate without overflow",
+  );
+  const cross = await request(
+    `/rest/v1/categories?owner_id=eq.${b.id}&select=id`,
+    { token: a.token },
+  );
+  check(
+    cross.status === 200 && cross.body.length === 0,
+    "RLS blocks cross-account categories",
+  );
+  const own = await request(
+    `/rest/v1/categories?owner_id=eq.${a.id}&select=id`,
+    { token: a.token },
+  );
+  check(
+    own.status === 200 && own.body.length === 8,
+    "RLS allows own active categories",
+  );
+  const write = await request("/rest/v1/categories", {
+    token: a.token,
+    method: "POST",
+    body: { owner_id: a.id, name: "forbidden", kind: "custom" },
+  });
+  check(write.status === 403, "direct category writes denied");
+  const revoke = await request(`/rest/v1/beta_members?owner_id=eq.${a.id}`, {
+    token: serviceKey,
+    method: "PATCH",
+    body: { enabled: false },
+  });
+  assert.equal(revoke.status, 204);
+  const revoked = await bootstrap(a);
+  check(revoked.status === 403, "revocation blocks existing JWT bootstrap");
+  const hidden = await request("/rest/v1/categories?select=id", {
+    token: a.token,
+  });
+  check(
+    hidden.status === 200 && hidden.body.length === 0,
+    "revocation hides existing member data",
+  );
+  const deleting = await request(`/rest/v1/profiles?id=eq.${b.id}`, {
+    token: serviceKey,
+    method: "PATCH",
+    body: {
+      state: "deleting",
+      deletion_requested_at: new Date().toISOString(),
+    },
+  });
+  assert.equal(deleting.status, 204);
+  const deletedBootstrap = await bootstrap(b);
+  check(
+    deletedBootstrap.status === 403 &&
+      deletedBootstrap.body.error.code === "ACCOUNT_DELETING",
+    "deleting state cannot bootstrap again",
+  );
+  const deletedMe = await request("/functions/v1/library-api/v1/me", {
+    token: b.token,
+  });
+  check(
+    deletedMe.status === 200 && deletedMe.body.state === "deleting",
+    "deleting account receives only state",
+  );
+  for (let index = 0; index < 4; index++) await approve(await user());
+  const contenders = [await user(), await user()];
+  const approvals = await Promise.all(
+    contenders.map((account) =>
+      request("/rest/v1/beta_members", {
+        token: serviceKey,
+        method: "POST",
+        body: {
+          owner_id: account.id,
+          enabled: true,
+          approved_at: new Date().toISOString(),
+        },
+      })
+    ),
+  );
+  check(
+    approvals.filter((result) => result.status === 201).length === 1 &&
+      approvals.filter((result) => result.status === 400).length === 1,
+    "concurrent seventh approval cannot exceed six enabled members",
+  );
+} finally {
+  for (const id of createdUsers) {
+    const result = await request(`/auth/v1/admin/users/${id}`, {
+      token: serviceKey,
+      method: "DELETE",
+    });
+    assert.equal(result.status, 200, "remove only this run fixture account");
+  }
+}
+console.log(
+  `${checks} real local Auth/API/RLS checks passed; Google provider not exercised.`,
+);

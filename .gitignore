@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# 로컬 에이전트/도구 (개발 규칙 파일. 팀 공유가 필요하면 이 블록을 해제한다)
+# ---------------------------------------------------------------------------
+.claude/
+CLAUDE.md
+CLAUDE-*.md
+AGENTS.md
+GOALS.md
+.gjc/
+.codex/
+.serena/
+.omc/
+.omx/
+
+# ---------------------------------------------------------------------------
+# 기획 문서 (원본은 로컬 보관. 공유가 필요하면 이 블록을 해제한다)
+# ---------------------------------------------------------------------------
+docs/*
+!docs/DEPLOYMENT.md
+!docs/IMPLEMENTATION_STATUS.md
+
+# Android build outputs and machine-local settings
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+*.iml
+*.jks
+*.keystore
+
+# Local backend tooling and credentials
+node_modules/
+.env
+.env.*
+supabase/.temp/
+supabase/.branches/

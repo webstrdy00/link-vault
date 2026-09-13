@@ -1,0 +1,16 @@
+{
+  "name": "link-vault",
+  "private": true,
+  "scripts": {
+    "backend:start": "supabase start -x studio,imgproxy,realtime,storage-api,logflare,vector,supavisor,postgres-meta",
+    "backend:migrate": "supabase migration up --local",
+    "test:db": "supabase test db",
+    "test:api": "deno test --config supabase/functions/library-api/deno.json supabase/functions/library-api/handler_test.ts",
+    "test:integration": "node scripts/member-integration.mjs",
+    "test:emulator-integration": "node scripts/emulator-integration.mjs"
+  },
+  "devDependencies": {
+    "deno": "2.9.6",
+    "supabase": "2.117.0"
+  }
+}

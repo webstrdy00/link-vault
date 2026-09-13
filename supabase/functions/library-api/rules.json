@@ -1,0 +1,210 @@
+{
+  "version": "rules-v2.0.0",
+  "search_version": "search-v2.0.0",
+  "cue_version": "cues-v1.0.0",
+  "threshold": 3,
+  "max_auto": 3,
+  "max_total": 5,
+  "suffixes": [
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "의",
+    "에",
+    "에서",
+    "에게",
+    "와",
+    "과",
+    "도",
+    "만",
+    "로",
+    "으로",
+    "부터",
+    "까지",
+    "보다",
+    "처럼",
+    "에는",
+    "에서는",
+    "으로는",
+    "이라면",
+    "라면"
+  ],
+  "categories": [
+    {
+      "id": "travel",
+      "name": "여행",
+      "strong": [
+        ["여행", "여행용", "travel"],
+        ["숙소", "accommodation"],
+        ["여행 일정", "여행 코스"],
+        ["항공권"],
+        ["관광"],
+        ["캠핑"]
+      ],
+      "weak": [
+        ["호텔", "hotel"],
+        ["제주"],
+        ["공항"]
+      ]
+    },
+    {
+      "id": "food",
+      "name": "음식·맛집",
+      "strong": [
+        ["맛집"],
+        ["레시피", "recipe"],
+        ["식당 추천"],
+        ["카페 추천"],
+        ["베이킹"],
+        ["요리법"]
+      ],
+      "weak": [
+        ["카페", "cafe"],
+        ["식당", "restaurant"],
+        ["메뉴", "menu"],
+        ["커피", "coffee"]
+      ]
+    },
+    {
+      "id": "work",
+      "name": "업무·학습",
+      "strong": [
+        ["엑셀", "excel"],
+        ["xlookup"],
+        ["회의록"],
+        ["공부법"],
+        ["파이썬", "python"],
+        ["sql"],
+        ["jetpack compose"],
+        ["시험 공부"]
+      ],
+      "weak": [
+        ["회의"],
+        ["학습"],
+        ["업무"],
+        ["함수"]
+      ]
+    },
+    {
+      "id": "shopping",
+      "name": "쇼핑",
+      "strong": [
+        ["구매 후기"],
+        ["제품 비교"],
+        ["가격 비교"],
+        ["최저가"],
+        ["장바구니"]
+      ],
+      "weak": [
+        ["구매"],
+        ["가격"],
+        ["할인"],
+        ["제품"],
+        ["카메라"]
+      ]
+    },
+    {
+      "id": "tools",
+      "name": "앱·도구",
+      "strong": [
+        ["앱 사용법"],
+        ["앱 추천"],
+        ["소프트웨어", "software"],
+        ["자동화", "automation"],
+        ["activitypub"],
+        ["fediverse"],
+        ["브라우저 확장"]
+      ],
+      "weak": [
+        ["앱", "app"],
+        ["기능", "feature"],
+        ["업데이트", "update"],
+        ["카카오톡", "카톡"],
+        ["인스타그램", "instagram"]
+      ]
+    },
+    {
+      "id": "life",
+      "name": "생활·건강",
+      "strong": [
+        ["스트레칭", "stretching"],
+        ["운동 루틴"],
+        ["수면"],
+        ["청소"],
+        ["정리 수납"],
+        ["건강"],
+        ["육아"],
+        ["반려동물"]
+      ],
+      "weak": [
+        ["운동"],
+        ["생활"],
+        ["습관"]
+      ]
+    },
+    {
+      "id": "culture",
+      "name": "문화·읽을거리",
+      "strong": [
+        ["전시", "전시회"],
+        ["박물관", "museum"],
+        ["공연"],
+        ["독서"],
+        ["서평"],
+        ["책 추천"],
+        ["영화"],
+        ["칼럼", "opinion column"],
+        ["풍속화"],
+        ["달항아리"]
+      ],
+      "weak": [
+        ["책"],
+        ["기사"],
+        ["문화"]
+      ]
+    }
+  ],
+  "aliases": [
+    {
+      "id": "kakaotalk",
+      "forms": ["카카오톡", "카톡", "kakaotalk"]
+    },
+    {
+      "id": "profile_photo",
+      "forms": ["프로필 사진", "프로필사진", "프사", "profile photo"]
+    },
+    {
+      "id": "instagram",
+      "forms": ["인스타그램", "인스타", "instagram"]
+    },
+    {
+      "id": "threads",
+      "forms": ["스레드", "쓰레드", "threads"]
+    },
+    {
+      "id": "excel",
+      "forms": ["엑셀", "excel"]
+    },
+    {
+      "id": "android",
+      "forms": ["안드로이드", "android"]
+    },
+    {
+      "id": "youtube",
+      "forms": ["유튜브", "youtube"]
+    },
+    {
+      "id": "reels",
+      "forms": ["릴스", "reels"]
+    }
+  ],
+  "compounds": {
+    "카톡프사": ["kakaotalk", "profile_photo"],
+    "카카오톡프사": ["kakaotalk", "profile_photo"],
+    "카톡프로필사진": ["kakaotalk", "profile_photo"],
+    "카카오톡프로필사진": ["kakaotalk", "profile_photo"]
+  }
+}

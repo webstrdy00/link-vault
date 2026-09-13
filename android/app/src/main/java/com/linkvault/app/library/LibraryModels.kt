@@ -1,0 +1,260 @@
+package com.linkvault.app.library
+
+import java.net.URI
+import java.util.UUID
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.put
+
+const val LIBRARY_URL_MAX_CODE_POINTS = 4096
+const val LIBRARY_TITLE_MAX_CODE_POINTS = 300
+const val LIBRARY_NOTE_MAX_CODE_POINTS = 4000
+const val LIBRARY_SHARED_TEXT_MAX_CODE_POINTS = 4000
+
+private val libraryJson = Json { ignoreUnknownKeys = true }
+
+data class LibrarySaveForm(
+    val initialUrl: String?,
+    val sharedText: String,
+    val title: String = "",
+    val note: String = "",
+)
+
+enum class LibraryFormField {
+    URL,
+    TITLE,
+    NOTE,
+    SHARED_TEXT,
+}
+
+data class LibraryFormIssue(
+    val field: LibraryFormField,
+    val message: String,
+)
+
+sealed interface LibrarySavePreparation {
+    data class Valid(val operation: LibrarySaveOperation) : LibrarySavePreparation
+    data class Invalid(val issues: List<LibraryFormIssue>) : LibrarySavePreparation
+}
+
+data class LibraryRequestArguments(
+    val path: String,
+    val method: String,
+    val body: String?,
+    val requestId: String?,
+)
+
+data class LibrarySaveOperation(
+    val ownerId: String,
+    val requestId: String,
+    val body: String,
+) {
+    fun requestArguments() = LibraryRequestArguments(
+        path = "/items",
+        method = "POST",
+        body = body,
+        requestId = requestId,
+    )
+}
+
+fun validateLibrarySaveForm(form: LibrarySaveForm): List<LibraryFormIssue> = buildList {
+    val url = form.initialUrl
+    when {
+        url.isNullOrEmpty() -> add(
+            LibraryFormIssue(
+                LibraryFormField.URL,
+                "보관할 원문 URL이 없어요. 원문 입력 화면에서 URL을 먼저 확인해 주세요.",
+            ),
+        )
+
+        url.codePointLength() > LIBRARY_URL_MAX_CODE_POINTS -> add(
+            LibraryFormIssue(
+                LibraryFormField.URL,
+                "원문 URL은 최대 ${LIBRARY_URL_MAX_CODE_POINTS}자까지 보관할 수 있어요.",
+            ),
+        )
+
+        !url.isValidLibraryUrl() -> add(
+            LibraryFormIssue(
+                LibraryFormField.URL,
+                "HTTP 또는 HTTPS 원문 URL을 다시 확인해 주세요.",
+            ),
+        )
+    }
+
+    if (form.title.codePointLength() > LIBRARY_TITLE_MAX_CODE_POINTS) {
+        add(
+            LibraryFormIssue(
+                LibraryFormField.TITLE,
+                "제목은 최대 ${LIBRARY_TITLE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
+            ),
+        )
+    }
+    if (form.note.codePointLength() > LIBRARY_NOTE_MAX_CODE_POINTS) {
+        add(
+            LibraryFormIssue(
+                LibraryFormField.NOTE,
+                "메모는 최대 ${LIBRARY_NOTE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
+            ),
+        )
+    }
+    if (form.sharedText.codePointLength() > LIBRARY_SHARED_TEXT_MAX_CODE_POINTS) {
+        add(
+            LibraryFormIssue(
+                LibraryFormField.SHARED_TEXT,
+                "공유 텍스트가 ${LIBRARY_SHARED_TEXT_MAX_CODE_POINTS}자를 넘어요. 원문 입력 화면에서 내용을 줄여 주세요.",
+            ),
+        )
+    }
+}
+
+fun prepareLibrarySave(
+    form: LibrarySaveForm,
+    ownerId: String,
+    requestId: String,
+): LibrarySavePreparation {
+    val issues = validateLibrarySaveForm(form).toMutableList()
+    if (ownerId.isBlank()) {
+        issues += LibraryFormIssue(
+            LibraryFormField.URL,
+            "로그인 계정을 확인하지 못했어요. 다시 로그인해 주세요.",
+        )
+    }
+    if (!requestId.isCanonicalUuid()) {
+        issues += LibraryFormIssue(
+            LibraryFormField.URL,
+            "저장 요청을 만들지 못했어요. 다시 시도해 주세요.",
+        )
+    }
+    if (issues.isNotEmpty()) return LibrarySavePreparation.Invalid(issues)
+
+    val body = buildJsonObject {
+        put("url", form.initialUrl!!)
+        form.title.takeUnless(String::isBlank)?.let { put("title", it) }
+        form.note.takeUnless(String::isBlank)?.let { put("note", it) }
+        form.sharedText.takeUnless(String::isBlank)?.let { put("shared_text", it) }
+    }.toString()
+    return LibrarySavePreparation.Valid(
+        LibrarySaveOperation(
+            ownerId = ownerId,
+            requestId = requestId,
+            body = body,
+        ),
+    )
+}
+
+@Serializable
+data class LibraryCategoryRef(
+    val id: String? = null,
+    val name: String? = null,
+    val origin: String? = null,
+)
+
+@Serializable
+data class LibraryItemSummary(
+    val id: String,
+    val version: Long? = null,
+    val url: String,
+    @SerialName("display_title") val displayTitle: String? = null,
+    val source: String? = null,
+    @SerialName("note_excerpt") val noteExcerpt: String? = null,
+    @SerialName("category_refs") val categoryRefs: List<LibraryCategoryRef> = emptyList(),
+    @SerialName("has_attachment") val hasAttachment: Boolean? = null,
+    @SerialName("metadata_state") val metadataState: String? = null,
+    @SerialName("ocr_state") val ocrState: String? = null,
+    @SerialName("classification_state") val classificationState: String? = null,
+    @SerialName("cue_state") val cueState: String? = null,
+    @SerialName("cue_flags") val cueFlags: List<String> = emptyList(),
+    @SerialName("match_type") val matchType: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+)
+
+@Serializable
+data class LibraryItemDetail(
+    val id: String,
+    val version: Long? = null,
+    val url: String,
+    @SerialName("display_title") val displayTitle: String? = null,
+    val source: String? = null,
+    @SerialName("note_excerpt") val noteExcerpt: String? = null,
+    @SerialName("category_refs") val categoryRefs: List<LibraryCategoryRef> = emptyList(),
+    @SerialName("has_attachment") val hasAttachment: Boolean? = null,
+    @SerialName("metadata_state") val metadataState: String? = null,
+    @SerialName("ocr_state") val ocrState: String? = null,
+    @SerialName("classification_state") val classificationState: String? = null,
+    @SerialName("cue_state") val cueState: String? = null,
+    @SerialName("cue_flags") val cueFlags: List<String> = emptyList(),
+    @SerialName("match_type") val matchType: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    @SerialName("user_title") val userTitle: String? = null,
+    @SerialName("fetched_title") val fetchedTitle: String? = null,
+    @SerialName("shared_text") val sharedText: String? = null,
+    val description: String? = null,
+    @SerialName("body_text") val bodyText: String? = null,
+    val note: String? = null,
+)
+
+@Serializable
+private data class LibraryListResponse(
+    val items: List<LibraryItemSummary>,
+    @SerialName("has_more") val hasMore: Boolean,
+)
+
+data class LibraryListPage(
+    val items: List<LibraryItemSummary>,
+    val hasMore: Boolean,
+)
+
+@Serializable
+private data class LibrarySaveResponse(
+    val duplicate: Boolean,
+    val item: LibraryItemSummary,
+)
+
+data class LibrarySaveResult(
+    val duplicate: Boolean,
+    val item: LibraryItemSummary,
+)
+
+internal fun parseLibraryListResponse(response: JsonObject): LibraryListPage {
+    val parsed = libraryJson.decodeFromJsonElement<LibraryListResponse>(response)
+    return LibraryListPage(parsed.items, parsed.hasMore)
+}
+
+internal fun parseLibrarySaveResponse(response: JsonObject): LibrarySaveResult {
+    val parsed = libraryJson.decodeFromJsonElement<LibrarySaveResponse>(response)
+    return LibrarySaveResult(parsed.duplicate, parsed.item)
+}
+
+internal fun parseLibraryDetailResponse(response: JsonObject): LibraryItemDetail =
+    libraryJson.decodeFromJsonElement(response)
+
+internal fun String.codePointLength(): Int = codePointCount(0, length)
+
+private fun String.isValidLibraryUrl(): Boolean {
+    if (any(Char::isWhitespace)) return false
+    val uri = try {
+        URI(this)
+    } catch (_: Exception) {
+        return false
+    }
+    val schemeIsAllowed = uri.scheme.equals("http", ignoreCase = true) ||
+        uri.scheme.equals("https", ignoreCase = true)
+    return schemeIsAllowed &&
+        !uri.isOpaque &&
+        !uri.host.isNullOrBlank() &&
+        uri.rawUserInfo == null &&
+        uri.port in -1..65_535
+}
+
+private fun String.isCanonicalUuid(): Boolean = try {
+    UUID.fromString(this).toString().equals(this, ignoreCase = true)
+} catch (_: IllegalArgumentException) {
+    false
+}

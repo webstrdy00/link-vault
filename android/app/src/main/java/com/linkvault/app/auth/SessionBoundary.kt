@@ -1,7 +1,16 @@
 package com.linkvault.app.auth
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+
+data class AccountSessionState(
+    val generation: Long = 0,
+    val ownerId: String? = null,
+    val recoverable: Boolean = false,
+    val initialized: Boolean = false,
+)
 
 internal data class SessionOrigin(
     val generation: Long,
@@ -12,30 +21,33 @@ internal class SessionBoundaryChangedException : Exception("The authenticated se
 
 internal class SessionBoundary {
     private val mutex = Mutex()
+    private val mutableSessionState = MutableStateFlow(AccountSessionState())
 
-    @Volatile
-    private var state = State()
+    val sessionState = mutableSessionState.asStateFlow()
 
-    fun generation(): Long = state.generation
+    fun generation(): Long = mutableSessionState.value.generation
 
-    fun ownerId(): String? = state.ownerId
+    fun ownerId(): String? = mutableSessionState.value.ownerId
 
-    fun hasSession(): Boolean = state.ownerId != null
+    fun hasSession(): Boolean = mutableSessionState.value.ownerId != null
 
-    fun isRecoverable(): Boolean = state.recoverable
+    fun isRecoverable(): Boolean = mutableSessionState.value.recoverable
 
     suspend fun <T> locked(block: suspend SessionBoundary.() -> T): T =
         mutex.withLock { block() }
 
-    fun currentOrigin(): SessionOrigin? = state.ownerId?.let { ownerId ->
-        SessionOrigin(state.generation, ownerId)
+    fun currentOrigin(): SessionOrigin? = mutableSessionState.value.let { state ->
+        state.ownerId?.let { ownerId -> SessionOrigin(state.generation, ownerId) }
     }
 
     fun requireGeneration(expectedGeneration: Long) {
-        if (state.generation != expectedGeneration) throw SessionBoundaryChangedException()
+        if (mutableSessionState.value.generation != expectedGeneration) {
+            throw SessionBoundaryChangedException()
+        }
     }
 
     fun requireCurrent(origin: SessionOrigin) {
+        val state = mutableSessionState.value
         if (state.generation != origin.generation || state.ownerId != origin.ownerId) {
             throw SessionBoundaryChangedException()
         }
@@ -45,23 +57,27 @@ internal class SessionBoundary {
         require(ownerId.isNotBlank())
         val current = currentOrigin()
         if (current != null && current.ownerId == ownerId) {
-            state = state.copy(recoverable = true)
+            mutableSessionState.value = mutableSessionState.value.copy(recoverable = true)
             return current
         }
-        state = State(
+        val state = mutableSessionState.value
+        mutableSessionState.value = AccountSessionState(
             generation = state.generation + 1,
             ownerId = ownerId,
             recoverable = true,
+            initialized = state.initialized,
         )
         return requireNotNull(currentOrigin())
     }
 
     fun commitLogin(ownerId: String): SessionOrigin {
         require(ownerId.isNotBlank())
-        state = State(
+        val state = mutableSessionState.value
+        mutableSessionState.value = AccountSessionState(
             generation = state.generation + 1,
             ownerId = ownerId,
             recoverable = false,
+            initialized = state.initialized,
         )
         return requireNotNull(currentOrigin())
     }
@@ -69,12 +85,16 @@ internal class SessionBoundary {
     fun confirmAuthenticated(origin: SessionOrigin, ownerId: String) {
         requireCurrent(origin)
         if (ownerId != origin.ownerId) throw SessionBoundaryChangedException()
-        state = state.copy(recoverable = false)
+        mutableSessionState.value = mutableSessionState.value.copy(recoverable = false)
     }
 
     fun markRecoverable(origin: SessionOrigin) {
         requireCurrent(origin)
-        state = state.copy(recoverable = true)
+        mutableSessionState.value = mutableSessionState.value.copy(recoverable = true)
+    }
+
+    fun markInitialized() {
+        mutableSessionState.value = mutableSessionState.value.copy(initialized = true)
     }
 
     fun clear(origin: SessionOrigin) {
@@ -83,12 +103,10 @@ internal class SessionBoundary {
     }
 
     fun clearCurrent() {
-        state = State(generation = state.generation + 1)
+        val state = mutableSessionState.value
+        mutableSessionState.value = AccountSessionState(
+            generation = state.generation + 1,
+            initialized = state.initialized,
+        )
     }
-
-    private data class State(
-        val generation: Long = 0,
-        val ownerId: String? = null,
-        val recoverable: Boolean = false,
-    )
 }

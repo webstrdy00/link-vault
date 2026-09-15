@@ -15,7 +15,13 @@ import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.room.TypeConverter
 import androidx.room.TypeConverters
+import androidx.room.migration.Migration
 import androidx.room.withTransaction
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.linkvault.app.attachment.AttachmentDao
+import com.linkvault.app.attachment.AttachmentOcrState
+import com.linkvault.app.attachment.AttachmentStage
+import com.linkvault.app.attachment.PendingAttachment
 import kotlinx.coroutines.flow.Flow
 
 @Entity(
@@ -85,6 +91,17 @@ data class CachedItem(
     val fetchedAt: Long,
     @ColumnInfo(name = "is_detail")
     val isDetail: Boolean,
+)
+
+@Entity(tableName = "cached_categories")
+data class CachedCategories(
+    @PrimaryKey
+    @ColumnInfo(name = "owner_id")
+    val ownerId: String,
+    @ColumnInfo(name = "response_json")
+    val responseJson: String,
+    @ColumnInfo(name = "fetched_at")
+    val fetchedAt: Long,
 )
 
 @Entity(tableName = "pending_inputs")
@@ -436,10 +453,31 @@ abstract class CachedItemDao {
     )
     abstract suspend fun readDetail(ownerId: String, itemId: String): CachedItem?
 
+    @Query("DELETE FROM cached_items WHERE owner_id = :ownerId AND item_id = :itemId")
+    abstract suspend fun deleteItem(ownerId: String, itemId: String): Int
+
     @Query("DELETE FROM cached_items WHERE owner_id = :ownerId")
     abstract suspend fun deleteOwner(ownerId: String): Int
 
     @Query("DELETE FROM cached_items")
+    abstract suspend fun deleteAll(): Int
+}
+
+@Dao
+abstract class CachedCategoriesDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    abstract suspend fun upsert(categories: CachedCategories)
+
+    @Query("SELECT * FROM cached_categories WHERE owner_id = :ownerId")
+    abstract suspend fun read(ownerId: String): CachedCategories?
+
+    @Query("SELECT owner_id FROM cached_categories")
+    abstract suspend fun ownerIds(): List<String>
+
+    @Query("DELETE FROM cached_categories WHERE owner_id = :ownerId")
+    abstract suspend fun deleteOwner(ownerId: String): Int
+
+    @Query("DELETE FROM cached_categories")
     abstract suspend fun deleteAll(): Int
 }
 
@@ -513,31 +551,58 @@ class VaultConverters {
     @TypeConverter
     fun outboxStateFromStorage(value: String): OutboxState =
         OutboxState.valueOf(value.uppercase())
+
+    @TypeConverter
+    fun attachmentStageToStorage(stage: AttachmentStage?): String? = stage?.name?.lowercase()
+
+    @TypeConverter
+    fun attachmentStageFromStorage(value: String?): AttachmentStage? =
+        value?.let { AttachmentStage.valueOf(it.uppercase()) }
+
+    @TypeConverter
+    fun attachmentOcrStateToStorage(state: AttachmentOcrState): String =
+        state.name.lowercase()
+
+    @TypeConverter
+    fun attachmentOcrStateFromStorage(value: String): AttachmentOcrState =
+        AttachmentOcrState.valueOf(value.uppercase())
 }
 
 @Database(
-    entities = [OutboxEntry::class, CachedItem::class, PendingInput::class],
-    version = 1,
+    entities = [
+        OutboxEntry::class,
+        CachedItem::class,
+        CachedCategories::class,
+        PendingInput::class,
+        PendingAttachment::class,
+    ],
+    version = 3,
     exportSchema = true,
 )
 @TypeConverters(VaultConverters::class)
 abstract class VaultDatabase : RoomDatabase() {
     abstract fun outboxDao(): OutboxDao
     abstract fun cachedItemDao(): CachedItemDao
+    abstract fun cachedCategoriesDao(): CachedCategoriesDao
     abstract fun pendingInputDao(): PendingInputDao
+    abstract fun attachmentDao(): AttachmentDao
 
     suspend fun clearOwner(ownerId: String) {
         withTransaction {
+            attachmentDao().deleteOwner(ownerId)
             outboxDao().deleteOwner(ownerId)
             cachedItemDao().deleteOwner(ownerId)
+            cachedCategoriesDao().deleteOwner(ownerId)
             pendingInputDao().deleteAll()
         }
     }
 
     suspend fun clearAllOwners() {
         withTransaction {
+            attachmentDao().deleteAll()
             outboxDao().deleteAll()
             cachedItemDao().deleteAll()
+            cachedCategoriesDao().deleteAll()
             pendingInputDao().deleteAll()
         }
     }
@@ -549,6 +614,79 @@ abstract class VaultDatabase : RoomDatabase() {
             context.applicationContext,
             VaultDatabase::class.java,
             DATABASE_NAME,
-        ).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+    }
+}
+
+internal val MIGRATION_1_2 = object : Migration(1, 2) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `cached_categories` (
+                `owner_id` TEXT NOT NULL,
+                `response_json` TEXT NOT NULL,
+                `fetched_at` INTEGER NOT NULL,
+                PRIMARY KEY(`owner_id`)
+            )
+            """.trimIndent(),
+        )
+    }
+}
+
+internal val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `pending_attachments` (
+                `operation_id` TEXT NOT NULL,
+                `owner_id` TEXT NOT NULL,
+                `item_id` TEXT NOT NULL,
+                `base_expected_version` INTEGER NOT NULL,
+                `session_generation` INTEGER NOT NULL,
+                `local_file_name` TEXT NOT NULL,
+                `mime_type` TEXT NOT NULL,
+                `ocr_state` TEXT NOT NULL,
+                `ocr_text` TEXT,
+                `ocr_truncated` INTEGER NOT NULL,
+                `created_at` INTEGER NOT NULL,
+                `expires_at` INTEGER NOT NULL,
+                `stage` TEXT NOT NULL,
+                `resume_stage` TEXT,
+                `reserve_request_id` TEXT NOT NULL,
+                `reserve_body_json` TEXT NOT NULL,
+                `complete_request_id` TEXT,
+                `complete_body_json` TEXT NOT NULL,
+                `server_asset_id` TEXT,
+                `server_object_path` TEXT,
+                `reservation_expires_at` INTEGER,
+                `reservation_received_at` INTEGER,
+                `attempt_count` INTEGER NOT NULL,
+                `next_retry_at` INTEGER NOT NULL,
+                `lease_token` TEXT,
+                `lease_until` INTEGER,
+                `error_code` TEXT,
+                `error_message` TEXT,
+                PRIMARY KEY(`operation_id`)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS `index_pending_attachments_owner_id_item_id`
+            ON `pending_attachments` (`owner_id`, `item_id`)
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS `index_pending_attachments_owner_id_stage_next_retry_at`
+            ON `pending_attachments` (`owner_id`, `stage`, `next_retry_at`)
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS `index_pending_attachments_owner_id_expires_at`
+            ON `pending_attachments` (`owner_id`, `expires_at`)
+            """.trimIndent(),
+        )
     }
 }

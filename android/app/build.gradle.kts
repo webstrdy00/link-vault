@@ -59,6 +59,7 @@ android {
         jvmTarget = "17"
     }
 
+    sourceSets.getByName("androidTest").assets.srcDir("$projectDir/schemas")
     if (providers.gradleProperty("localBackendTests").orNull == "true") {
         sourceSets.getByName("androidTest").java.srcDir("src/localBackendTest/java")
     }
@@ -78,6 +79,9 @@ dependencies {
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     implementation(libs.androidx.work.runtime)
+    implementation(libs.mlkit.text)
+    implementation(libs.mlkit.text.korean)
+    implementation(libs.androidx.exifinterface)
     kapt(libs.androidx.room.compiler)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
@@ -85,6 +89,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.espresso)
     androidTestImplementation(libs.androidx.test.espresso.intents)
+    androidTestImplementation(libs.androidx.room.testing)
 
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 }

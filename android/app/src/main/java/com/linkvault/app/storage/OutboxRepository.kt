@@ -11,8 +11,11 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
@@ -26,6 +29,7 @@ class OutboxRepository(
     private val json = Json { ignoreUnknownKeys = true }
     private val outbox = database.outboxDao()
     private val cache = database.cachedItemDao()
+    private val categoryCache = database.cachedCategoriesDao()
     private val drafts = database.pendingInputDao()
 
     suspend fun enqueue(
@@ -38,8 +42,7 @@ class OutboxRepository(
         val normalizedOwnerId = ownerId.requireOwnerId()
         val normalizedRequestId = requestId.requireCanonicalUuid()
         val normalizedMethod = method.trim().uppercase()
-        require(normalizedMethod in MUTATING_METHODS) { "Only mutating requests belong in the outbox." }
-        require(path == "/items" || path.startsWith("/items/")) { "Unsupported outbox path." }
+        requireValidOutboxRoute(normalizedMethod, path)
         json.decodeFromString<JsonObject>(payloadJson)
 
         val now = System.currentTimeMillis()
@@ -108,7 +111,7 @@ class OutboxRepository(
     }
 
     suspend fun clearAllOwners() {
-        outbox.ownerIds().forEach { ownerId ->
+        (outbox.ownerIds() + categoryCache.ownerIds()).distinct().forEach { ownerId ->
             UploadWorker.cancel(applicationContext, ownerId)
         }
         database.clearAllOwners()
@@ -156,6 +159,22 @@ class OutboxRepository(
 
     suspend fun readCachedDetail(ownerId: String, itemId: String): CachedItem? =
         cache.readDetail(ownerId.requireOwnerId(), itemId)
+
+    suspend fun cacheCategories(ownerId: String, response: JsonObject) {
+        val normalizedOwnerId = ownerId.requireOwnerId()
+        validateCategoriesResponse(response)
+        val cached = CachedCategories(
+            ownerId = normalizedOwnerId,
+            responseJson = response.toString(),
+            fetchedAt = System.currentTimeMillis(),
+        )
+        client.withSessionOwner(normalizedOwnerId) {
+            categoryCache.upsert(cached)
+        }
+    }
+
+    suspend fun readCachedCategories(ownerId: String): CachedCategories? =
+        categoryCache.read(ownerId.requireOwnerId())
 
     suspend fun saveDraft(localId: String, text: String, selectedUrl: String?) {
         require(localId.isNotBlank()) { "Draft ID must not be blank." }
@@ -249,7 +268,7 @@ class OutboxRepository(
                 body = entry.payloadJson,
                 requestId = entry.requestId,
             )
-            val cacheRows = response.cacheRowsFor(entry, System.currentTimeMillis())
+            val responseEffect = mapOutboxResponse(entry, response, System.currentTimeMillis())
             val persisted = client.withSessionOwner(entry.ownerId) {
                 database.withTransaction {
                     val completed = outbox.completeSaved(
@@ -258,7 +277,13 @@ class OutboxRepository(
                         leaseUntil = leaseUntil,
                         resultJson = response.toString(),
                     )
-                    if (completed == 1) cacheRows.forEach { cache.upsert(it) }
+                    if (completed == 1) {
+                        responseEffect.invalidatesItemIds.forEach { cache.deleteItem(entry.ownerId, it) }
+                        responseEffect.cachedItems.forEach { cache.upsert(it) }
+                        if (responseEffect.invalidatesCategories) {
+                            categoryCache.deleteOwner(entry.ownerId)
+                        }
+                    }
                     completed == 1
                 }
             }
@@ -283,14 +308,21 @@ class OutboxRepository(
         entry: OutboxEntry,
         leaseUntil: Long,
         error: AccountClientException,
-    ): UploadOutcome = completeFailure(
-        entry = entry,
-        leaseUntil = leaseUntil,
-        retryable = error.retryable,
-        errorCode = error.code,
-        errorMessage = error.message,
-        retryAfterSeconds = error.retryAfterSeconds,
-    )
+    ): UploadOutcome {
+        val isPermanentCategoryFailure = error.code in PERMANENT_CATEGORY_ERROR_CODES
+        return completeFailure(
+            entry = entry,
+            leaseUntil = leaseUntil,
+            retryable = error.retryable && !isPermanentCategoryFailure,
+            errorCode = error.code,
+            errorMessage = error.message,
+            retryAfterSeconds = if (isPermanentCategoryFailure) {
+                null
+            } else {
+                error.retryAfterSeconds
+            },
+        )
+    }
 
     private suspend fun completeFailure(
         entry: OutboxEntry,
@@ -409,58 +441,6 @@ class OutboxRepository(
         return BatchResult.ScheduleAt(nextWakeAt)
     }
 
-    private fun JsonObject.toCachedItem(
-        ownerId: String,
-        isDetail: Boolean,
-        fetchedAt: Long,
-    ): CachedItem {
-        val itemId = (this["id"] as? JsonPrimitive)?.contentOrNull
-            ?.takeIf(String::isNotBlank)
-            ?: throw InvalidServerResponseException("The server item is missing its ID.")
-        val serverVersion = (this["version"] as? JsonPrimitive)?.longOrNull
-            ?.takeIf { it > 0L }
-            ?: throw InvalidServerResponseException("The server item has an invalid version.")
-        val rawCreatedAt = (this["created_at"] as? JsonPrimitive)
-            ?.takeIf { it.isString }
-            ?.contentOrNull
-            ?: throw InvalidServerResponseException("The server item is missing its creation time.")
-        val serverCreatedAt = try {
-            FIXED_INSTANT_FORMAT.format(Instant.from(DateTimeFormatter.ISO_DATE_TIME.parse(rawCreatedAt)))
-        } catch (error: Exception) {
-            throw InvalidServerResponseException("The server item has an invalid creation time.")
-        }
-        return CachedItem(
-            ownerId = ownerId,
-            itemId = itemId,
-            responseJson = toString(),
-            serverVersion = serverVersion,
-            serverCreatedAt = serverCreatedAt,
-            fetchedAt = fetchedAt,
-            isDetail = isDetail,
-        )
-    }
-
-    private fun JsonObject.cacheRowsFor(entry: OutboxEntry, fetchedAt: Long): List<CachedItem> = when {
-        entry.method == "POST" && entry.path == "/items" -> {
-            val item = this["item"] as? JsonObject
-                ?: throw InvalidServerResponseException("The save response is missing its item.")
-            listOf(
-                item.toCachedItem(entry.ownerId, isDetail = false, fetchedAt = fetchedAt),
-                item.toCachedItem(entry.ownerId, isDetail = true, fetchedAt = fetchedAt),
-            )
-        }
-        entry.method == "PATCH" && entry.path.startsWith("/items/") -> {
-            val summary = toCachedItem(entry.ownerId, isDetail = false, fetchedAt = fetchedAt)
-            val detail = toCachedItem(entry.ownerId, isDetail = true, fetchedAt = fetchedAt)
-            val expectedItemId = entry.path.removePrefix("/items/")
-            if (detail.itemId != expectedItemId) {
-                throw InvalidServerResponseException("The edited item response has a different ID.")
-            }
-            listOf(summary, detail)
-        }
-        else -> emptyList()
-    }
-
     private fun OutboxEntry.pendingCaptureText(): String? {
         if (method != "POST" || path != "/items") return null
         return try {
@@ -473,9 +453,175 @@ class OutboxRepository(
     }
 
     private companion object {
-        val MUTATING_METHODS = setOf("POST", "PATCH", "DELETE")
-        val FIXED_INSTANT_FORMAT: DateTimeFormatter =
-            DateTimeFormatterBuilder().appendInstant(9).toFormatter()
+        val PERMANENT_CATEGORY_ERROR_CODES = setOf(
+            "CATEGORY_LIMIT_REACHED",
+            "CATEGORY_NAME_EXISTS",
+            "CATEGORY_NOT_FOUND",
+            "INVALID_CATEGORY_IDS",
+            "SYSTEM_CATEGORY_READONLY",
+        )
+    }
+}
+
+internal data class OutboxResponseEffect(
+    val cachedItems: List<CachedItem>,
+    val invalidatesCategories: Boolean,
+    val invalidatesItemIds: List<String> = emptyList(),
+)
+
+internal fun requireValidOutboxRoute(method: String, path: String) {
+    require(parseOutboxRoute(method, path) != null) { "Unsupported outbox route." }
+}
+
+internal fun mapOutboxResponse(
+    entry: OutboxEntry,
+    response: JsonObject,
+    fetchedAt: Long,
+): OutboxResponseEffect {
+    return when (val route = parseOutboxRoute(entry.method, entry.path)) {
+        OutboxRoute.CreateItem -> {
+            val duplicate = response["duplicate"] as? JsonPrimitive
+            if (duplicate == null || duplicate.isString || duplicate.booleanOrNull == null) {
+                throw InvalidServerResponseException(
+                    "The save response has an invalid duplicate marker.",
+                )
+            }
+            val item = response["item"] as? JsonObject
+                ?: throw InvalidServerResponseException("The save response is missing its item.")
+            OutboxResponseEffect(
+                cachedItems = item.cacheAsListAndDetail(entry.ownerId, fetchedAt),
+                invalidatesCategories = false,
+            )
+        }
+        is OutboxRoute.PatchItem -> {
+            response.requireMatchingId(route.itemId, "edited item")
+            OutboxResponseEffect(
+                cachedItems = response.cacheAsListAndDetail(entry.ownerId, fetchedAt),
+                invalidatesCategories = entry.payloadContains("category_ids"),
+            )
+        }
+        OutboxRoute.CreateCategory -> {
+            response.requireUuid("id", "The created category response has an invalid ID.")
+            OutboxResponseEffect(emptyList(), invalidatesCategories = true)
+        }
+        is OutboxRoute.PatchCategory -> {
+            response.requireMatchingId(route.categoryId, "edited category")
+            OutboxResponseEffect(emptyList(), invalidatesCategories = true)
+        }
+        OutboxRoute.DeleteCategory -> {
+            if (response.isNotEmpty()) {
+                throw InvalidServerResponseException(
+                    "The deleted category response must be empty.",
+                )
+            }
+            OutboxResponseEffect(emptyList(), invalidatesCategories = true)
+        }
+        is OutboxRoute.DismissCue -> {
+            response.requireMatchingId(route.itemId, "cue-dismissed item")
+            OutboxResponseEffect(
+                cachedItems = response.cacheAsListAndDetail(entry.ownerId, fetchedAt),
+                invalidatesCategories = false,
+            )
+        }
+        is OutboxRoute.Reclassify -> {
+            response.requireUuid("job_id", "The reclassification response has an invalid job ID.")
+            val itemId = response.requireUuid(
+                "item_id",
+                "The reclassification response has an invalid item ID.",
+            )
+            if (!itemId.equals(route.itemId, ignoreCase = true)) {
+                throw InvalidServerResponseException(
+                    "The reclassification response has a different item ID.",
+                )
+            }
+            OutboxResponseEffect(emptyList(), invalidatesCategories = true)
+        }
+        is OutboxRoute.RetryMetadata -> {
+            response.requireUuid("job_id", "The metadata response has an invalid job ID.")
+            OutboxResponseEffect(emptyList(), invalidatesCategories = false)
+        }
+        is OutboxRoute.DeleteAsset -> {
+            val assetId = response.requireUuid("asset_id", "The deleted asset response has an invalid ID.")
+            if (!assetId.equals(route.assetId, ignoreCase = true)) {
+                throw InvalidServerResponseException("The deleted asset response has a different ID.")
+            }
+            OutboxResponseEffect(
+                emptyList(),
+                invalidatesCategories = true,
+                invalidatesItemIds = listOf(route.itemId),
+            )
+        }
+        is OutboxRoute.UpdateOcr -> {
+            response.requireMatchingId(route.itemId, "OCR-updated item")
+            OutboxResponseEffect(
+                response.cacheAsListAndDetail(entry.ownerId, fetchedAt),
+                invalidatesCategories = true,
+            )
+        }
+        null -> throw InvalidServerResponseException(
+            "The stored request uses an unsupported outbox route.",
+        )
+    }
+}
+
+internal fun validateCategoriesResponse(response: JsonObject) {
+    val categories = response["categories"] as? JsonArray
+        ?: throw InvalidServerResponseException(
+            "The category response is missing its category list.",
+        )
+    val count = response.requireNonNegativeLong(
+        "count",
+        "The category response has an invalid count.",
+    )
+    if (count != categories.size.toLong()) {
+        throw InvalidServerResponseException(
+            "The category response count does not match its category list.",
+        )
+    }
+    response.requireNonNegativeLong(
+        "unclassified_count",
+        "The category response has an invalid unclassified count.",
+    )
+
+    val categoryIds = mutableSetOf<String>()
+    categories.forEach { element ->
+        val category = element as? JsonObject
+            ?: throw InvalidServerResponseException(
+                "The category response contains an invalid category.",
+            )
+        val id = category.requireUuid("id", "A category has an invalid ID.")
+        if (!categoryIds.add(id.lowercase())) {
+            throw InvalidServerResponseException(
+                "The category response contains a duplicate category ID.",
+            )
+        }
+        category.requireString("name", "A category has an invalid name.")
+            .takeIf(String::isNotBlank)
+            ?: throw InvalidServerResponseException("A category has an invalid name.")
+        val kind = category.requireString("kind", "A category has an invalid kind.")
+        if (kind != "system" && kind != "custom") {
+            throw InvalidServerResponseException("A category has an invalid kind.")
+        }
+        val systemCodeElement = category["system_code"]
+        val systemCode = if (systemCodeElement == null || systemCodeElement is JsonNull) {
+            null
+        } else {
+            val value = systemCodeElement as? JsonPrimitive
+            if (value == null || !value.isString || value.contentOrNull.isNullOrBlank()) {
+                throw InvalidServerResponseException("A category has an invalid system code.")
+            }
+            value.content
+        }
+        if (
+            (kind == "system" && systemCode == null) ||
+            (kind == "custom" && systemCode != null)
+        ) {
+            throw InvalidServerResponseException("A category has an invalid system code.")
+        }
+        category.requireNonNegativeLong(
+            "item_count",
+            "A category has an invalid item count.",
+        )
     }
 }
 
@@ -491,7 +637,144 @@ private enum class UploadOutcome {
     Pause,
 }
 
+private sealed interface OutboxRoute {
+    data object CreateItem : OutboxRoute
+    data class PatchItem(val itemId: String) : OutboxRoute
+    data object CreateCategory : OutboxRoute
+    data class PatchCategory(val categoryId: String) : OutboxRoute
+    data object DeleteCategory : OutboxRoute
+    data class DismissCue(val itemId: String) : OutboxRoute
+    data class Reclassify(val itemId: String) : OutboxRoute
+    data class RetryMetadata(val itemId: String) : OutboxRoute
+    data class DeleteAsset(val itemId: String, val assetId: String) : OutboxRoute
+    data class UpdateOcr(val itemId: String, val assetId: String) : OutboxRoute
+}
+
 private class InvalidServerResponseException(message: String) : Exception(message)
+
+private fun parseOutboxRoute(method: String, path: String): OutboxRoute? {
+    if (method == "POST" && path == "/items") return OutboxRoute.CreateItem
+    if (method == "POST" && path == "/categories") return OutboxRoute.CreateCategory
+
+    path.resourceId("/items/")?.let { itemId ->
+        if (method == "PATCH") return OutboxRoute.PatchItem(itemId)
+    }
+    path.resourceId("/categories/")?.let { categoryId ->
+        if (method == "PATCH") return OutboxRoute.PatchCategory(categoryId)
+        if (method == "DELETE") return OutboxRoute.DeleteCategory
+    }
+    path.resourceId("/items/", "/cue-dismiss")?.let { itemId ->
+        if (method == "POST") return OutboxRoute.DismissCue(itemId)
+    }
+    path.resourceId("/items/", "/reclassify")?.let { itemId ->
+        if (method == "POST") return OutboxRoute.Reclassify(itemId)
+    }
+    path.resourceId("/items/", "/retry-metadata")?.let { itemId ->
+        if (method == "POST") return OutboxRoute.RetryMetadata(itemId)
+    }
+    val segments = path.split("/")
+    if (segments.size in 5..6 && segments[0].isEmpty() &&
+        segments[1] == "items" && segments[3] == "assets" &&
+        segments[2].isCanonicalUuid() && segments[4].isCanonicalUuid()
+    ) {
+        if (segments.size == 5 && method == "DELETE") {
+            return OutboxRoute.DeleteAsset(segments[2], segments[4])
+        }
+        if (segments.size == 6 && segments[5] == "ocr" && method == "PATCH") {
+            return OutboxRoute.UpdateOcr(segments[2], segments[4])
+        }
+    }
+    return null
+}
+
+private fun String.resourceId(prefix: String, suffix: String = ""): String? {
+    if (
+        !startsWith(prefix) ||
+        !endsWith(suffix) ||
+        length <= prefix.length + suffix.length
+    ) {
+        return null
+    }
+    val id = substring(prefix.length, length - suffix.length)
+    return id.takeIf(String::isCanonicalUuid)
+}
+
+private fun JsonObject.cacheAsListAndDetail(
+    ownerId: String,
+    fetchedAt: Long,
+): List<CachedItem> = listOf(
+    toCachedItem(ownerId, isDetail = false, fetchedAt = fetchedAt),
+    toCachedItem(ownerId, isDetail = true, fetchedAt = fetchedAt),
+)
+
+private fun JsonObject.toCachedItem(
+    ownerId: String,
+    isDetail: Boolean,
+    fetchedAt: Long,
+): CachedItem {
+    val itemId = requireUuid("id", "The server item has an invalid ID.")
+    val serverVersion = requirePositiveLong(
+        "version",
+        "The server item has an invalid version.",
+    )
+    val rawCreatedAt = (this["created_at"] as? JsonPrimitive)
+        ?.takeIf { it.isString }
+        ?.contentOrNull
+        ?: throw InvalidServerResponseException("The server item is missing its creation time.")
+    val serverCreatedAt = try {
+        FIXED_INSTANT_FORMAT.format(Instant.from(DateTimeFormatter.ISO_DATE_TIME.parse(rawCreatedAt)))
+    } catch (error: Exception) {
+        throw InvalidServerResponseException("The server item has an invalid creation time.")
+    }
+    return CachedItem(
+        ownerId = ownerId,
+        itemId = itemId,
+        responseJson = toString(),
+        serverVersion = serverVersion,
+        serverCreatedAt = serverCreatedAt,
+        fetchedAt = fetchedAt,
+        isDetail = isDetail,
+    )
+}
+
+private fun JsonObject.requireMatchingId(expectedId: String, responseName: String) {
+    val actualId = requireUuid("id", "The $responseName response has an invalid ID.")
+    if (!actualId.equals(expectedId, ignoreCase = true)) {
+        throw InvalidServerResponseException(
+            "The $responseName response has a different ID.",
+        )
+    }
+}
+
+private fun JsonObject.requireString(field: String, errorMessage: String): String {
+    val value = this[field] as? JsonPrimitive
+    if (value == null || !value.isString) throw InvalidServerResponseException(errorMessage)
+    return value.contentOrNull ?: throw InvalidServerResponseException(errorMessage)
+}
+
+private fun JsonObject.requireUuid(field: String, errorMessage: String): String =
+    requireString(field, errorMessage).takeIf(String::isCanonicalUuid)
+        ?: throw InvalidServerResponseException(errorMessage)
+
+private fun JsonObject.requirePositiveLong(field: String, errorMessage: String): Long {
+    val value = this[field] as? JsonPrimitive
+    if (value == null || value.isString) throw InvalidServerResponseException(errorMessage)
+    return value.longOrNull?.takeIf { it > 0L }
+        ?: throw InvalidServerResponseException(errorMessage)
+}
+
+private fun JsonObject.requireNonNegativeLong(field: String, errorMessage: String): Long {
+    val value = this[field] as? JsonPrimitive
+    if (value == null || value.isString) throw InvalidServerResponseException(errorMessage)
+    return value.longOrNull?.takeIf { it >= 0L }
+        ?: throw InvalidServerResponseException(errorMessage)
+}
+
+private fun OutboxEntry.payloadContains(field: String): Boolean = try {
+    Json.decodeFromString<JsonObject>(payloadJson).containsKey(field)
+} catch (error: Exception) {
+    throw InvalidServerResponseException("The stored request body is invalid.")
+}
 
 private fun String.requireOwnerId(): String = trim().also {
     require(it.isNotEmpty()) { "Owner ID must not be blank." }
@@ -509,3 +792,10 @@ private fun String.requireCanonicalUuid(): String {
     }
     return value
 }
+
+private fun String.isCanonicalUuid(): Boolean = runCatching {
+    requireCanonicalUuid() == this
+}.getOrDefault(false)
+
+private val FIXED_INSTANT_FORMAT: DateTimeFormatter =
+    DateTimeFormatterBuilder().appendInstant(9).toFormatter()

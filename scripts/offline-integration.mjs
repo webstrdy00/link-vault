@@ -6,7 +6,7 @@ const config = JSON.parse(execSync("npx --no-install supabase status -o json", {
   encoding: "utf8",
   stdio: ["ignore", "pipe", "pipe"],
 }));
-assert.equal(config.API_URL, "http://127.0.0.1:54321");
+assert.equal(config.API_URL, "http://127.0.0.1:18021");
 const devices = execFileSync("adb", ["devices"], { encoding: "utf8" });
 const serial = devices.match(/^(emulator-\d+)\s+device$/m)?.[1];
 assert.ok(serial, "An emulator is required; physical devices are not targeted");
@@ -147,7 +147,7 @@ try {
   const env = {
     ...process.env,
     ANDROID_SERIAL: serial,
-    SUPABASE_URL: "http://10.0.2.2:54321",
+    SUPABASE_URL: "http://10.0.2.2:18021",
     SUPABASE_PUBLISHABLE_KEY: config.ANON_KEY,
     GOOGLE_WEB_CLIENT_ID: "local-instrumentation.apps.googleusercontent.com",
   };

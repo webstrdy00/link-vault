@@ -144,9 +144,10 @@ select ok(
 
 select throws_ok(
   $$
-    insert into public.categories (owner_id, name, kind, system_code)
+    insert into public.categories (owner_id, name, normalized_name, kind, system_code)
     values (
       '10000000-0000-0000-0000-000000000004',
+      '잘못된 시스템 분류',
       '잘못된 시스템 분류',
       'system',
       null
@@ -461,7 +462,7 @@ select throws_ok(
 );
 
 select throws_ok(
-  $$ insert into public.categories (owner_id, name, kind) values ('10000000-0000-0000-0000-000000000001', '직접 쓰기', 'custom') $$,
+  $$ insert into public.categories (owner_id, name, normalized_name, kind) values ('10000000-0000-0000-0000-000000000001', '직접 쓰기', '직접 쓰기', 'custom') $$,
   '42501',
   null,
   'a member cannot directly insert a category'

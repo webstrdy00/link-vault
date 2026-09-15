@@ -1,12 +1,18 @@
 {
   "name": "link-vault",
+  "type": "module",
   "private": true,
   "scripts": {
-    "backend:start": "supabase start -x studio,imgproxy,realtime,storage-api,logflare,vector,supavisor,postgres-meta",
-    "backend:migrate": "supabase migration up --local",
+    "backend:start": "node scripts/start-local-backend.mjs",
+    "backend:migrate": "supabase migration up --local && node scripts/normalize-existing-categories.mjs",
+    "backend:configure-worker": "node scripts/configure-local-worker.mjs",
     "test:db": "supabase test db",
-    "test:api": "deno test --config supabase/functions/library-api/deno.json supabase/functions/library-api/handler_test.ts",
+    "test:api": "deno test --allow-read=supabase/functions/library-api/webp_dec.wasm --allow-env=NODE_V8_COVERAGE,UNDICI_NO_FG,JEST_WORKER_ID --config supabase/functions/library-api/deno.json supabase/functions/library-api",
     "test:integration": "node scripts/member-integration.mjs",
+    "test:discovery-integration": "node scripts/discovery-integration.mjs",
+    "test:discovery-emulator-integration": "node scripts/discovery-emulator-integration.mjs",
+    "test:enrichment-integration": "node scripts/enrichment-integration.mjs",
+    "test:enrichment-emulator-integration": "node scripts/enrichment-emulator-integration.mjs",
     "test:emulator-integration": "node scripts/emulator-integration.mjs",
     "test:offline-integration": "node scripts/offline-integration.mjs"
   },

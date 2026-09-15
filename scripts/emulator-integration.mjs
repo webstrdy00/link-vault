@@ -8,7 +8,7 @@ const config = JSON.parse(execSync("npx --no-install supabase status -o json", {
 }));
 assert.equal(
   config.API_URL,
-  "http://127.0.0.1:54321",
+  "http://127.0.0.1:18021",
   "Local fixture runner only",
 );
 const fixtureEmail = `emulator-${randomUUID()}@example.test`;
@@ -85,7 +85,7 @@ try {
   const env = {
     ...process.env,
     ANDROID_SERIAL: emulator,
-    SUPABASE_URL: "http://10.0.2.2:54321",
+    SUPABASE_URL: "http://10.0.2.2:18021",
     SUPABASE_PUBLISHABLE_KEY: config.ANON_KEY,
     // No Google token is fabricated. This suite imports real local GoTrue sessions
     // via the test-only SDK client and does not exercise the Google provider.

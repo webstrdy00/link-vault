@@ -1,6 +1,8 @@
 package com.linkvault.app
 
 import android.app.Application
+import com.linkvault.app.attachment.AttachmentRepository
+import com.linkvault.app.attachment.IncomingImageStore
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.storage.OutboxRepository
 import java.util.concurrent.atomic.AtomicLong
@@ -40,6 +42,10 @@ class LinkVaultApplication : Application() {
     }
 
     val outboxRepository: OutboxRepository by lazy { OutboxRepository(this, accountClient) }
+    val attachmentRepository: AttachmentRepository by lazy {
+        AttachmentRepository(this, accountClient, outboxRepository)
+    }
+    val incomingImageStore: IncomingImageStore by lazy { IncomingImageStore(this) }
 
     private suspend fun bindLocalOwner(ownerId: String): Unit = withContext(Dispatchers.IO) {
         val previous = localState.getString("data_owner", null)
@@ -55,6 +61,8 @@ class LinkVaultApplication : Application() {
     private suspend fun clearLocalBoundary(nextOwner: String?): Unit = withContext(Dispatchers.IO) {
         draftRevision.incrementAndGet()
         draftMutex.withLock {
+            incomingImageStore.clear()
+            attachmentRepository.clearAll()
             outboxRepository.clearAllOwners()
             val generation = mutableLogoutGeneration.value + 1
             check(
@@ -71,6 +79,8 @@ class LinkVaultApplication : Application() {
         applicationScope.launch {
             try {
                 outboxRepository.cleanupDrafts()
+                incomingImageStore.cleanupExpired()
+                attachmentRepository.cleanup()
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -88,6 +98,7 @@ class LinkVaultApplication : Application() {
             try {
                 accountClient.sessionUserId()?.let { owner ->
                     outboxRepository.resumeOwner(owner)
+                    attachmentRepository.resumeOwner(owner)
                 }
             } catch (error: CancellationException) {
                 throw error

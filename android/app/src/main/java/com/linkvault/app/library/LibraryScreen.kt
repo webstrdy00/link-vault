@@ -1,5 +1,6 @@
 package com.linkvault.app.library
 
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,6 +34,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.linkvault.app.attachment.AttachmentControls
+import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
@@ -44,19 +47,31 @@ import java.util.Date
 fun LibraryScreen(
     client: AccountClient,
     outbox: OutboxRepository,
+    attachments: AttachmentRepository,
     entryId: String,
     initialUrl: String?,
     sharedText: String,
     onBack: () -> Unit,
     onSignIn: () -> Unit,
     onOpenOriginal: (String) -> Unit,
+    initialItemId: String? = null,
+    onDiscover: () -> Unit = {},
+    incomingImageUri: Uri? = null,
+    onIncomingImageConsumed: () -> Unit = {},
 ) {
     val ownerId = client.sessionUserId()
     val viewModelKey = remember(client, ownerId, entryId) {
         "library:${System.identityHashCode(client)}:${ownerId ?: "signed-out"}:$entryId"
     }
-    val factory = remember(client, outbox, ownerId, initialUrl, sharedText) {
-        LibraryViewModel.factory(client, outbox, ownerId, initialUrl, sharedText)
+    val factory = remember(client, outbox, ownerId, initialUrl, sharedText, initialItemId) {
+        LibraryViewModel.factory(
+            client = client,
+            outbox = outbox,
+            ownerId = ownerId,
+            initialUrl = initialUrl,
+            sharedText = sharedText,
+            initialItemId = initialItemId,
+        )
     }
     val libraryViewModel: LibraryViewModel = viewModel(
         key = viewModelKey,
@@ -92,19 +107,26 @@ fun LibraryScreen(
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
             )
-            if (
-                state.availability is LibraryAvailability.Ready &&
-                state.detail is LibraryDetailState.None
-            ) {
-                TextButton(
-                    onClick = libraryViewModel::refresh,
-                    enabled = !state.isListLoading,
-                ) {
-                    Text("새로고침")
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (state.availability is LibraryAvailability.Ready) {
+                    TextButton(onClick = onDiscover) {
+                        Text("검색·분류")
+                    }
                 }
-            } else {
-                TextButton(onClick = {}, enabled = false) {
-                    Text("새로고침")
+                if (
+                    state.availability is LibraryAvailability.Ready &&
+                    state.detail is LibraryDetailState.None
+                ) {
+                    TextButton(
+                        onClick = libraryViewModel::refresh,
+                        enabled = !state.isListLoading,
+                    ) {
+                        Text("새로고침")
+                    }
+                } else {
+                    TextButton(onClick = {}, enabled = false) {
+                        Text("새로고침")
+                    }
                 }
             }
         }
@@ -189,19 +211,42 @@ fun LibraryScreen(
                         onRetry = libraryViewModel::retryDetail,
                     )
 
-                    is LibraryDetailState.Loaded -> DetailContent(
-                        detail = detail,
-                        edit = state.edit,
-                        onBackToList = libraryViewModel::closeDetail,
-                        onOpenOriginal = onOpenOriginal,
-                        onBeginEdit = libraryViewModel::beginEdit,
-                        onEditTitleChange = libraryViewModel::updateEditTitle,
-                        onEditNoteChange = libraryViewModel::updateEditNote,
-                        onSaveEdit = libraryViewModel::saveEdit,
-                        onCancelEdit = libraryViewModel::cancelEdit,
-                        onLoadLatest = libraryViewModel::loadLatestForEdit,
-                        onConfirmAgain = libraryViewModel::confirmEditAgain,
-                    )
+                    is LibraryDetailState.Loaded -> {
+                        DetailContent(
+                            detail = detail,
+                            edit = state.edit,
+                            onBackToList = libraryViewModel::closeDetail,
+                            onOpenOriginal = onOpenOriginal,
+                            onBeginEdit = libraryViewModel::beginEdit,
+                            onEditTitleChange = libraryViewModel::updateEditTitle,
+                            onEditNoteChange = libraryViewModel::updateEditNote,
+                            onSaveEdit = libraryViewModel::saveEdit,
+                            onCancelEdit = libraryViewModel::cancelEdit,
+                            onLoadLatest = libraryViewModel::loadLatestForEdit,
+                            onConfirmAgain = libraryViewModel::confirmEditAgain,
+                        )
+                        if (state.edit == null) {
+                            AttachmentControls(
+                                item = detail.item,
+                                client = client,
+                                outbox = outbox,
+                                attachments = attachments,
+                                onRefreshItem = { libraryViewModel.refreshDetail(detail.item.id) },
+                                incomingImageUri = incomingImageUri,
+                                onIncomingImageConsumed = onIncomingImageConsumed,
+                            )
+                            ClassificationControls(
+                                client = client,
+                                outbox = outbox,
+                                entryId = entryId,
+                                item = detail.item,
+                                onRefresh = {
+                                    libraryViewModel.refreshDetail(detail.item.id)
+                                },
+                                onEditNote = libraryViewModel::beginEdit,
+                            )
+                        }
+                    }
                 }
             }
         }

@@ -2,6 +2,7 @@ package com.linkvault.app
 
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
@@ -62,7 +63,7 @@ class OfflineLibraryIntegrationTest {
 
     @Test
     fun queueWhileOffline(): Unit = runBlocking {
-        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:54321")
+        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:18021")
         val sessionClient = createSupabaseClient(BuildConfig.SUPABASE_URL, BuildConfig.SUPABASE_PUBLISHABLE_KEY) {
             defaultLogLevel = LogLevel.NONE
             install(Auth)
@@ -109,7 +110,7 @@ class OfflineLibraryIntegrationTest {
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo()
                     .performTextReplacement(argument("fixtureUrl"))
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
-                awaitText("서버에 보관")
+                awaitOfflineSaveForm()
                 compose.onNodeWithText("나중에 찾을 메모").performScrollTo()
                     .performTextReplacement("오프라인 재시작 보관 검증")
                 compose.onNodeWithText("서버에 보관").performScrollTo().assertIsEnabled().performClick()
@@ -210,5 +211,40 @@ class OfflineLibraryIntegrationTest {
             shell("svc wifi enable")
             shell("svc data enable")
         }
+    }
+
+    private fun awaitOfflineSaveForm() {
+        try {
+            awaitText("서버에 보관")
+        } catch (error: Throwable) {
+            val screenshot = captureFixtureScreenshot()
+            throw AssertionError(
+                "Offline save form did not appear; screenshot=$screenshot",
+                error,
+            )
+        }
+    }
+
+    private fun captureFixtureScreenshot(): String {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        return runCatching {
+            val directory = checkNotNull(
+                instrumentation.targetContext.getExternalFilesDir("test-artifacts"),
+            )
+            check(directory.exists() || directory.mkdirs())
+            val screenshot = checkNotNull(instrumentation.uiAutomation.takeScreenshot())
+            val file = File(directory, OFFLINE_SAVE_FORM_SCREENSHOT_NAME)
+            file.outputStream().use { output ->
+                check(screenshot.compress(Bitmap.CompressFormat.PNG, 100, output))
+            }
+            screenshot.recycle()
+            file.absolutePath
+        }.getOrElse {
+            "UNAVAILABLE"
+        }
+    }
+
+    private companion object {
+        const val OFFLINE_SAVE_FORM_SCREENSHOT_NAME = "offline-save-form-failure.png"
     }
 }

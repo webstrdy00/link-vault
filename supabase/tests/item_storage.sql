@@ -72,15 +72,15 @@ values
   ('11000000-0000-0000-0000-000000000001'),
   ('11000000-0000-0000-0000-000000000002');
 
-insert into public.categories (id, owner_id, name, kind)
+insert into public.categories (id, owner_id, name, normalized_name, kind)
 values
-  ('31000000-0000-0000-0000-000000000001', '11000000-0000-0000-0000-000000000001', '여행', 'custom'),
-  ('31000000-0000-0000-0000-000000000002', '11000000-0000-0000-0000-000000000001', '음식', 'custom'),
-  ('31000000-0000-0000-0000-000000000003', '11000000-0000-0000-0000-000000000001', '업무', 'custom'),
-  ('31000000-0000-0000-0000-000000000004', '11000000-0000-0000-0000-000000000001', '쇼핑', 'custom'),
-  ('31000000-0000-0000-0000-000000000005', '11000000-0000-0000-0000-000000000001', '도구', 'custom'),
-  ('31000000-0000-0000-0000-000000000006', '11000000-0000-0000-0000-000000000001', '생활', 'custom'),
-  ('32000000-0000-0000-0000-000000000001', '11000000-0000-0000-0000-000000000002', '상대분류', 'custom');
+  ('31000000-0000-0000-0000-000000000001', '11000000-0000-0000-0000-000000000001', '여행', '여행', 'custom'),
+  ('31000000-0000-0000-0000-000000000002', '11000000-0000-0000-0000-000000000001', '음식', '음식', 'custom'),
+  ('31000000-0000-0000-0000-000000000003', '11000000-0000-0000-0000-000000000001', '업무', '업무', 'custom'),
+  ('31000000-0000-0000-0000-000000000004', '11000000-0000-0000-0000-000000000001', '쇼핑', '쇼핑', 'custom'),
+  ('31000000-0000-0000-0000-000000000005', '11000000-0000-0000-0000-000000000001', '도구', '도구', 'custom'),
+  ('31000000-0000-0000-0000-000000000006', '11000000-0000-0000-0000-000000000001', '생활', '생활', 'custom'),
+  ('32000000-0000-0000-0000-000000000001', '11000000-0000-0000-0000-000000000002', '상대분류', '상대분류', 'custom');
 
 create temporary table item_test_inputs (
   input_name text primary key,
@@ -131,7 +131,7 @@ with input_specs(
       '직접 분류 메모',
       '직접 분류 공유문',
       '["31000000-0000-0000-0000-000000000001"]'::jsonb,
-      '여행',
+      '',
       false
     ),
     (
@@ -768,6 +768,21 @@ select is(
 
 select is(
   (
+    select search_record.normalized_fields ->> 'categories'
+    from public.item_search as search_record
+    where search_record.owner_id = '11000000-0000-0000-0000-000000000001'
+      and search_record.item_id = (
+        select item_id
+        from item_test_inputs
+        where input_name = 'manual'
+      )
+  ),
+  '여행',
+  'manual category search text is built from the validated stored category name'
+);
+
+select is(
+  (
     select pg_catalog.jsonb_build_object(
       'manual_override', controls.manual_override,
       'classification_state', classification.state
@@ -1221,18 +1236,15 @@ where owner_id = '11000000-0000-0000-0000-000000000001';
 
 set local role service_role;
 
-select throws_ok(
-  $$
-    select public.library_create_item(
-      '11000000-0000-0000-0000-000000000001',
-      '44000000-0000-0000-0000-000000000001',
-      (select body from item_test_inputs where input_name = 'item_limit'),
-      (select prepared from item_test_inputs where input_name = 'item_limit')
-    )
-  $$,
-  'P0001',
-  'ITEM_LIMIT_REACHED',
-  'the locked owner counter enforces the 100 active-item limit'
+select is(
+  public.library_create_item(
+    '11000000-0000-0000-0000-000000000001',
+    '44000000-0000-0000-0000-000000000001',
+    (select body from item_test_inputs where input_name = 'item_limit'),
+    (select prepared from item_test_inputs where input_name = 'item_limit')
+  ),
+  '{"http_status":409,"error_code":"ITEM_LIMIT_REACHED"}'::jsonb,
+  'the locked owner counter commits the 100 active-item limit conflict'
 );
 
 reset role;
@@ -1243,12 +1255,14 @@ select ok(
     from public.items
     where normalized_url = 'https://example.com/posts/item-limit'
   )
-  and not exists (
+  and exists (
     select 1
     from public.api_requests
     where request_id = '44000000-0000-0000-0000-000000000001'
+      and response_code = 409
+      and response_body = '{"error_code":"ITEM_LIMIT_REACHED"}'::jsonb
   ),
-  'a rejected item-limit transaction leaves no item or request record'
+  'an item-limit conflict leaves no item and stores only its minimal receipt'
 );
 
 update public.library_usage

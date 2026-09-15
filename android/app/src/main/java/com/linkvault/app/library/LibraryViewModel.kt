@@ -17,8 +17,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -29,6 +31,7 @@ class LibraryViewModel internal constructor(
     private val ownerId: String?,
     initialUrl: String?,
     sharedText: String,
+    initialItemId: String?,
 ) : ViewModel() {
     private val json = Json { ignoreUnknownKeys = true }
     private val mutableUiState = MutableStateFlow(
@@ -48,6 +51,8 @@ class LibraryViewModel internal constructor(
     private var outboxJob: Job? = null
     private var pendingSaveRequestId: String? = null
     private var pendingEditRequestId: String? = null
+    private var pendingEditItemId: String? = null
+    private val editOwnershipToken = UUID.randomUUID().toString()
     private var cachedItems: List<LibraryItemSummary> = emptyList()
     private var cachedFetchedAt: Long? = null
     private val preparedReceipts = mutableSetOf<String>()
@@ -75,7 +80,8 @@ class LibraryViewModel internal constructor(
                 )
                 observeCache(ownerId)
                 observeOutbox(ownerId)
-                restoreAndLoad(ownerId)
+                resumeAndLoad(ownerId)
+                initialItemId?.takeUnless(String::isBlank)?.let(::openDetail)
             }
         }
     }
@@ -86,6 +92,11 @@ class LibraryViewModel internal constructor(
         saveJob?.cancel()
         saveJob = null
         pendingSaveRequestId = null
+        editJob?.cancel()
+        editJob = null
+        releaseAllEditRequestOwnership()
+        pendingEditRequestId = null
+        pendingEditItemId = null
         mutableUiState.value = mutableUiState.value.copy(
             form = LibrarySaveForm(initialUrl = initialUrl, sharedText = sharedText),
             saveStatus = LibrarySaveStatus.Idle,
@@ -233,29 +244,54 @@ class LibraryViewModel internal constructor(
     }
 
     fun openDetail(itemId: String) {
+        requestDetail(itemId = itemId, showLoading = true)
+    }
+
+    fun refreshDetail(itemId: String) {
+        val loaded = mutableUiState.value.detail as? LibraryDetailState.Loaded ?: return
+        if (loaded.item.id != itemId) return
+        requestDetail(itemId = itemId, showLoading = false)
+    }
+
+    private fun requestDetail(itemId: String, showLoading: Boolean) {
         if (detailJob?.isActive == true || !identityMatches()) {
             if (!identityMatches()) invalidateIdentity()
             return
         }
         val requestOwner = ownerId ?: return
-        mutableUiState.value = mutableUiState.value.copy(
-            detail = LibraryDetailState.Loading(itemId),
-            edit = null,
-        )
+        if (showLoading) {
+            releaseAllEditRequestOwnership()
+            pendingEditRequestId = null
+            pendingEditItemId = null
+            mutableUiState.value = mutableUiState.value.copy(
+                detail = LibraryDetailState.Loading(itemId),
+                edit = null,
+            )
+        }
         val job = viewModelScope.launch {
             try {
                 val response = client.libraryRequest(
                     expectedOwnerId = requestOwner,
                     path = "/items/$itemId",
                 )
-                val item = parseLibraryDetailResponse(response)
-                outbox.cacheDetail(requestOwner, response)
-                if (!responseBelongsTo(requestOwner)) {
-                    invalidateIdentity()
+                val publication = resolveDetailPublication(
+                    requestOwner = requestOwner,
+                    requestedItemId = itemId,
+                    response = response,
+                    cacheResponse = true,
+                )
+                if (publication == null) {
+                    if (identityMatches()) {
+                        showCachedDetailOrFailure(
+                            requestOwner = requestOwner,
+                            itemId = itemId,
+                            message = "서버 상세 응답을 확인하지 못했어요. 다시 시도해 주세요.",
+                        )
+                    }
                     return@launch
                 }
                 mutableUiState.value = mutableUiState.value.copy(
-                    detail = LibraryDetailState.Loaded(item),
+                    detail = publication.toDetailState(),
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -289,6 +325,9 @@ class LibraryViewModel internal constructor(
         editJob?.cancel()
         detailJob = null
         editJob = null
+        releaseAllEditRequestOwnership()
+        pendingEditRequestId = null
+        pendingEditItemId = null
         mutableUiState.value = mutableUiState.value.copy(
             detail = LibraryDetailState.None,
             edit = null,
@@ -298,6 +337,9 @@ class LibraryViewModel internal constructor(
     fun beginEdit() {
         val detail = mutableUiState.value.detail as? LibraryDetailState.Loaded ?: return
         val version = detail.item.version ?: return
+        releaseAllEditRequestOwnership()
+        pendingEditRequestId = null
+        pendingEditItemId = null
         mutableUiState.value = mutableUiState.value.copy(
             edit = LibraryEditUiState(
                 itemId = detail.item.id,
@@ -317,6 +359,9 @@ class LibraryViewModel internal constructor(
         if (!edit.status.allowsEditing() && edit.status !is LibraryEditStatus.Saved) return
         editJob?.cancel()
         editJob = null
+        releaseAllEditRequestOwnership()
+        pendingEditRequestId = null
+        pendingEditItemId = null
         mutableUiState.value = mutableUiState.value.copy(edit = null)
     }
 
@@ -376,26 +421,38 @@ class LibraryViewModel internal constructor(
                     expectedOwnerId = boundOwner,
                     path = "/items/${edit.itemId}",
                 )
-                val latest = parseLibraryDetailResponse(response)
-                if (latest.version == null) {
-                    throw IllegalStateException("The detail response has no version.")
-                }
-                outbox.cacheDetail(boundOwner, response)
-                if (!responseBelongsTo(boundOwner)) {
-                    invalidateIdentity()
+                val publication = resolveDetailPublication(
+                    requestOwner = boundOwner,
+                    requestedItemId = edit.itemId,
+                    response = response,
+                    cacheResponse = true,
+                )
+                if (publication == null) {
+                    restoreBlockedStatusAfterDroppedDetail(edit.itemId, blocked)
                     return@launch
                 }
-                mutableUiState.value = mutableUiState.value.copy(
-                    detail = LibraryDetailState.Loaded(latest),
-                    edit = edit.copy(
-                        status = LibraryEditStatus.ReadyToConfirm(
-                            requestId = blocked.requestId,
-                            reason = blocked.reason,
-                            latest = latest,
+                val latest = publication.item
+                val state = mutableUiState.value
+                val currentEdit = state.edit
+                val loading = currentEdit?.status as? LibraryEditStatus.LoadingLatest
+                mutableUiState.value = if (
+                    currentEdit?.itemId == edit.itemId &&
+                    loading?.requestId == blocked.requestId
+                ) {
+                    state.copy(
+                        detail = publication.toDetailState(),
+                        edit = currentEdit.copy(
+                            status = LibraryEditStatus.ReadyToConfirm(
+                                requestId = blocked.requestId,
+                                reason = blocked.reason,
+                                latest = latest,
+                            ),
+                            latestError = null,
                         ),
-                        latestError = null,
-                    ),
-                )
+                    )
+                } else {
+                    state.copy(detail = publication.toDetailState())
+                }
             } catch (error: CancellationException) {
                 throw error
             } catch (_: AccountAuthenticationRequiredException) {
@@ -404,11 +461,10 @@ class LibraryViewModel internal constructor(
                 if (!identityMatches()) {
                     invalidateIdentity()
                 } else {
-                    mutableUiState.value = mutableUiState.value.copy(
-                        edit = edit.copy(
-                            status = blocked,
-                            latestError = error.detailMessage(),
-                        ),
+                    restoreBlockedStatusAfterDroppedDetail(
+                        itemId = edit.itemId,
+                        blocked = blocked,
+                        message = error.detailMessage(),
                     )
                 }
             }
@@ -450,8 +506,31 @@ class LibraryViewModel internal constructor(
             val job = viewModelScope.launch {
                 try {
                     outbox.discard(boundOwner, ready.requestId)
-                    mutableUiState.value = mutableUiState.value.copy(
-                        detail = LibraryDetailState.Loaded(ready.latest),
+                    releaseEditRequestOwnership(boundOwner, ready.requestId)
+                    if (pendingEditRequestId == ready.requestId) {
+                        pendingEditRequestId = null
+                        pendingEditItemId = null
+                    }
+                    val state = mutableUiState.value
+                    val currentDetail = state.detail as? LibraryDetailState.Loaded
+                    val latestIsPublishable = shouldPublishLibraryDetail(
+                        requestedItemId = edit.itemId,
+                        candidate = LibraryDetailVersion(
+                            ready.latest.id,
+                            ready.latest.version,
+                        ),
+                        knownVersions = listOfNotNull(
+                            currentDetail?.item?.let {
+                                LibraryDetailVersion(it.id, it.version)
+                            },
+                        ),
+                    )
+                    mutableUiState.value = state.copy(
+                        detail = if (latestIsPublishable) {
+                            LibraryDetailState.Loaded(ready.latest)
+                        } else {
+                            state.detail
+                        },
                         edit = edit.copy(status = LibraryEditStatus.Saved("최신 내용과 이미 같아요.")),
                     )
                 } catch (error: CancellationException) {
@@ -477,7 +556,9 @@ class LibraryViewModel internal constructor(
         }
 
         val operation = (preparation as LibraryEditPreparation.Valid).operation
+        if (!acquireEditRequestOwnership(boundOwner, operation.requestId)) return
         pendingEditRequestId = operation.requestId
+        pendingEditItemId = operation.itemId
         replacedRequestIds += ready.requestId
         mutableUiState.value = mutableUiState.value.copy(
             edit = edit.copy(status = LibraryEditStatus.Queuing),
@@ -492,32 +573,54 @@ class LibraryViewModel internal constructor(
                     payloadJson = operation.body,
                 )
                 outbox.discard(boundOwner, ready.requestId)
-                mutableUiState.value = mutableUiState.value.copy(
-                    edit = edit.copy(
-                        expectedVersion = latestVersion,
-                        originalTitle = ready.latest.userTitle,
-                        originalNote = ready.latest.note,
-                        status = LibraryEditStatus.Queued(operation.requestId),
-                        latestError = null,
-                    ),
-                )
+                releaseEditRequestOwnership(boundOwner, ready.requestId)
+                val state = mutableUiState.value
+                val currentEdit = state.edit
+                if (
+                    pendingEditRequestId == operation.requestId &&
+                    pendingEditItemId == operation.itemId &&
+                    currentEdit?.status is LibraryEditStatus.Queuing &&
+                    currentEdit.itemId == operation.itemId
+                ) {
+                    mutableUiState.value = state.copy(
+                        edit = currentEdit.copy(
+                            expectedVersion = latestVersion,
+                            originalTitle = ready.latest.userTitle,
+                            originalNote = ready.latest.note,
+                            status = LibraryEditStatus.Queued(operation.requestId),
+                            latestError = null,
+                        ),
+                    )
+                }
             } catch (error: CancellationException) {
+                releaseEditRequestOwnership(boundOwner, operation.requestId)
                 throw error
             } catch (_: AccountAuthenticationRequiredException) {
                 invalidateIdentity()
             } catch (error: Exception) {
+                releaseEditRequestOwnership(boundOwner, operation.requestId)
                 if (!identityMatches()) {
                     invalidateIdentity()
                     return@launch
                 }
-                pendingEditRequestId = null
-                replacedRequestIds -= ready.requestId
-                mutableUiState.value = mutableUiState.value.copy(
-                    edit = edit.copy(
-                        status = ready,
-                        latestError = error.localQueueMessage(),
-                    ),
-                )
+                val state = mutableUiState.value
+                val currentEdit = state.edit
+                if (
+                    pendingEditRequestId == operation.requestId &&
+                    pendingEditItemId == operation.itemId &&
+                    currentEdit?.status is LibraryEditStatus.Queuing &&
+                    currentEdit.itemId == operation.itemId
+                ) {
+                    pendingEditRequestId = null
+                    pendingEditItemId = null
+                    replacedRequestIds -= ready.requestId
+                    mutableUiState.value = state.copy(
+                        edit = currentEdit.copy(
+                            status = ready,
+                            latestError = error.localQueueMessage(),
+                        ),
+                    )
+                }
             }
         }
         editJob = job
@@ -533,13 +636,17 @@ class LibraryViewModel internal constructor(
     fun discardOperation(requestId: String) {
         mutateOutbox(requestId) { boundOwner ->
             outbox.discard(boundOwner, requestId)
+            releaseEditRequestOwnership(boundOwner, requestId)
+            if (pendingEditRequestId == requestId) {
+                pendingEditRequestId = null
+                pendingEditItemId = null
+            }
             if (pendingSaveRequestId == requestId) {
                 pendingSaveRequestId = null
                 mutableUiState.value = mutableUiState.value.copy(saveStatus = LibrarySaveStatus.Idle)
             }
             val edit = mutableUiState.value.edit
             if (edit?.status?.requestIdOrNull() == requestId) {
-                pendingEditRequestId = null
                 mutableUiState.value = mutableUiState.value.copy(
                     edit = if (edit.status is LibraryEditStatus.Blocked ||
                         edit.status is LibraryEditStatus.ReadyToConfirm
@@ -558,6 +665,9 @@ class LibraryViewModel internal constructor(
         val boundOwner = ownerId ?: return
         viewModelScope.launch {
             receiptIds.forEach { requestId ->
+                if (libraryEditRequestOwnershipRegistry.hasLiveOwner(boundOwner, requestId)) {
+                    return@forEach
+                }
                 try {
                     outbox.acknowledge(boundOwner, requestId)
                     preparedReceipts -= requestId
@@ -619,7 +729,9 @@ class LibraryViewModel internal constructor(
     private fun enqueueEdit(operation: LibraryEditOperation) {
         if (editJob?.isActive == true) return
         val current = mutableUiState.value.edit ?: return
+        if (!acquireEditRequestOwnership(operation.ownerId, operation.requestId)) return
         pendingEditRequestId = operation.requestId
+        pendingEditItemId = operation.itemId
         mutableUiState.value = mutableUiState.value.copy(
             edit = current.copy(status = LibraryEditStatus.Queuing),
         )
@@ -632,24 +744,50 @@ class LibraryViewModel internal constructor(
                     path = "/items/${operation.itemId}",
                     payloadJson = operation.body,
                 )
-                mutableUiState.value = mutableUiState.value.copy(
-                    edit = current.copy(status = LibraryEditStatus.Queued(operation.requestId)),
-                )
+                val state = mutableUiState.value
+                val currentEdit = state.edit
+                if (
+                    pendingEditRequestId == operation.requestId &&
+                    pendingEditItemId == operation.itemId &&
+                    currentEdit?.status is LibraryEditStatus.Queuing &&
+                    currentEdit.itemId == operation.itemId
+                ) {
+                    mutableUiState.value = state.copy(
+                        edit = currentEdit.copy(
+                            status = LibraryEditStatus.Queued(operation.requestId),
+                        ),
+                    )
+                }
             } catch (error: CancellationException) {
+                releaseEditRequestOwnership(operation.ownerId, operation.requestId)
                 throw error
             } catch (_: AccountAuthenticationRequiredException) {
                 invalidateIdentity()
             } catch (error: Exception) {
+                releaseEditRequestOwnership(operation.ownerId, operation.requestId)
                 if (!identityMatches()) {
                     invalidateIdentity()
                     return@launch
                 }
-                pendingEditRequestId = null
-                mutableUiState.value = mutableUiState.value.copy(
-                    edit = current.copy(
-                        status = LibraryEditStatus.Failed(null, error.localQueueMessage()),
-                    ),
-                )
+                val state = mutableUiState.value
+                val currentEdit = state.edit
+                if (
+                    pendingEditRequestId == operation.requestId &&
+                    pendingEditItemId == operation.itemId &&
+                    currentEdit?.status is LibraryEditStatus.Queuing &&
+                    currentEdit.itemId == operation.itemId
+                ) {
+                    pendingEditRequestId = null
+                    pendingEditItemId = null
+                    mutableUiState.value = state.copy(
+                        edit = currentEdit.copy(
+                            status = LibraryEditStatus.Failed(
+                                null,
+                                error.localQueueMessage(),
+                            ),
+                        ),
+                    )
+                }
             }
         }
         editJob = job
@@ -658,10 +796,11 @@ class LibraryViewModel internal constructor(
         }
     }
 
-    private fun restoreAndLoad(requestOwner: String) {
+    private fun resumeAndLoad(requestOwner: String) {
         val job = viewModelScope.launch {
             try {
-                client.restoreAccount()
+                // An owner-bound route already has a restored identity. Re-restoring here can
+                // mutate the observable session boundary offline and dispose this route.
                 if (!responseBelongsTo(requestOwner)) {
                     invalidateIdentity()
                     return@launch
@@ -828,12 +967,16 @@ class LibraryViewModel internal constructor(
 
     private fun observeOutbox(requestOwner: String) {
         outboxJob = viewModelScope.launch {
-            outbox.observeOutbox(requestOwner).collect { entries ->
+            combine(
+                outbox.observeOutbox(requestOwner),
+                libraryEditRequestOwnershipRegistry.revision,
+            ) { entries, _ -> entries }.collect { entries ->
                 if (!responseBelongsTo(requestOwner)) {
                     invalidateIdentity()
                     return@collect
                 }
                 val visibleEntries = entries.filterNot { it.requestId in replacedRequestIds }
+                    .filter(OutboxEntry::isLibrarySaveOrTextEdit)
                 mutableUiState.value = mutableUiState.value.copy(outboxEntries = visibleEntries)
                 updateSaveFromOutbox(visibleEntries)
                 updateEditFromOutbox(visibleEntries)
@@ -895,7 +1038,11 @@ class LibraryViewModel internal constructor(
         ) {
             return
         }
-        val requestId = pendingEditRequestId ?: edit.status.requestIdOrNull() ?: return
+        val requestId = edit.status.requestIdOrNull()
+            ?: pendingEditRequestId?.takeIf {
+                edit.status is LibraryEditStatus.Queuing && pendingEditItemId == edit.itemId
+            }
+            ?: return
         val entry = entries.firstOrNull {
             it.requestId == requestId && it.method == "PATCH"
         } ?: return
@@ -929,14 +1076,27 @@ class LibraryViewModel internal constructor(
     }
 
     private suspend fun restoreBlockedEdit(entries: List<OutboxEntry>) {
+        val openItemId = when (val detail = mutableUiState.value.detail) {
+            LibraryDetailState.None -> null
+            is LibraryDetailState.Loading -> detail.itemId
+            is LibraryDetailState.Loaded -> detail.item.id
+            is LibraryDetailState.Failed -> detail.itemId
+        }
         val entry = entries
             .asSequence()
-            .filter { it.method == "PATCH" && it.path.startsWith("/items/") }
+            .filter(OutboxEntry::isLibraryTextEdit)
+            .filter {
+                openItemId == null || it.path.removePrefix("/items/") == openItemId
+            }
             .filter { it.state == OutboxState.CONFLICT || it.state == OutboxState.EXPIRED }
             .maxByOrNull { it.createdAt }
             ?: return
         val current = mutableUiState.value.edit
-        if (current?.status?.requestIdOrNull() == entry.requestId) {
+        if (
+            current?.status?.requestIdOrNull() == entry.requestId &&
+            current.itemId == entry.path.removePrefix("/items/")
+        ) {
+            if (!acquireEditRequestOwnership(entry.ownerId, entry.requestId)) return
             val reason = if (entry.state == OutboxState.CONFLICT) {
                 LibraryEditBlockReason.VERSION_CONFLICT
             } else {
@@ -952,6 +1112,7 @@ class LibraryViewModel internal constructor(
             }
             return
         }
+        if (current != null) return
 
         val itemId = entry.path.removePrefix("/items/")
         val patch = runCatching { parseLibraryEditPatch(entry.payloadJson) }.getOrNull() ?: return
@@ -970,6 +1131,7 @@ class LibraryViewModel internal constructor(
         } else {
             LibraryEditBlockReason.EXPIRED
         }
+        if (!acquireEditRequestOwnership(entry.ownerId, entry.requestId)) return
         mutableUiState.value = mutableUiState.value.copy(
             detail = original?.let {
                 LibraryDetailState.Loaded(it, isCached = true, fetchedAt = cached?.fetchedAt)
@@ -987,6 +1149,7 @@ class LibraryViewModel internal constructor(
 
     private suspend fun prepareSavedReceipt(entry: OutboxEntry) {
         if (!preparedReceipts.add(entry.requestId)) return
+        val textEditItemId = entry.libraryTextEditItemIdOrNull()
         val resultJson = entry.resultJson
         if (resultJson == null) {
             preparedReceipts -= entry.requestId
@@ -1013,25 +1176,80 @@ class LibraryViewModel internal constructor(
                     }
                 }
 
-                entry.method == "PATCH" && entry.path.startsWith("/items/") -> {
-                    val detail = parseLibraryDetailResponse(response)
-                    if (pendingEditRequestId == entry.requestId ||
-                        mutableUiState.value.edit?.itemId == detail.id
+                textEditItemId != null -> {
+                    val publication = resolveDetailPublication(
+                        requestOwner = entry.ownerId,
+                        requestedItemId = textEditItemId,
+                        response = response,
+                        cacheResponse = true,
+                    )
+                    if (publication == null) {
+                        preparedReceipts -= entry.requestId
+                        return
+                    }
+                    val state = mutableUiState.value
+                    val edit = state.edit
+                    val editorOwnedRequestId = edit?.status?.requestIdOrNull()
+                        ?: pendingEditRequestId?.takeIf {
+                            edit?.status is LibraryEditStatus.Queuing &&
+                                pendingEditItemId == edit.itemId
+                        }
+                    val appliesToEditor = shouldApplyLibraryEditReceipt(
+                        receiptRequestId = entry.requestId,
+                        receiptItemId = textEditItemId,
+                        ownedRequestId = editorOwnedRequestId,
+                        ownedItemId = edit?.itemId,
+                    )
+                    val nextDetail = if (state.detail.itemIdOrNull() == textEditItemId) {
+                        publication.toDetailState()
+                    } else {
+                        state.detail
+                    }
+                    val nextEdit = if (appliesToEditor && edit != null) {
+                        edit.copy(
+                            expectedVersion = publication.item.version ?: edit.expectedVersion,
+                            originalTitle = publication.item.userTitle,
+                            originalNote = publication.item.note,
+                            form = LibraryEditForm(
+                                title = publication.item.userTitle.orEmpty(),
+                                note = publication.item.note.orEmpty(),
+                            ),
+                            status = LibraryEditStatus.Saved("제목·메모를 저장했어요."),
+                        )
+                    } else {
+                        edit
+                    }
+                    mutableUiState.value = state.copy(
+                        detail = nextDetail,
+                        edit = nextEdit,
+                    )
+                    if (appliesToEditor) {
+                        releaseEditRequestOwnership(entry.ownerId, entry.requestId)
+                    }
+                    if (
+                        pendingEditRequestId == entry.requestId &&
+                        pendingEditItemId == textEditItemId
                     ) {
                         pendingEditRequestId = null
-                        mutableUiState.value = mutableUiState.value.copy(
-                            detail = LibraryDetailState.Loaded(detail),
-                            edit = mutableUiState.value.edit?.copy(
-                                expectedVersion = detail.version ?: mutableUiState.value.edit!!.expectedVersion,
-                                originalTitle = detail.userTitle,
-                                originalNote = detail.note,
-                                form = LibraryEditForm(
-                                    title = detail.userTitle.orEmpty(),
-                                    note = detail.note.orEmpty(),
-                                ),
-                                status = LibraryEditStatus.Saved("제목·메모를 저장했어요."),
+                        pendingEditItemId = null
+                    }
+                    if (
+                        !shouldAcknowledgeLibraryEditReceipt(
+                            receiptRequestId = entry.requestId,
+                            receiptItemId = textEditItemId,
+                            reconciledDetail = LibraryDetailVersion(
+                                publication.item.id,
+                                publication.item.version,
                             ),
+                            hasLiveRequestOwner =
+                                libraryEditRequestOwnershipRegistry.hasLiveOwner(
+                                    entry.ownerId,
+                                    entry.requestId,
+                                ),
                         )
+                    ) {
+                        preparedReceipts -= entry.requestId
+                        return
                     }
                 }
             }
@@ -1047,6 +1265,98 @@ class LibraryViewModel internal constructor(
         }
     }
 
+    private suspend fun resolveDetailPublication(
+        requestOwner: String,
+        requestedItemId: String,
+        response: JsonObject,
+        cacheResponse: Boolean,
+    ): LibraryDetailPublication? {
+        val responseItem = parseLibraryDetailResponse(response)
+        val responseVersion = LibraryDetailVersion(responseItem.id, responseItem.version)
+        val responseIsValidCandidate = shouldPublishLibraryDetail(
+            requestedItemId = requestedItemId,
+            candidate = responseVersion,
+            knownVersions = emptyList(),
+        )
+        if (!responseIsValidCandidate) return null
+        if (cacheResponse) {
+            outbox.cacheDetail(requestOwner, response)
+        }
+        if (!responseBelongsTo(requestOwner)) {
+            invalidateIdentity()
+            return null
+        }
+
+        val cached = runCatching {
+            outbox.readCachedDetail(requestOwner, requestedItemId)
+        }.getOrNull()
+        if (!responseBelongsTo(requestOwner)) {
+            invalidateIdentity()
+            return null
+        }
+        val current = mutableUiState.value.detail as? LibraryDetailState.Loaded
+        val currentPublication = current
+            ?.takeIf { it.item.id == requestedItemId }
+            ?.let {
+                LibraryDetailPublication(
+                    item = it.item,
+                    isCached = it.isCached,
+                    fetchedAt = it.fetchedAt,
+                )
+            }
+        val cachedPublication = cached?.takeIf { it.itemId == requestedItemId }?.let { row ->
+            row.parseDetailOrNull()?.let {
+                LibraryDetailPublication(
+                    item = it,
+                    isCached = true,
+                    fetchedAt = row.fetchedAt,
+                )
+            }
+        }
+        val knownVersions = listOfNotNull(
+            currentPublication?.item?.let { LibraryDetailVersion(it.id, it.version) },
+            cached?.let { LibraryDetailVersion(it.itemId, it.serverVersion) },
+        )
+        if (
+            shouldPublishLibraryDetail(
+                requestedItemId = requestedItemId,
+                candidate = responseVersion,
+                knownVersions = knownVersions,
+            )
+        ) {
+            return LibraryDetailPublication(responseItem)
+        }
+        return listOfNotNull(currentPublication, cachedPublication)
+            .filter { publication ->
+                shouldPublishLibraryDetail(
+                    requestedItemId = requestedItemId,
+                    candidate = LibraryDetailVersion(
+                        publication.item.id,
+                        publication.item.version,
+                    ),
+                    knownVersions = knownVersions,
+                )
+            }
+            .maxByOrNull { it.item.version ?: Long.MIN_VALUE }
+    }
+
+    private fun restoreBlockedStatusAfterDroppedDetail(
+        itemId: String,
+        blocked: LibraryEditStatus.Blocked,
+        message: String? = null,
+    ) {
+        val state = mutableUiState.value
+        val edit = state.edit ?: return
+        val loading = edit.status as? LibraryEditStatus.LoadingLatest ?: return
+        if (edit.itemId != itemId || loading.requestId != blocked.requestId) return
+        mutableUiState.value = state.copy(
+            edit = edit.copy(
+                status = blocked,
+                latestError = message,
+            ),
+        )
+    }
+
     private suspend fun showCachedDetailOrFailure(
         requestOwner: String,
         itemId: String,
@@ -1058,13 +1368,28 @@ class LibraryViewModel internal constructor(
             return
         }
         val item = cached?.parseDetailOrNull()
-        mutableUiState.value = mutableUiState.value.copy(
-            detail = if (item == null) {
-                LibraryDetailState.Failed(itemId, message)
-            } else {
-                LibraryDetailState.Loaded(item, isCached = true, fetchedAt = cached?.fetchedAt)
-            },
+        val state = mutableUiState.value
+        val current = state.detail as? LibraryDetailState.Loaded
+        val knownVersions = listOfNotNull(
+            current?.item?.let { LibraryDetailVersion(it.id, it.version) },
+            cached?.let { LibraryDetailVersion(it.itemId, it.serverVersion) },
         )
+        val cachedIsPublishable = item != null && shouldPublishLibraryDetail(
+            requestedItemId = itemId,
+            candidate = LibraryDetailVersion(item.id, item.version),
+            knownVersions = knownVersions,
+        )
+        val nextDetail = when {
+            cachedIsPublishable -> LibraryDetailState.Loaded(
+                item = requireNotNull(item),
+                isCached = true,
+                fetchedAt = cached?.fetchedAt,
+            )
+
+            current?.item?.id == itemId -> current
+            else -> LibraryDetailState.Failed(itemId, message)
+        }
+        mutableUiState.value = state.copy(detail = nextDetail)
     }
 
     private fun showCachedList(message: String) {
@@ -1130,7 +1455,33 @@ class LibraryViewModel internal constructor(
     private fun identityMatches(): Boolean =
         ownerId != null && client.sessionUserId() == ownerId
 
+    private fun acquireEditRequestOwnership(requestOwner: String, requestId: String): Boolean {
+        if (!responseBelongsTo(requestOwner)) {
+            invalidateIdentity()
+            return false
+        }
+        libraryEditRequestOwnershipRegistry.acquire(
+            ownerId = requestOwner,
+            requestId = requestId,
+            viewModelToken = editOwnershipToken,
+        )
+        return true
+    }
+
+    private fun releaseEditRequestOwnership(requestOwner: String, requestId: String) {
+        libraryEditRequestOwnershipRegistry.release(
+            ownerId = requestOwner,
+            requestId = requestId,
+            viewModelToken = editOwnershipToken,
+        )
+    }
+
+    private fun releaseAllEditRequestOwnership() {
+        libraryEditRequestOwnershipRegistry.releaseAll(editOwnershipToken)
+    }
+
     private fun invalidateIdentity() {
+        releaseAllEditRequestOwnership()
         listJob?.cancel()
         saveJob?.cancel()
         detailJob?.cancel()
@@ -1147,6 +1498,7 @@ class LibraryViewModel internal constructor(
         outboxJob = null
         pendingSaveRequestId = null
         pendingEditRequestId = null
+        pendingEditItemId = null
         cachedItems = emptyList()
         mutableUiState.value = LibraryUiState(
             availability = LibraryAvailability.SignInRequired(
@@ -1155,6 +1507,11 @@ class LibraryViewModel internal constructor(
             form = LibrarySaveForm(initialUrl = null, sharedText = ""),
             isListLoading = false,
         )
+    }
+
+    override fun onCleared() {
+        releaseAllEditRequestOwnership()
+        super.onCleared()
     }
 
     companion object {
@@ -1166,15 +1523,36 @@ class LibraryViewModel internal constructor(
             ownerId: String?,
             initialUrl: String?,
             sharedText: String,
+            initialItemId: String? = null,
         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
                 require(modelClass.isAssignableFrom(LibraryViewModel::class.java))
-                return LibraryViewModel(client, outbox, ownerId, initialUrl, sharedText) as T
+                return LibraryViewModel(
+                    client,
+                    outbox,
+                    ownerId,
+                    initialUrl,
+                    sharedText,
+                    initialItemId,
+                ) as T
             }
         }
     }
 }
+
+private data class LibraryDetailPublication(
+    val item: LibraryItemDetail,
+    val isCached: Boolean = false,
+    val fetchedAt: Long? = null,
+)
+
+private fun LibraryDetailPublication.toDetailState(): LibraryDetailState.Loaded =
+    LibraryDetailState.Loaded(
+        item = item,
+        isCached = isCached,
+        fetchedAt = fetchedAt,
+    )
 
 data class LibraryUiState(
     val availability: LibraryAvailability,
@@ -1224,6 +1602,13 @@ sealed interface LibraryDetailState {
     ) : LibraryDetailState
 
     data class Failed(val itemId: String, val message: String) : LibraryDetailState
+}
+
+private fun LibraryDetailState.itemIdOrNull(): String? = when (this) {
+    LibraryDetailState.None -> null
+    is LibraryDetailState.Loading -> itemId
+    is LibraryDetailState.Loaded -> item.id
+    is LibraryDetailState.Failed -> itemId
 }
 
 data class LibraryEditUiState(
@@ -1295,6 +1680,21 @@ private fun CachedItem.parseDetailOrNull(): LibraryItemDetail? = runCatching {
 private fun OutboxEntry.payloadUrlOrNull(): String? = runCatching {
     Json.parseToJsonElement(payloadJson).jsonObject["url"]?.jsonPrimitive?.content
 }.getOrNull()
+
+private fun OutboxEntry.isLibrarySaveOrTextEdit(): Boolean =
+    (method == "POST" && path == "/items") || isLibraryTextEdit()
+
+private fun OutboxEntry.isLibraryTextEdit(): Boolean = libraryTextEditItemIdOrNull() != null
+
+private fun OutboxEntry.libraryTextEditItemIdOrNull(): String? {
+    if (method != "PATCH" || !path.startsWith("/items/")) return null
+    val itemId = path.removePrefix("/items/")
+    if (itemId.isBlank() || '/' in itemId) return null
+    val editsText = runCatching {
+        !Json.parseToJsonElement(payloadJson).jsonObject.containsKey("category_ids")
+    }.getOrDefault(false)
+    return itemId.takeIf { editsText }
+}
 
 private fun OutboxEntry.failureMessage(): String = when (errorCode) {
     "VERSION_CONFLICT" -> "변경 충돌이 발생했어요. 최신 내용을 확인해 주세요."

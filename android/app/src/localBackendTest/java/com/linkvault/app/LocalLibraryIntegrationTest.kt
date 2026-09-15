@@ -33,7 +33,7 @@ class LocalLibraryIntegrationTest {
 
     @Test
     fun realAuthenticatedSessionSavesAndReloadsOriginal(): Unit = runBlocking {
-        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:54321")
+        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:18021")
         val arguments = InstrumentationRegistry.getArguments()
         val email = checkNotNull(arguments.getString("fixtureEmail"))
         val password = checkNotNull(arguments.getString("fixturePassword"))

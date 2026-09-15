@@ -30,6 +30,8 @@ import io.ktor.client.request.header
 import io.ktor.client.request.post
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -37,6 +39,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import io.ktor.utils.io.readAvailable
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -45,6 +48,7 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerialName
@@ -103,6 +107,8 @@ class AccountClient(
     val configurationMessage: String?
         get() = (configuration as? AccountConfigValidation.Unconfigured)?.issue?.message
 
+    val sessionState: StateFlow<AccountSessionState> = sessionBoundary.sessionState
+
     fun hasSession(): Boolean = sessionBoundary.hasSession()
 
     fun sessionUserId(): String? = sessionBoundary.ownerId()
@@ -114,39 +120,39 @@ class AccountClient(
             block()
         }
 
-    suspend fun restoreAccount(): AccountAccess? {
+    suspend fun restoreAccount(): AccountAccess? = try {
         val auth = requireSupabase().auth
-        val hasRestoredSession = try {
-            sessionBoundary.locked {
-                when (val status = auth.sessionStatus.value) {
-                    is SessionStatus.Authenticated -> {
-                        if (status.session.expiresAt <= kotlinx.datetime.Clock.System.now()) {
-                            return@locked restoreStoredSession(auth)
-                        }
-                        val ownerId = status.session.user?.id
-                            ?: throw invalidSdkSession()
-                        prepareLocalOwner(ownerId)
-                        val origin = currentOrigin() ?: commitLogin(ownerId)
-                        if (origin.ownerId != ownerId) {
-                            auth.clearSession()
-                            clear(origin)
-                            throw AccountAuthenticationRequiredException()
-                        }
-                        confirmAuthenticated(origin, ownerId)
-                        true
+        val hasRestoredSession = sessionBoundary.locked {
+            when (val status = auth.sessionStatus.value) {
+                is SessionStatus.Authenticated -> {
+                    if (status.session.expiresAt <= kotlinx.datetime.Clock.System.now()) {
+                        return@locked restoreStoredSession(auth)
                     }
-                    is SessionStatus.RefreshFailure -> {
-                        restoreStoredSession(auth)
+                    val ownerId = status.session.user?.id
+                        ?: throw invalidSdkSession()
+                    prepareLocalOwner(ownerId)
+                    val origin = currentOrigin() ?: commitLogin(ownerId)
+                    if (origin.ownerId != ownerId) {
+                        auth.clearSession()
+                        clear(origin)
+                        throw AccountAuthenticationRequiredException()
                     }
-                    is SessionStatus.NotAuthenticated,
-                    SessionStatus.Initializing,
-                    -> restoreStoredSession(auth)
+                    confirmAuthenticated(origin, ownerId)
+                    true
                 }
+                is SessionStatus.RefreshFailure -> {
+                    restoreStoredSession(auth)
+                }
+                is SessionStatus.NotAuthenticated,
+                SessionStatus.Initializing,
+                -> restoreStoredSession(auth)
             }
-        } catch (error: SessionBoundaryChangedException) {
-            throw sessionChanged()
         }
-        return if (hasRestoredSession) getAccount() else null
+        if (hasRestoredSession) getAccount() else null
+    } catch (error: SessionBoundaryChangedException) {
+        throw sessionChanged()
+    } finally {
+        sessionBoundary.locked { markInitialized() }
     }
 
     suspend fun signIn(activity: Activity): AccountAccess {
@@ -269,6 +275,14 @@ class AccountClient(
     ): JsonObject {
         val safePath = validateLibraryPath(path)
         val httpMethod = parseLibraryMethod(method)
+        validateLibraryRouteMethod(safePath, httpMethod)
+        if (safePath.endsWith("/content")) {
+            throw AccountClientException(
+                message = "이미지는 이미지 다운로드 요청으로 받아야 해요.",
+                retryable = false,
+                code = "BINARY_RESPONSE_REQUIRED",
+            )
+        }
         val safeRequestId = requestId?.let(::validateRequestId)
         if (httpMethod != HttpMethod.Get && safeRequestId == null) {
             throw AccountClientException(
@@ -300,6 +314,12 @@ class AccountClient(
         }
         return acceptResponse(response) { rawResponse ->
             if (!rawResponse.status.isSuccess()) throw apiException(rawResponse)
+            if (
+                rawResponse.status == HttpStatusCode.NoContent &&
+                httpMethod == HttpMethod.Delete && safePath.startsWith("/categories/")
+            ) {
+                return@acceptResponse JsonObject(emptyMap())
+            }
             try {
                 json.decodeFromString<JsonObject>(rawResponse.body)
             } catch (error: Exception) {
@@ -309,6 +329,122 @@ class AccountClient(
                     cause = error,
                 )
             }
+        }
+    }
+
+    suspend fun uploadReservedAsset(
+        expectedOwnerId: String,
+        itemId: String,
+        assetId: String,
+        mimeType: String,
+        bytes: ByteArray,
+    ): Unit {
+        val asset = validateAssetTransport(
+            expectedOwnerId = expectedOwnerId,
+            itemId = itemId,
+            assetId = assetId,
+        )
+        val safeMimeType = validateAssetMimeType(mimeType)
+        validateAssetByteCount(bytes.size)
+
+        val response = authorizedRequest(asset.expectedOwnerId) { accessToken ->
+            val httpResponse = requireHttpClient().post(
+                "${requireConfig().url}/storage/v1/object/library-images/" +
+                    "${asset.expectedOwnerId}/${asset.itemId}/${asset.assetId}",
+            ) {
+                header(HttpHeaders.Authorization, "Bearer $accessToken")
+                header(API_KEY_HEADER, requireConfig().key)
+                header(HttpHeaders.ContentType, safeMimeType)
+                header(UPSERT_HEADER, "false")
+                setBody(bytes)
+            }
+            if (httpResponse.status.isSuccess() || httpResponse.status == HttpStatusCode.Unauthorized) {
+                httpResponse.bodyAsChannel().cancel(null)
+                RawResponse(httpResponse.status)
+            } else {
+                httpResponse.toBoundedTextResponse(MAX_ERROR_BODY_BYTES)
+            }
+        }
+        acceptResponse(response) { rawResponse ->
+            if (isStorageObjectExists(rawResponse)) {
+                throw AccountClientException(
+                    message = "이미 업로드된 이미지 객체가 있어요.",
+                    retryable = false,
+                    code = ASSET_OBJECT_EXISTS,
+                )
+            }
+            if (!rawResponse.status.isSuccess()) throw apiException(rawResponse)
+        }
+    }
+
+    suspend fun downloadActiveAsset(
+        expectedOwnerId: String,
+        itemId: String,
+        assetId: String,
+    ): ByteArray {
+        val asset = validateAssetTransport(
+            expectedOwnerId = expectedOwnerId,
+            itemId = itemId,
+            assetId = assetId,
+        )
+        val safePath = validateLibraryPath(
+            "/items/${asset.itemId}/assets/${asset.assetId}/content",
+        )
+
+        val response = authorizedRequest(asset.expectedOwnerId) { accessToken ->
+            val httpResponse = requireHttpClient().get(
+                "${requireConfig().url}$FUNCTIONS_PATH$safePath",
+            ) {
+                header(HttpHeaders.Authorization, "Bearer $accessToken")
+                header(API_KEY_HEADER, requireConfig().key)
+            }
+            when {
+                httpResponse.status == HttpStatusCode.Unauthorized -> {
+                    httpResponse.bodyAsChannel().cancel(null)
+                    RawResponse(httpResponse.status)
+                }
+                !httpResponse.status.isSuccess() -> {
+                    httpResponse.toBoundedTextResponse(MAX_ERROR_BODY_BYTES)
+                }
+                httpResponse.headers[HttpHeaders.ContentType] !in ALLOWED_ASSET_MIME_TYPES -> {
+                    httpResponse.bodyAsChannel().cancel(null)
+                    RawResponse(
+                        status = httpResponse.status,
+                        contentType = httpResponse.headers[HttpHeaders.ContentType],
+                    )
+                }
+                else -> {
+                    val body = httpResponse.readBoundedBody(MAX_ASSET_BYTES)
+                    RawResponse(
+                        status = httpResponse.status,
+                        bytes = body.bytes,
+                        contentType = httpResponse.headers[HttpHeaders.ContentType],
+                        bodyOverflow = body.overflow,
+                    )
+                }
+            }
+        }
+        return acceptResponse(response) { rawResponse ->
+            if (!rawResponse.status.isSuccess()) throw apiException(rawResponse)
+            if (rawResponse.contentType !in ALLOWED_ASSET_MIME_TYPES) {
+                throw AccountClientException(
+                    message = "서버가 지원하지 않는 이미지 형식을 반환했어요.",
+                    retryable = false,
+                    code = ASSET_MIME_MISMATCH,
+                )
+            }
+            if (rawResponse.bodyOverflow) {
+                throw AccountClientException(
+                    message = ASSET_TOO_LARGE_MESSAGE,
+                    retryable = false,
+                    code = ASSET_TOO_LARGE,
+                )
+            }
+            rawResponse.bytes ?: throw AccountClientException(
+                message = "서버가 이미지 데이터를 반환하지 않았어요.",
+                retryable = true,
+                code = "INVALID_ASSET_RESPONSE",
+            )
         }
     }
 
@@ -701,6 +837,19 @@ class AccountClient(
         null
     }
 
+    private fun isStorageObjectExists(response: RawResponse): Boolean {
+        if (response.status == HttpStatusCode.Conflict) return true
+        if (response.status != HttpStatusCode.BadRequest) return false
+        val error = try {
+            json.decodeFromString<StorageErrorResponse>(response.body)
+        } catch (_: Exception) {
+            return false
+        }
+        return error.code == "ResourceAlreadyExists" ||
+            error.code == "KeyAlreadyExists" ||
+            (error.statusCode == "409" && error.error == "Duplicate")
+    }
+
     private fun validateJsonObject(body: String) {
         try {
             json.decodeFromString<JsonObject>(body)
@@ -761,15 +910,19 @@ class AccountClient(
         const val FUNCTIONS_PATH = "/functions/v1/library-api/v1"
         const val API_KEY_HEADER = "apikey"
         const val REQUEST_ID_HEADER = "X-Request-Id"
+        const val UPSERT_HEADER = "x-upsert"
         const val EMPTY_JSON_OBJECT = "{}"
         const val BETA_ACCESS_REQUIRED = "BETA_ACCESS_REQUIRED"
         const val ACCOUNT_DELETING = "ACCOUNT_DELETING"
         const val INVALID_REQUEST_ID = "INVALID_REQUEST_ID"
         const val INVALID_REQUEST_BODY = "INVALID_REQUEST_BODY"
+        const val ASSET_OBJECT_EXISTS = "ASSET_OBJECT_EXISTS"
+        const val ASSET_MIME_MISMATCH = "ASSET_MIME_MISMATCH"
         const val PROFILE_ACTIVE = "active"
         const val PROFILE_PENDING = "pending_approval"
         const val PROFILE_DELETING = "deleting"
         const val MAX_ERROR_MESSAGE_LENGTH = 300
+        const val MAX_ERROR_BODY_BYTES = 64 * 1024
         const val AUTH_REQUEST_TIMEOUT_SECONDS = 15
         const val AUTH_SESSION_OPERATION_TIMEOUT_MILLIS = 16_000L
         const val API_REQUEST_TIMEOUT_MILLIS = 15_000L
@@ -899,7 +1052,7 @@ internal fun validateAccountConfig(
     val isDebugEmulator = debug &&
         scheme == "http" &&
         uri.host == "10.0.2.2" &&
-        uri.port == 54321
+        uri.port == 18021
     if (!isHttps && !isDebugEmulator) {
         val issue = if (scheme == "http") {
             AccountConfigIssue.INSECURE_URL
@@ -918,7 +1071,7 @@ internal fun validateAccountConfig(
     )
 }
 
-private fun validateLibraryPath(path: String): String {
+internal fun validateLibraryPath(path: String): String {
     val uri = try {
         URI(path)
     } catch (error: Exception) {
@@ -928,13 +1081,82 @@ private fun validateLibraryPath(path: String): String {
         throw invalidLibraryPath()
     }
     val rawPath = uri.rawPath ?: throw invalidLibraryPath()
-    if (rawPath == "/items") return path
-
-    val itemId = rawPath.removePrefix("/items/")
-    if (itemId == rawPath || itemId.contains('/') || !itemId.isCanonicalUuid()) {
-        throw invalidLibraryPath()
+    validateLibraryQuery(rawPath, uri.rawQuery)
+    if (rawPath == "/items" || rawPath == "/categories") return path
+    val parts = rawPath.split('/').drop(1)
+    if (
+        parts.size == 2 && (parts[0] == "items" || parts[0] == "categories") &&
+        parts[1].isCanonicalUuid()
+    ) {
+        return path
     }
-    return path
+    if (
+        parts.size == 3 && parts[0] == "items" && parts[1].isCanonicalUuid() &&
+        (
+            parts[2] == "reclassify" ||
+                parts[2] == "cue-dismiss" ||
+                parts[2] == "retry-metadata"
+        )
+    ) return path
+    if (
+        parts.size == 4 && parts[0] == "items" && parts[1].isCanonicalUuid() &&
+        parts[2] == "assets" &&
+        (parts[3] == "reserve" || parts[3].isCanonicalUuid())
+    ) return path
+    if (
+        parts.size == 5 && parts[0] == "items" && parts[1].isCanonicalUuid() &&
+        parts[2] == "assets" && parts[3].isCanonicalUuid() &&
+        (parts[4] == "complete" || parts[4] == "ocr" || parts[4] == "content")
+    ) return path
+    throw invalidLibraryPath()
+}
+
+private fun validateLibraryQuery(rawPath: String, rawQuery: String?) {
+    if (rawQuery == null) return
+    val allowedNames = when {
+        rawPath == "/items" -> ITEM_LIST_QUERY_NAMES
+        rawPath.startsWith("/items/") &&
+            rawPath.removePrefix("/items/").isCanonicalUuid() -> ITEM_DETAIL_QUERY_NAMES
+        else -> throw invalidLibraryPath()
+    }
+    if (rawQuery.isEmpty()) throw invalidLibraryPath()
+    val seenNames = mutableSetOf<String>()
+    rawQuery.split('&').forEach { parameter ->
+        val equalsIndex = parameter.indexOf('=')
+        if (equalsIndex <= 0) throw invalidLibraryPath()
+        val name = parameter.substring(0, equalsIndex)
+        if (name !in allowedNames || !seenNames.add(name)) throw invalidLibraryPath()
+    }
+}
+
+internal fun validateLibraryRouteMethod(path: String, method: HttpMethod) {
+    val rawPath = try {
+        URI(path).rawPath
+    } catch (error: Exception) {
+        throw invalidLibraryPath(error)
+    }
+    val parts = rawPath?.split('/')?.drop(1) ?: throw invalidLibraryPath()
+    val requiredMethod = when {
+        parts.size == 3 && parts[0] == "items" && parts[2] == "retry-metadata" ->
+            HttpMethod.Post
+        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[3] == "reserve" -> HttpMethod.Post
+        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" -> HttpMethod.Delete
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "complete" -> HttpMethod.Post
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "ocr" -> HttpMethod.Patch
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "content" -> HttpMethod.Get
+        else -> return
+    }
+    if (method != requiredMethod) {
+        throw AccountClientException(
+            message = "이 보관함 경로에서 지원하지 않는 요청 방식이에요.",
+            retryable = false,
+            code = "INVALID_METHOD",
+        )
+    }
 }
 
 private fun parseLibraryMethod(method: String): HttpMethod = when (method.trim().uppercase()) {
@@ -965,6 +1187,57 @@ private fun String.isCanonicalUuid(): Boolean = try {
     UUID.fromString(this).toString().equals(this, ignoreCase = true)
 } catch (_: IllegalArgumentException) {
     false
+}
+
+internal data class ValidatedAssetTransport(
+    val expectedOwnerId: String,
+    val itemId: String,
+    val assetId: String,
+)
+
+internal fun validateAssetTransport(
+    expectedOwnerId: String,
+    itemId: String,
+    assetId: String,
+): ValidatedAssetTransport {
+    return ValidatedAssetTransport(
+        expectedOwnerId = validateAssetId(expectedOwnerId, "INVALID_OWNER_ID", "계정 ID"),
+        itemId = validateAssetId(itemId, "INVALID_ITEM_ID", "항목 ID"),
+        assetId = validateAssetId(assetId, "INVALID_ASSET_ID", "이미지 ID"),
+    )
+}
+
+internal fun validateAssetMimeType(mimeType: String): String {
+    if (mimeType !in ALLOWED_ASSET_MIME_TYPES) {
+        throw AccountClientException(
+            message = "JPEG, PNG, WebP 이미지만 업로드할 수 있어요.",
+            retryable = false,
+            code = "INVALID_ASSET_MIME",
+        )
+    }
+    return mimeType
+}
+
+internal fun validateAssetByteCount(byteCount: Int): Int {
+    if (byteCount !in 0..MAX_ASSET_BYTES) {
+        throw AccountClientException(
+            message = ASSET_TOO_LARGE_MESSAGE,
+            retryable = false,
+            code = ASSET_TOO_LARGE,
+        )
+    }
+    return byteCount
+}
+
+private fun validateAssetId(value: String, code: String, label: String): String {
+    if (!value.isCanonicalUuid()) {
+        throw AccountClientException(
+            message = "$label 형식이 올바르지 않아요.",
+            retryable = false,
+            code = code,
+        )
+    }
+    return value.lowercase()
 }
 
 private fun invalidLibraryPath(cause: Throwable? = null) = AccountClientException(
@@ -1008,9 +1281,57 @@ private fun RestException.isDefinitiveRefreshFailure(): Boolean {
 
 private data class RawResponse(
     val status: HttpStatusCode,
-    val body: String,
+    val body: String = "",
     val retryAfterSeconds: Int? = null,
+    val bytes: ByteArray? = null,
+    val contentType: String? = null,
+    val bodyOverflow: Boolean = false,
 )
+
+private data class BoundedBody(
+    val bytes: ByteArray?,
+    val overflow: Boolean,
+)
+
+private suspend fun HttpResponse.readBoundedBody(maxBytes: Int): BoundedBody {
+    val channel = bodyAsChannel()
+    val declaredBytes = headers[HttpHeaders.ContentLength]?.toLongOrNull()
+    if (declaredBytes != null && declaredBytes > maxBytes) {
+        channel.cancel(null)
+        return BoundedBody(bytes = null, overflow = true)
+    }
+
+    val buffer = ByteArray(maxBytes)
+    var size = 0
+    while (size < maxBytes) {
+        val read = channel.readAvailable(buffer, size, maxBytes - size)
+        if (read < 0) {
+            return BoundedBody(buffer.copyOf(size), overflow = false)
+        }
+        if (read == 0) {
+            if (!channel.awaitContent()) {
+                return BoundedBody(buffer.copyOf(size), overflow = false)
+            }
+        } else {
+            size += read
+        }
+    }
+    if (channel.awaitContent()) {
+        channel.cancel(null)
+        return BoundedBody(bytes = null, overflow = true)
+    }
+    return BoundedBody(bytes = buffer, overflow = false)
+}
+
+private suspend fun HttpResponse.toBoundedTextResponse(maxBytes: Int): RawResponse {
+    val boundedBody = readBoundedBody(maxBytes)
+    return RawResponse(
+        status = status,
+        body = boundedBody.bytes?.toString(StandardCharsets.UTF_8).orEmpty(),
+        retryAfterSeconds = parseRetryAfter(headers[HttpHeaders.RetryAfter]),
+        bodyOverflow = boundedBody.overflow,
+    )
+}
 
 internal fun parseRetryAfter(value: String?, nowMillis: Long = System.currentTimeMillis()): Int? {
     val header = value?.trim() ?: return null
@@ -1092,3 +1413,28 @@ private data class ApiErrorResponse(
     val message: String,
     val retryable: Boolean,
 )
+
+@Serializable
+private data class StorageErrorResponse(
+    val statusCode: String? = null,
+    val error: String? = null,
+    val code: String? = null,
+)
+
+internal const val MAX_ASSET_BYTES = 2_000_000
+internal const val ASSET_TOO_LARGE = "ASSET_TOO_LARGE"
+internal const val ASSET_TOO_LARGE_MESSAGE = "이미지는 2MB 이하여야 해요."
+private val ALLOWED_ASSET_MIME_TYPES = setOf("image/jpeg", "image/png", "image/webp")
+private val ITEM_LIST_QUERY_NAMES = setOf(
+    "q",
+    "category_id",
+    "unclassified",
+    "source",
+    "date_from",
+    "date_to",
+    "aliases",
+    "needs_cues",
+    "limit",
+    "offset",
+)
+private val ITEM_DETAIL_QUERY_NAMES = setOf("q")

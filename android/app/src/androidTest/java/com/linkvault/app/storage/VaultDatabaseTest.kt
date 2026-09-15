@@ -7,8 +7,12 @@ import androidx.test.core.app.ApplicationProvider
 import java.util.UUID
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -78,6 +82,20 @@ class VaultDatabaseTest {
             cache.readDetail("owner-a", "item-1")?.responseJson,
         )
         assertNull(cache.readDetail("owner-b", "item-1"))
+    }
+
+    @Test
+    fun categoryCacheIsIsolatedByOwnerAndReplacesOnlyTheOwnedEnvelope() = runBlocking {
+        val cache = database.cachedCategoriesDao()
+        cache.upsert(CachedCategories("owner-a", "{\"count\":1}", 1_000L))
+        cache.upsert(CachedCategories("owner-b", "{\"count\":2}", 2_000L))
+        cache.upsert(CachedCategories("owner-a", "{\"count\":3}", 3_000L))
+
+        assertEquals("{\"count\":3}", cache.read("owner-a")?.responseJson)
+        assertEquals(3_000L, cache.read("owner-a")?.fetchedAt)
+        assertEquals("{\"count\":2}", cache.read("owner-b")?.responseJson)
+        assertEquals(setOf("owner-a", "owner-b"), cache.ownerIds().toSet())
+        assertNull(cache.read("owner-c"))
     }
 
     @Test
@@ -230,6 +248,221 @@ class VaultDatabaseTest {
             database.outboxDao().insertImmutable(original.copy(path = "/items/item-1"))
         }
         assertEquals(original, database.outboxDao().findByRequestId(requestId))
+    }
+
+    @Test
+    fun outboxRouteAllowlistRequiresExactMethodAndCanonicalResourceUuid() {
+        val itemId = "10000000-0000-4000-8000-000000000001"
+        val categoryId = "20000000-0000-4000-8000-000000000002"
+        listOf(
+            "POST" to "/items",
+            "PATCH" to "/items/$itemId",
+            "POST" to "/categories",
+            "PATCH" to "/categories/$categoryId",
+            "DELETE" to "/categories/$categoryId",
+            "POST" to "/items/$itemId/cue-dismiss",
+            "POST" to "/items/$itemId/reclassify",
+        ).forEach { (method, path) ->
+            requireValidOutboxRoute(method, path)
+        }
+
+        listOf(
+            "DELETE" to "/items/$itemId",
+            "POST" to "/items/$itemId",
+            "DELETE" to "/categories",
+            "POST" to "/categories/$categoryId",
+            "PATCH" to "/items/not-a-uuid",
+            "PATCH" to "/items/$itemId/extra",
+            "POST" to "/items/$itemId/reclassify/extra",
+            "POST" to "/items/$itemId?unexpected=true",
+            "GET" to "/items",
+        ).forEach { (method, path) ->
+            assertRejected { requireValidOutboxRoute(method, path) }
+        }
+    }
+
+    @Test
+    fun outboxResponsesCacheOnlyRealItemDetailsAndInvalidateCategoryCounts() {
+        val itemId = "10000000-0000-4000-8000-000000000001"
+        val categoryId = "20000000-0000-4000-8000-000000000002"
+        val jobId = "30000000-0000-4000-8000-000000000003"
+        val item = jsonObject(
+            """
+            {
+              "id":"$itemId",
+              "version":2,
+              "created_at":"2026-09-13T01:02:03Z",
+              "display_title":"Saved"
+            }
+            """,
+        )
+
+        val created = mapOutboxResponse(
+            responseEntry("POST", "/items", "{\"url\":\"https://example.com\"}"),
+            jsonObject("""{"duplicate":false,"item":$item}"""),
+            fetchedAt = 10_000L,
+        )
+        assertEquals(listOf(false, true), created.cachedItems.map(CachedItem::isDetail))
+        assertEquals(listOf(itemId, itemId), created.cachedItems.map(CachedItem::itemId))
+        assertFalse(created.invalidatesCategories)
+
+        val categoryEdit = mapOutboxResponse(
+            responseEntry("PATCH", "/items/$itemId", """{"category_ids":["$categoryId"]}"""),
+            item,
+            fetchedAt = 11_000L,
+        )
+        assertEquals(2, categoryEdit.cachedItems.size)
+        assertTrue(categoryEdit.invalidatesCategories)
+
+        val titleEdit = mapOutboxResponse(
+            responseEntry("PATCH", "/items/$itemId", """{"title":"Renamed"}"""),
+            item,
+            fetchedAt = 12_000L,
+        )
+        assertEquals(2, titleEdit.cachedItems.size)
+        assertFalse(titleEdit.invalidatesCategories)
+
+        val dismissed = mapOutboxResponse(
+            responseEntry("POST", "/items/$itemId/cue-dismiss", "{}"),
+            item,
+            fetchedAt = 13_000L,
+        )
+        assertEquals(2, dismissed.cachedItems.size)
+        assertFalse(dismissed.invalidatesCategories)
+
+        val createdCategory = mapOutboxResponse(
+            responseEntry("POST", "/categories", """{"name":"Travel"}"""),
+            jsonObject("""{"id":"$categoryId","name":"Travel"}"""),
+            fetchedAt = 14_000L,
+        )
+        assertTrue(createdCategory.cachedItems.isEmpty())
+        assertTrue(createdCategory.invalidatesCategories)
+
+        val editedCategory = mapOutboxResponse(
+            responseEntry("PATCH", "/categories/$categoryId", """{"name":"Trips"}"""),
+            jsonObject("""{"id":"$categoryId","name":"Trips"}"""),
+            fetchedAt = 15_000L,
+        )
+        assertTrue(editedCategory.cachedItems.isEmpty())
+        assertTrue(editedCategory.invalidatesCategories)
+
+        val deletedCategory = mapOutboxResponse(
+            responseEntry("DELETE", "/categories/$categoryId", "{}"),
+            jsonObject("{}"),
+            fetchedAt = 16_000L,
+        )
+        assertTrue(deletedCategory.cachedItems.isEmpty())
+        assertTrue(deletedCategory.invalidatesCategories)
+
+        val reclassified = mapOutboxResponse(
+            responseEntry("POST", "/items/$itemId/reclassify", """{"expected_version":2}"""),
+            jsonObject("""{"job_id":"$jobId","item_id":"$itemId"}"""),
+            fetchedAt = 17_000L,
+        )
+        assertTrue(reclassified.cachedItems.isEmpty())
+        assertTrue(reclassified.invalidatesCategories)
+    }
+
+    @Test
+    fun outboxResponseValidationRejectsWrongShapesAndMismatchedIds() {
+        val itemId = "10000000-0000-4000-8000-000000000001"
+        val otherItemId = "10000000-0000-4000-8000-000000000009"
+        val categoryId = "20000000-0000-4000-8000-000000000002"
+        val item = jsonObject(
+            """{"id":"$otherItemId","version":1,"created_at":"2026-09-13T01:02:03Z"}""",
+        )
+
+        assertRejected {
+            mapOutboxResponse(
+                responseEntry("POST", "/items", "{}"),
+                jsonObject("""{"item":$item}"""),
+                1L,
+            )
+        }
+        assertRejected {
+            mapOutboxResponse(
+                responseEntry("PATCH", "/items/$itemId", "{}"),
+                item,
+                1L,
+            )
+        }
+        assertRejected {
+            mapOutboxResponse(
+                responseEntry("PATCH", "/categories/$categoryId", "{}"),
+                jsonObject("""{"id":"20000000-0000-4000-8000-000000000009"}"""),
+                1L,
+            )
+        }
+        assertRejected {
+            mapOutboxResponse(
+                responseEntry("DELETE", "/categories/$categoryId", "{}"),
+                jsonObject("""{"deleted":true}"""),
+                1L,
+            )
+        }
+        assertRejected {
+            mapOutboxResponse(
+                responseEntry("POST", "/items/$itemId/reclassify", "{}"),
+                jsonObject(
+                    """
+                    {
+                      "job_id":"30000000-0000-4000-8000-000000000003",
+                      "item_id":"$otherItemId"
+                    }
+                    """,
+                ),
+                1L,
+            )
+        }
+    }
+
+    @Test
+    fun categoryEnvelopeValidationChecksCountsKindsAndCategoryRows() {
+        validateCategoriesResponse(
+            jsonObject(
+                """
+                {
+                  "categories":[
+                    {
+                      "id":"20000000-0000-4000-8000-000000000001",
+                      "name":"Travel",
+                      "kind":"system",
+                      "system_code":"travel",
+                      "item_count":2
+                    },
+                    {
+                      "id":"20000000-0000-4000-8000-000000000002",
+                      "name":"Ideas",
+                      "kind":"custom",
+                      "system_code":null,
+                      "item_count":0
+                    }
+                  ],
+                  "count":2,
+                  "unclassified_count":1
+                }
+                """,
+            ),
+        )
+
+        assertRejected {
+            validateCategoriesResponse(
+                jsonObject(
+                    """
+                    {
+                      "categories":[{
+                        "id":"20000000-0000-4000-8000-000000000001",
+                        "name":"Travel",
+                        "kind":"unknown",
+                        "item_count":-1
+                      }],
+                      "count":2,
+                      "unclassified_count":0
+                    }
+                    """,
+                ),
+            )
+        }
     }
 
     @Test
@@ -401,6 +634,8 @@ class VaultDatabaseTest {
         database.outboxDao().insertImmutable(ownerBRequest)
         database.cachedItemDao().upsert(cachedItem("owner-a", "item-a", false, "{\"id\":\"item-a\"}"))
         database.cachedItemDao().upsert(cachedItem("owner-b", "item-b", false, "{\"id\":\"item-b\"}"))
+        database.cachedCategoriesDao().upsert(CachedCategories("owner-a", "{\"count\":1}", 1L))
+        database.cachedCategoriesDao().upsert(CachedCategories("owner-b", "{\"count\":2}", 2L))
         database.pendingInputDao().saveDraft(PendingInput("draft", "private", null, 1L, 100L))
 
         database.clearOwner("owner-a")
@@ -409,6 +644,8 @@ class VaultDatabaseTest {
         assertNotNull(database.outboxDao().findByRequestId(ownerBRequest.requestId))
         assertTrue(database.cachedItemDao().observeList("owner-a").first().isEmpty())
         assertEquals("item-b", database.cachedItemDao().observeList("owner-b").first().single().itemId)
+        assertNull(database.cachedCategoriesDao().read("owner-a"))
+        assertEquals("{\"count\":2}", database.cachedCategoriesDao().read("owner-b")?.responseJson)
         assertNull(database.pendingInputDao().read("draft"))
     }
 
@@ -423,6 +660,8 @@ class VaultDatabaseTest {
         database.outboxDao().insertImmutable(saved)
         database.cachedItemDao().upsert(cachedItem("owner-a", "item-a", false, "{\"id\":\"item-a\"}"))
         database.cachedItemDao().upsert(cachedItem("owner-b", "item-b", false, "{\"id\":\"item-b\"}"))
+        database.cachedCategoriesDao().upsert(CachedCategories("owner-a", "{\"count\":1}", 1L))
+        database.cachedCategoriesDao().upsert(CachedCategories("owner-b", "{\"count\":2}", 2L))
         database.pendingInputDao().saveDraft(PendingInput("draft", "private", null, 1L, 100L))
 
         assertEquals(1, database.outboxDao().retainedCount())
@@ -434,6 +673,8 @@ class VaultDatabaseTest {
         assertNull(database.outboxDao().findByRequestId(saved.requestId))
         assertTrue(database.cachedItemDao().observeList("owner-a").first().isEmpty())
         assertTrue(database.cachedItemDao().observeList("owner-b").first().isEmpty())
+        assertNull(database.cachedCategoriesDao().read("owner-a"))
+        assertNull(database.cachedCategoriesDao().read("owner-b"))
         assertNull(database.pendingInputDao().read("draft"))
         assertEquals(0, database.outboxDao().retainedCount())
     }
@@ -519,6 +760,25 @@ class VaultDatabaseTest {
         fetchedAt = fetchedAt,
         isDetail = isDetail,
     )
+
+    private fun responseEntry(method: String, path: String, payload: String): OutboxEntry =
+        outboxEntry(UUID.randomUUID().toString(), "owner-a", payload).copy(
+            method = method,
+            path = path,
+        )
+
+    private fun jsonObject(raw: String): JsonObject =
+        Json.parseToJsonElement(raw).jsonObject
+
+    private fun assertRejected(block: () -> Unit) {
+        var thrown: Throwable? = null
+        try {
+            block()
+        } catch (error: Throwable) {
+            thrown = error
+        }
+        assertNotNull(thrown)
+    }
 
     private suspend fun assertRequestConflict(block: suspend () -> Unit) {
         var thrown: Throwable? = null

@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <application android:networkSecurityConfig="@xml/debug_network_security" />
+    <application android:networkSecurityConfig="@xml/debug_network_security">
+        <provider
+            android:name="com.linkvault.app.test.FixtureImageProvider"
+            android:authorities="com.linkvault.app.test.fixture-images"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+    </application>
 </manifest>

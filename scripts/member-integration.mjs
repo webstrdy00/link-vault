@@ -1,87 +1,16 @@
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { localBackendFixture } from "./local-backend-fixture.mjs";
 
-// Credentials stay in this process. Never emit the local status response or tokens.
-const config = JSON.parse(execSync("npx --no-install supabase status -o json", {
-  encoding: "utf8",
-  stdio: ["ignore", "pipe", "pipe"],
-}));
-const base = config.API_URL;
-assert.equal(
-  new URL(base).hostname,
-  "127.0.0.1",
-  "This test only mutates local Supabase",
-);
-assert.equal(new URL(base).port, "54321");
-const serviceKey = config.SERVICE_ROLE_KEY;
-const anonKey = config.ANON_KEY;
-const createdUsers = [];
+const { request, user, approve, bootstrap, cleanup, settleClassification, serviceKey } =
+  localBackendFixture();
 let checks = 0;
 
-async function request(
-  path,
-  { token = anonKey, method = "GET", body, headers = {} } = {},
-) {
-  const response = await fetch(`${base}${path}`, {
-    method,
-    headers: {
-      apikey: anonKey,
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...headers,
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-  const text = await response.text();
-  return { status: response.status, body: text ? JSON.parse(text) : null };
-}
 function check(condition, label) {
   assert.ok(condition, label);
   checks++;
   console.log(`PASS ${label}`);
 }
-async function user() {
-  const email = `member-${randomUUID()}@example.test`;
-  const password = `Local-fixture-${randomUUID()}!`;
-  const created = await request("/auth/v1/admin/users", {
-    token: serviceKey,
-    method: "POST",
-    body: { email, password, email_confirm: true },
-  });
-  assert.equal(created.status, 200, "create local fixture user");
-  createdUsers.push(created.body.id);
-  // Real local GoTrue sessions, not forged JWTs. Password is a test fixture only;
-  // the Android product exposes Google login exclusively.
-  const session = await request("/auth/v1/token?grant_type=password", {
-    method: "POST",
-    body: { email, password },
-  });
-  assert.equal(session.status, 200, "issue real local test session");
-  return { id: created.body.id, token: session.body.access_token };
-}
-async function approve(account) {
-  const result = await request("/rest/v1/beta_members", {
-    token: serviceKey,
-    method: "POST",
-    body: {
-      owner_id: account.id,
-      enabled: true,
-      approved_at: new Date().toISOString(),
-    },
-  });
-  assert.equal(result.status, 201, "approve local fixture member");
-}
-function bootstrap(account, id = randomUUID()) {
-  return request("/functions/v1/library-api/v1/bootstrap", {
-    token: account.token,
-    method: "POST",
-    body: {},
-    headers: { "X-Request-Id": id },
-  });
-}
-
 try {
   const health = await request("/functions/v1/library-api/v1/health");
   check(
@@ -170,10 +99,7 @@ try {
       mismatched.body.error.code === "IDEMPOTENCY_MISMATCH",
     "changed request body cannot reuse request ID",
   );
-  const detail = await request(
-    `/functions/v1/library-api/v1/items/${saved.body.item.id}`,
-    { token: a.token },
-  );
+  const detail = await settleClassification(a, saved.body.item.id);
   check(
     detail.status === 200 && detail.body.note === itemBody.note,
     "duplicate save does not overwrite original note",
@@ -200,7 +126,8 @@ try {
   const replayedEdit = await patchItem(a, editBody, editId);
   check(
     replayedEdit.status === 200 &&
-      replayedEdit.body.version === edited.body.version,
+      replayedEdit.body.version >= edited.body.version &&
+      replayedEdit.body.note === editBody.note,
     "successful PATCH replay wins before stale version checking",
   );
   const changedEdit = await patchItem(a, {
@@ -228,13 +155,16 @@ try {
       rewrittenConflict.body.error.code === "IDEMPOTENCY_MISMATCH",
     "a conflicted request cannot change its body while reusing the same ID",
   );
+  // Classification legitimately advances item.version. Bind this deliberate
+  // edit race to the current snapshot, not a pre-classification version.
+  const currentEdit = await settleClassification(a, saved.body.item.id);
   const concurrentEdits = await Promise.all([
     patchItem(a, {
-      expected_version: edited.body.version,
+      expected_version: currentEdit.body.version,
       note: "경쟁 메모 하나",
     }),
     patchItem(a, {
-      expected_version: edited.body.version,
+      expected_version: currentEdit.body.version,
       note: "경쟁 메모 둘",
     }),
   ]);
@@ -243,7 +173,7 @@ try {
       concurrentEdits.filter((result) => result.status === 409).length === 1,
     "two edits of the same version commit only one winner",
   );
-  const winner = concurrentEdits.find((result) => result.status === 200);
+  const winner = await settleClassification(a, saved.body.item.id);
   const cleared = await patchItem(a, {
     expected_version: winner.body.version,
     note: null,
@@ -461,13 +391,7 @@ try {
     "concurrent seventh approval cannot exceed six enabled members",
   );
 } finally {
-  for (const id of createdUsers) {
-    const result = await request(`/auth/v1/admin/users/${id}`, {
-      token: serviceKey,
-      method: "DELETE",
-    });
-    assert.equal(result.status, 200, "remove only this run fixture account");
-  }
+  await cleanup();
 }
 console.log(
   `${checks} real local Auth/API/RLS checks passed; Google provider not exercised.`,

@@ -13,6 +13,8 @@ googleid = "1.1.1"
 lifecycle = "2.8.7"
 room = "2.7.2"
 work = "2.9.1"
+mlkitText = "16.0.1"
+exif = "1.4.2"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
@@ -34,7 +36,11 @@ androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
 androidx-room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
+androidx-room-testing = { module = "androidx.room:room-testing", version.ref = "room" }
 androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
+mlkit-text = { module = "com.google.mlkit:text-recognition", version.ref = "mlkitText" }
+mlkit-text-korean = { module = "com.google.mlkit:text-recognition-korean", version.ref = "mlkitText" }
+androidx-exifinterface = { module = "androidx.exifinterface:exifinterface", version.ref = "exif" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

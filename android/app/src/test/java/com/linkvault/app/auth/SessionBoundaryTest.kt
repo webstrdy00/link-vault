@@ -13,6 +13,77 @@ import org.junit.Test
 
 class SessionBoundaryTest {
     @Test
+    fun `session state publishes restore readiness without advancing identity`() = runBlocking {
+        val boundary = SessionBoundary()
+
+        assertEquals(AccountSessionState(), boundary.sessionState.value)
+
+        val origin = boundary.locked { beginRestore(OWNER_A) }
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                recoverable = true,
+            ),
+            boundary.sessionState.value,
+        )
+
+        boundary.locked { markInitialized() }
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                recoverable = true,
+                initialized = true,
+            ),
+            boundary.sessionState.value,
+        )
+
+        boundary.locked { confirmAuthenticated(origin, OWNER_A) }
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                initialized = true,
+            ),
+            boundary.sessionState.value,
+        )
+
+        val repeatedOrigin = boundary.locked { beginRestore(OWNER_A) }
+        assertEquals(origin, repeatedOrigin)
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                recoverable = true,
+                initialized = true,
+            ),
+            boundary.sessionState.value,
+        )
+    }
+
+    @Test
+    fun `ready signed out state preserves generation until an identity commit`() = runBlocking {
+        val boundary = SessionBoundary()
+
+        boundary.locked { markInitialized() }
+        assertEquals(
+            AccountSessionState(initialized = true),
+            boundary.sessionState.value,
+        )
+
+        val origin = boundary.locked { commitLogin(OWNER_A) }
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                initialized = true,
+            ),
+            boundary.sessionState.value,
+        )
+    }
+
+    @Test
     fun `delayed response from A is rejected after logout and login B`() = runBlocking {
         val boundary = SessionBoundary()
         val originA = boundary.locked { commitLogin(OWNER_A) }
@@ -36,6 +107,13 @@ class SessionBoundaryTest {
 
         assertTrue(delayedResponse.await() is SessionBoundaryChangedException)
         assertEquals(OWNER_B, boundary.ownerId())
+        assertEquals(
+            AccountSessionState(
+                generation = originA.generation + 2,
+                ownerId = OWNER_B,
+            ),
+            boundary.sessionState.value,
+        )
     }
 
     @Test
@@ -99,6 +177,14 @@ class SessionBoundaryTest {
         assertEquals(OWNER_A, boundary.ownerId())
         assertTrue(boundary.isRecoverable())
         assertEquals(origin, boundary.currentOrigin())
+        assertEquals(
+            AccountSessionState(
+                generation = origin.generation,
+                ownerId = OWNER_A,
+                recoverable = true,
+            ),
+            boundary.sessionState.value,
+        )
     }
 
     @Test
@@ -118,10 +204,25 @@ class SessionBoundaryTest {
         assertTrue(staleClear is SessionBoundaryChangedException)
         assertEquals(secondOrigin, boundary.currentOrigin())
         assertEquals(OWNER_A, boundary.ownerId())
+        assertEquals(
+            AccountSessionState(
+                generation = secondOrigin.generation,
+                ownerId = OWNER_A,
+            ),
+            boundary.sessionState.value,
+        )
 
+        boundary.locked { markInitialized() }
         boundary.locked { clear(secondOrigin) }
         assertFalse(boundary.hasSession())
         assertNull(boundary.ownerId())
+        assertEquals(
+            AccountSessionState(
+                generation = secondOrigin.generation + 1,
+                initialized = true,
+            ),
+            boundary.sessionState.value,
+        )
     }
 
     private companion object {

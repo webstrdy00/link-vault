@@ -138,10 +138,20 @@ abstract class AttachmentDao {
         SELECT * FROM pending_attachments
         WHERE owner_id = :ownerId
           AND (:itemId IS NULL OR item_id = :itemId)
+          AND (stage != 'expired' OR COALESCE(error_code, '') != 'ITEM_DELETED')
         ORDER BY created_at ASC, operation_id ASC
         """,
     )
     abstract fun observe(ownerId: String, itemId: String?): Flow<List<PendingAttachment>>
+
+    @Query(
+        """
+        SELECT * FROM pending_attachments
+        WHERE owner_id = :ownerId AND item_id = :itemId
+        ORDER BY created_at ASC, operation_id ASC
+        """,
+    )
+    abstract suspend fun findItem(ownerId: String, itemId: String): List<PendingAttachment>
 
     @Query(
         """
@@ -422,7 +432,11 @@ abstract class AttachmentDao {
     @Query(
         """
         SELECT * FROM pending_attachments
-        WHERE (stage = 'saved' OR (stage = 'expired' AND expires_at <= :now))
+        WHERE (
+            stage = 'saved'
+            OR (stage = 'expired' AND error_code = 'ITEM_DELETED')
+            OR (stage = 'expired' AND expires_at <= :now)
+        )
           AND (:ownerId IS NULL OR owner_id = :ownerId)
         """,
     )
@@ -539,6 +553,14 @@ abstract class AttachmentDao {
         operationId: String,
         sessionGeneration: Long,
     ): Int
+
+    @Query(
+        """
+        DELETE FROM pending_attachments
+        WHERE owner_id = :ownerId AND item_id = :itemId
+        """,
+    )
+    abstract suspend fun deleteItem(ownerId: String, itemId: String): Int
 
     @Query("DELETE FROM pending_attachments WHERE owner_id = :ownerId")
     abstract suspend fun deleteOwner(ownerId: String): Int

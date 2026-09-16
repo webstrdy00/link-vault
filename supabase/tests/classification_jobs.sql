@@ -255,18 +255,18 @@ begin
   values (
     p_item_id,
     p_owner_id,
-    item_url,
-    item_url,
-    pg_catalog.encode(
+    case when not p_deleted then item_url end,
+    case when not p_deleted then item_url end,
+    case when not p_deleted then pg_catalog.encode(
       extensions.digest(pg_catalog.convert_to(item_url, 'UTF8'), 'sha256'),
       'hex'
-    ),
-    'other',
-    'example.com',
-    '엑셀 자료',
+    ) end,
+    case when not p_deleted then 'other' end,
+    case when not p_deleted then 'example.com' end,
+    case when not p_deleted then '엑셀 자료' end,
     p_revision,
     p_version,
-    'ready',
+    case when not p_deleted then 'ready' end,
     case when p_deleted then pg_catalog.clock_timestamp() else null end
   );
 
@@ -852,7 +852,11 @@ select pg_temp.seed_classification_item(
 insert into classification_receipts (label, payload)
 values ('delete-lease', public.library_claim_classification_jobs(1));
 update public.items
-set deleted_at = pg_catalog.clock_timestamp()
+set deleted_at = pg_catalog.clock_timestamp(),
+    original_url = null, normalized_url = null, url_hash = null,
+    source = null, display_fallback = null, metadata_state = null,
+    user_title = null, fetched_title = null, shared_text = null,
+    description = null, body_text = null, note = null, extraction_meta = '{}'::jsonb
 where id = '52000000-0000-0000-0000-000000000005';
 
 select is(

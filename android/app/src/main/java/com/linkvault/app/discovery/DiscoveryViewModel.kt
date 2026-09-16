@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
@@ -122,12 +123,31 @@ class DiscoveryViewModel internal constructor(
         val parent = viewModelScope.coroutineContext[Job]
         screenScope = CoroutineScope(viewModelScope.coroutineContext + SupervisorJob(parent))
         val requestOwner = requireNotNull(ownerId)
+        val visibilityToken = currentRequestToken(requestOwner)
+        screenScope?.launch {
+            try {
+                outbox.observeDeletedItemIds(requestOwner).collect { deletedIds ->
+                    if (!responseBelongsTo(visibilityToken)) return@collect
+                    mutableUiState.value = mutableUiState.value.withoutDeletedItems(deletedIds.toSet())
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                if (responseBelongsTo(visibilityToken)) {
+                    mutableUiState.value = mutableUiState.value.copy(
+                        items = emptyList(),
+                        aliasDisclosure = DiscoveryAliasDisclosure.None,
+                        searchError = "삭제 상태를 확인하지 못했어요. 다시 시도해 주세요.",
+                    )
+                }
+            }
+        }
         observeCategoryOutbox(requestOwner)
         refreshCategories()
         if (mutableUiState.value.appliedQuery == null) {
             applyFilterIntent(mutableUiState.value.filters)
         } else {
-            restartAppliedSearch(clearExisting = false)
+            restartAppliedSearch(clearExisting = true)
         }
     }
 
@@ -593,6 +613,13 @@ class DiscoveryViewModel internal constructor(
                     path = "/items/$itemId?q=${encodeDiscoveryQueryComponent(query)}",
                 )
                 val detail = parseDiscoveryAliasDetail(response)
+                val deletedIds = outbox.observeDeletedItemIds(requestOwner).first().toSet()
+                if (itemId in deletedIds) {
+                    if (responseBelongsTo(requestToken)) {
+                        mutableUiState.value = mutableUiState.value.withoutDeletedItems(deletedIds)
+                    }
+                    return@launch
+                }
                 if (
                     detail.itemId != itemId || !responseBelongsTo(requestToken) ||
                     !isCurrentDiscoveryResponse(
@@ -762,6 +789,7 @@ class DiscoveryViewModel internal constructor(
                     path = snapshot.itemsPath(limit = DISCOVERY_PAGE_SIZE, offset = offset),
                 )
                 val page = parseDiscoveryItemsResponse(response)
+                val deletedIds = outbox.observeDeletedItemIds(requestOwner).first().toSet()
                 val current = mutableUiState.value
                 if (
                     !responseBelongsTo(requestToken) ||
@@ -783,7 +811,7 @@ class DiscoveryViewModel internal constructor(
                     isSearchLoading = false,
                     searchError = null,
                     failedOffset = null,
-                )
+                ).withoutDeletedItems(deletedIds)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: AccountAuthenticationRequiredException) {
@@ -1251,6 +1279,23 @@ sealed interface DiscoveryAliasDisclosure {
     data class Loading(val itemId: String) : DiscoveryAliasDisclosure
     data class Loaded(val detail: DiscoveryAliasDetail) : DiscoveryAliasDisclosure
     data class Failed(val itemId: String, val message: String) : DiscoveryAliasDisclosure
+}
+
+internal fun DiscoveryUiState.withoutDeletedItems(deletedItemIds: Set<String>): DiscoveryUiState {
+    val disclosedItemId = when (val disclosure = aliasDisclosure) {
+        DiscoveryAliasDisclosure.None -> null
+        is DiscoveryAliasDisclosure.Loading -> disclosure.itemId
+        is DiscoveryAliasDisclosure.Loaded -> disclosure.detail.itemId
+        is DiscoveryAliasDisclosure.Failed -> disclosure.itemId
+    }
+    return copy(
+        items = items.filterNot { it.id in deletedItemIds },
+        aliasDisclosure = if (disclosedItemId != null && disclosedItemId in deletedItemIds) {
+            DiscoveryAliasDisclosure.None
+        } else {
+            aliasDisclosure
+        },
+    )
 }
 
 data class DiscoveryCategoryReconfirmation(

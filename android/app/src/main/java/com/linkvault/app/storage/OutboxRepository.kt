@@ -31,6 +31,7 @@ class OutboxRepository(
     private val cache = database.cachedItemDao()
     private val categoryCache = database.cachedCategoriesDao()
     private val drafts = database.pendingInputDao()
+    private val deletedItems = database.deletedItems()
 
     suspend fun enqueue(
         ownerId: String,
@@ -43,7 +44,13 @@ class OutboxRepository(
         val normalizedRequestId = requestId.requireCanonicalUuid()
         val normalizedMethod = method.trim().uppercase()
         requireValidOutboxRoute(normalizedMethod, path)
-        json.decodeFromString<JsonObject>(payloadJson)
+        val route = checkNotNull(parseOutboxRoute(normalizedMethod, path))
+        val payload = json.decodeFromString<JsonObject>(payloadJson)
+        val deleteExpectedVersion = if (route is OutboxRoute.DeleteItem) {
+            requireItemDeleteExpectedVersion(payload)
+        } else {
+            null
+        }
 
         val now = System.currentTimeMillis()
         val entry = OutboxEntry(
@@ -59,13 +66,27 @@ class OutboxRepository(
             nextAttemptAt = now,
         )
         client.withSessionOwner(normalizedOwnerId) {
-            outbox.insertImmutable(entry)
+            database.withTransaction {
+                if (route is OutboxRoute.DeleteItem) {
+                    val knownItem = cache.readDetail(normalizedOwnerId, route.itemId)
+                    require(
+                        knownItem != null &&
+                            knownItem.serverVersion == deleteExpectedVersion,
+                    ) {
+                        "Item deletion requires a matching owner-bound cached detail."
+                    }
+                }
+                outbox.insertImmutable(entry)
+            }
         }
         UploadWorker.enqueue(applicationContext, normalizedOwnerId)
     }
 
     fun observeOutbox(ownerId: String): Flow<List<OutboxEntry>> =
         outbox.observe(ownerId.requireOwnerId())
+
+    fun observeDeletedItemIds(ownerId: String): Flow<List<String>> =
+        deletedItems.observeItemIds(ownerId.requireOwnerId())
 
     suspend fun acknowledge(ownerId: String, requestId: String) {
         val normalizedOwnerId = ownerId.requireOwnerId()
@@ -159,6 +180,24 @@ class OutboxRepository(
 
     suspend fun readCachedDetail(ownerId: String, itemId: String): CachedItem? =
         cache.readDetail(ownerId.requireOwnerId(), itemId)
+
+    suspend fun isItemDeleted(ownerId: String, itemId: String): Boolean {
+        val normalizedOwnerId = ownerId.requireOwnerId()
+        val normalizedItemId = itemId.requireCanonicalItemId()
+        return client.withSessionOwner(normalizedOwnerId) {
+            deletedItems.isDeleted(normalizedOwnerId, normalizedItemId)
+        }
+    }
+
+    suspend fun retainActiveItemIds(ownerId: String, itemIds: Collection<String>): Set<String> {
+        val normalizedOwnerId = ownerId.requireOwnerId()
+        val normalizedItemIds = itemIds.map(String::requireCanonicalItemId).distinct()
+        return client.withSessionOwner(normalizedOwnerId) {
+            normalizedItemIds.filterTo(linkedSetOf()) { itemId ->
+                !deletedItems.isDeleted(normalizedOwnerId, itemId)
+            }
+        }
+    }
 
     suspend fun cacheCategories(ownerId: String, response: JsonObject) {
         val normalizedOwnerId = ownerId.requireOwnerId()
@@ -278,7 +317,19 @@ class OutboxRepository(
                         resultJson = response.toString(),
                     )
                     if (completed == 1) {
-                        responseEffect.invalidatesItemIds.forEach { cache.deleteItem(entry.ownerId, it) }
+                        responseEffect.deletedItemId?.let { itemId ->
+                            deletedItems.markDeleted(entry.ownerId, itemId, System.currentTimeMillis())
+                            cache.deleteItem(entry.ownerId, itemId)
+                            outbox.deleteItemRequests(
+                                ownerId = entry.ownerId,
+                                exactItemPath = "/items/$itemId",
+                                nestedItemPathPattern = "/items/$itemId/%",
+                                preservedRequestId = entry.requestId,
+                            )
+                        }
+                        responseEffect.invalidatesItemIds
+                            .filterNot { it == responseEffect.deletedItemId }
+                            .forEach { cache.deleteItem(entry.ownerId, it) }
                         responseEffect.cachedItems.forEach { cache.upsert(it) }
                         if (responseEffect.invalidatesCategories) {
                             categoryCache.deleteOwner(entry.ownerId)
@@ -309,6 +360,23 @@ class OutboxRepository(
         leaseUntil: Long,
         error: AccountClientException,
     ): UploadOutcome {
+        if (error.code == "ITEM_DELETED") {
+            when (val route = parseOutboxRoute(entry.method, entry.path)) {
+                OutboxRoute.CreateItem -> return discardDeletedCreate(entry, leaseUntil)
+                is OutboxRoute.PatchItem -> return reconcileDeletedItem(
+                    entry = entry,
+                    leaseUntil = leaseUntil,
+                    itemId = route.itemId,
+                )
+                else -> Unit
+            }
+        }
+        if (error.code == "ITEM_NOT_FOUND") {
+            val route = parseOutboxRoute(entry.method, entry.path)
+            if (route is OutboxRoute.DeleteItem) {
+                return completeKnownMissingItem(entry, leaseUntil, route.itemId)
+            }
+        }
         val isPermanentCategoryFailure = error.code in PERMANENT_CATEGORY_ERROR_CODES
         return completeFailure(
             entry = entry,
@@ -322,6 +390,123 @@ class OutboxRepository(
                 error.retryAfterSeconds
             },
         )
+    }
+
+    private suspend fun discardDeletedCreate(
+        entry: OutboxEntry,
+        leaseUntil: Long,
+    ): UploadOutcome = try {
+        val discarded = client.withSessionOwner(entry.ownerId) {
+            outbox.discardClaimed(entry.ownerId, entry.requestId, leaseUntil)
+        }
+        if (discarded == 1) UploadOutcome.Continue else UploadOutcome.Pause
+    } catch (_: AccountClientException) {
+        outbox.completeFailure(
+            entry.ownerId,
+            entry.requestId,
+            leaseUntil,
+            OutboxState.WAITING_LOGIN,
+            System.currentTimeMillis(),
+            "SESSION_CHANGED",
+            "The signed-in account changed before the result could be stored.",
+        )
+        UploadOutcome.Pause
+    }
+
+    private suspend fun completeKnownMissingItem(
+        entry: OutboxEntry,
+        leaseUntil: Long,
+        itemId: String,
+    ): UploadOutcome = try {
+        val result = knownMissingItemDeleteReceipt(itemId)
+        val completed = client.withSessionOwner(entry.ownerId) {
+            database.withTransaction {
+                val expectedVersion = runCatching {
+                    requireItemDeleteExpectedVersion(
+                        json.decodeFromString<JsonObject>(entry.payloadJson),
+                    )
+                }.getOrNull() ?: return@withTransaction false
+                val knownItem = cache.readDetail(entry.ownerId, itemId)
+                if (knownItem?.serverVersion != expectedVersion) {
+                    return@withTransaction false
+                }
+                val saved = outbox.completeSaved(
+                    ownerId = entry.ownerId,
+                    requestId = entry.requestId,
+                    leaseUntil = leaseUntil,
+                    resultJson = result.toString(),
+                )
+                if (saved != 1) return@withTransaction false
+
+                deletedItems.markDeleted(entry.ownerId, itemId, System.currentTimeMillis())
+                cache.deleteItem(entry.ownerId, itemId)
+                categoryCache.deleteOwner(entry.ownerId)
+                outbox.deleteItemRequests(
+                    ownerId = entry.ownerId,
+                    exactItemPath = "/items/$itemId",
+                    nestedItemPathPattern = "/items/$itemId/%",
+                    preservedRequestId = entry.requestId,
+                )
+                true
+            }
+        }
+        if (completed) UploadOutcome.Continue else {
+            completeFailure(
+                entry = entry,
+                leaseUntil = leaseUntil,
+                retryable = false,
+                errorCode = "ITEM_NOT_FOUND",
+                errorMessage = "The requested item was not found.",
+                retryAfterSeconds = null,
+            )
+        }
+    } catch (_: AccountClientException) {
+        outbox.completeFailure(
+            entry.ownerId,
+            entry.requestId,
+            leaseUntil,
+            OutboxState.WAITING_LOGIN,
+            System.currentTimeMillis(),
+            "SESSION_CHANGED",
+            "The signed-in account changed before the result could be stored.",
+        )
+        UploadOutcome.Pause
+    }
+
+    private suspend fun reconcileDeletedItem(
+        entry: OutboxEntry,
+        leaseUntil: Long,
+        itemId: String,
+    ): UploadOutcome = try {
+        val reconciled = client.withSessionOwner(entry.ownerId) {
+            database.withTransaction {
+                if (!outbox.isClaimed(entry.ownerId, entry.requestId, leaseUntil)) {
+                    return@withTransaction false
+                }
+                deletedItems.markDeleted(entry.ownerId, itemId, System.currentTimeMillis())
+                cache.deleteItem(entry.ownerId, itemId)
+                categoryCache.deleteOwner(entry.ownerId)
+                outbox.deleteItemRequests(
+                    ownerId = entry.ownerId,
+                    exactItemPath = "/items/$itemId",
+                    nestedItemPathPattern = "/items/$itemId/%",
+                    preservedRequestId = null,
+                )
+                true
+            }
+        }
+        if (reconciled) UploadOutcome.Continue else UploadOutcome.Pause
+    } catch (_: AccountClientException) {
+        outbox.completeFailure(
+            entry.ownerId,
+            entry.requestId,
+            leaseUntil,
+            OutboxState.WAITING_LOGIN,
+            System.currentTimeMillis(),
+            "SESSION_CHANGED",
+            "The signed-in account changed before the result could be stored.",
+        )
+        UploadOutcome.Pause
     }
 
     private suspend fun completeFailure(
@@ -467,6 +652,7 @@ internal data class OutboxResponseEffect(
     val cachedItems: List<CachedItem>,
     val invalidatesCategories: Boolean,
     val invalidatesItemIds: List<String> = emptyList(),
+    val deletedItemId: String? = null,
 )
 
 internal fun requireValidOutboxRoute(method: String, path: String) {
@@ -498,6 +684,35 @@ internal fun mapOutboxResponse(
             OutboxResponseEffect(
                 cachedItems = response.cacheAsListAndDetail(entry.ownerId, fetchedAt),
                 invalidatesCategories = entry.payloadContains("category_ids"),
+            )
+        }
+        is OutboxRoute.DeleteItem -> {
+            if (response.keys != setOf("item_id", "state")) {
+                throw InvalidServerResponseException(
+                    "The item deletion response has an invalid envelope.",
+                )
+            }
+            val itemId = response.requireUuid(
+                "item_id",
+                "The item deletion response has an invalid item ID.",
+            )
+            if (!itemId.equals(route.itemId, ignoreCase = true)) {
+                throw InvalidServerResponseException(
+                    "The item deletion response has a different item ID.",
+                )
+            }
+            if (response.requireString("state", "The item deletion response has an invalid state.") !=
+                "deleting"
+            ) {
+                throw InvalidServerResponseException(
+                    "The item deletion response has an invalid state.",
+                )
+            }
+            OutboxResponseEffect(
+                cachedItems = emptyList(),
+                invalidatesCategories = true,
+                invalidatesItemIds = listOf(route.itemId),
+                deletedItemId = route.itemId,
             )
         }
         OutboxRoute.CreateCategory -> {
@@ -640,6 +855,7 @@ private enum class UploadOutcome {
 private sealed interface OutboxRoute {
     data object CreateItem : OutboxRoute
     data class PatchItem(val itemId: String) : OutboxRoute
+    data class DeleteItem(val itemId: String) : OutboxRoute
     data object CreateCategory : OutboxRoute
     data class PatchCategory(val categoryId: String) : OutboxRoute
     data object DeleteCategory : OutboxRoute
@@ -658,6 +874,7 @@ private fun parseOutboxRoute(method: String, path: String): OutboxRoute? {
 
     path.resourceId("/items/")?.let { itemId ->
         if (method == "PATCH") return OutboxRoute.PatchItem(itemId)
+        if (method == "DELETE") return OutboxRoute.DeleteItem(itemId)
     }
     path.resourceId("/categories/")?.let { categoryId ->
         if (method == "PATCH") return OutboxRoute.PatchCategory(categoryId)
@@ -776,8 +993,44 @@ private fun OutboxEntry.payloadContains(field: String): Boolean = try {
     throw InvalidServerResponseException("The stored request body is invalid.")
 }
 
+internal fun requireItemDeleteExpectedVersion(payload: JsonObject): Long {
+    require(payload.keys == setOf("expected_version")) {
+        "Item deletion body must contain only expected_version."
+    }
+    val value = payload["expected_version"] as? JsonPrimitive
+    require(value != null && !value.isString) {
+        "Item deletion expected_version must be a positive integer."
+    }
+    return requireNotNull(value.longOrNull?.takeIf { it > 0L }) {
+        "Item deletion expected_version must be a positive integer."
+    }
+}
+
+internal fun knownMissingItemDeleteReceipt(itemId: String): JsonObject {
+    require(itemId.isCanonicalUuid()) { "Item ID must be a UUID." }
+    return JsonObject(
+        mapOf(
+            "item_id" to JsonPrimitive(itemId),
+            "state" to JsonPrimitive("already_deleted"),
+        ),
+    )
+}
+
 private fun String.requireOwnerId(): String = trim().also {
     require(it.isNotEmpty()) { "Owner ID must not be blank." }
+}
+
+private fun String.requireCanonicalItemId(): String {
+    val value = trim()
+    val parsed = try {
+        UUID.fromString(value)
+    } catch (error: IllegalArgumentException) {
+        throw IllegalArgumentException("Item ID must be a UUID.", error)
+    }
+    require(parsed.toString().equals(value, ignoreCase = true)) {
+        "Item ID must be a UUID."
+    }
+    return parsed.toString()
 }
 
 private fun String.requireCanonicalUuid(): String {

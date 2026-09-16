@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -42,6 +43,10 @@ import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 @Composable
 fun LibraryScreen(
@@ -63,10 +68,11 @@ fun LibraryScreen(
     val viewModelKey = remember(client, ownerId, entryId) {
         "library:${System.identityHashCode(client)}:${ownerId ?: "signed-out"}:$entryId"
     }
-    val factory = remember(client, outbox, ownerId, initialUrl, sharedText, initialItemId) {
+    val factory = remember(client, outbox, attachments, ownerId, initialUrl, sharedText, initialItemId) {
         LibraryViewModel.factory(
             client = client,
             outbox = outbox,
+            attachments = attachments,
             ownerId = ownerId,
             initialUrl = initialUrl,
             sharedText = sharedText,
@@ -152,6 +158,20 @@ fun LibraryScreen(
             }
         }
 
+        state.deletionNotice?.let { message ->
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                shape = MaterialTheme.shapes.medium,
+            ) {
+                Text(
+                    text = message,
+                    modifier = Modifier.padding(16.dp),
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
+
         when (val availability = state.availability) {
             LibraryAvailability.Checking -> LoadingMessage("로그인 계정을 확인하고 있어요.")
             is LibraryAvailability.SignInRequired -> SignInRequiredContent(
@@ -164,10 +184,12 @@ fun LibraryScreen(
                     OutboxContent(
                         entries = state.outboxEntries,
                         edit = state.edit,
+                        delete = state.delete,
                         onRetry = libraryViewModel::retryOperation,
                         onDiscard = libraryViewModel::discardOperation,
                         onReconfirmSave = libraryViewModel::reconfirmExpiredSave,
                         onLoadLatest = libraryViewModel::loadLatestForEdit,
+                        onLoadLatestDelete = libraryViewModel::loadLatestForDelete,
                     )
                     HorizontalDivider()
                 }
@@ -215,6 +237,7 @@ fun LibraryScreen(
                         DetailContent(
                             detail = detail,
                             edit = state.edit,
+                            delete = state.delete,
                             onBackToList = libraryViewModel::closeDetail,
                             onOpenOriginal = onOpenOriginal,
                             onBeginEdit = libraryViewModel::beginEdit,
@@ -224,8 +247,12 @@ fun LibraryScreen(
                             onCancelEdit = libraryViewModel::cancelEdit,
                             onLoadLatest = libraryViewModel::loadLatestForEdit,
                             onConfirmAgain = libraryViewModel::confirmEditAgain,
+                            onBeginDelete = libraryViewModel::beginDelete,
+                            onCancelDelete = libraryViewModel::cancelDeleteConfirmation,
+                            onConfirmDelete = libraryViewModel::confirmDelete,
+                            onLoadLatestDelete = libraryViewModel::loadLatestForDelete,
                         )
-                        if (state.edit == null) {
+                        if (state.edit == null && state.delete == null) {
                             AttachmentControls(
                                 item = detail.item,
                                 client = client,
@@ -432,10 +459,12 @@ private fun SaveFormContent(
 private fun OutboxContent(
     entries: List<OutboxEntry>,
     edit: LibraryEditUiState?,
+    delete: LibraryDeleteUiState?,
     onRetry: (String) -> Unit,
     onDiscard: (String) -> Unit,
     onReconfirmSave: (String) -> Unit,
     onLoadLatest: () -> Unit,
+    onLoadLatestDelete: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(
@@ -455,10 +484,20 @@ private fun OutboxContent(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = if (entry.method == "PATCH") "제목·메모 수정" else "새 링크 보관",
+                        text = when {
+                            entry.isItemDeleteForScreen() -> "링크 삭제"
+                            entry.method == "PATCH" -> "제목·메모 수정"
+                            else -> "새 링크 보관"
+                        },
                         fontWeight = FontWeight.SemiBold,
                     )
-                    Text(entry.state.queueMessage())
+                    Text(entry.queueMessage())
+                    if (entry.isItemDeleteForScreen() && entry.state != OutboxState.SAVED) {
+                        Text(
+                            text = "서버가 아직 삭제를 수락하지 않아 링크는 보관함에 그대로 표시됩니다.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     entry.errorMessage?.takeUnless(String::isBlank)?.let { message ->
                         if (entry.state == OutboxState.FAILED) {
                             Text(message, color = MaterialTheme.colorScheme.error)
@@ -481,7 +520,17 @@ private fun OutboxContent(
                         }
 
                         OutboxState.CONFLICT -> {
-                            if (entry.method == "PATCH" &&
+                            if (entry.isItemDeleteForScreen() &&
+                                delete?.status?.requestIdForScreen() == entry.requestId
+                            ) {
+                                Button(
+                                    onClick = onLoadLatestDelete,
+                                    enabled = delete?.status !is LibraryDeleteStatus.LoadingLatest,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("최신 버전 확인")
+                                }
+                            } else if (entry.method == "PATCH" &&
                                 edit?.status?.requestIdForScreen() == entry.requestId
                             ) {
                                 Button(
@@ -507,6 +556,16 @@ private fun OutboxContent(
                                     modifier = Modifier.fillMaxWidth(),
                                 ) {
                                     Text("저장을 다시 확인")
+                                }
+                            } else if (entry.isItemDeleteForScreen() &&
+                                delete?.status?.requestIdForScreen() == entry.requestId
+                            ) {
+                                Button(
+                                    onClick = onLoadLatestDelete,
+                                    enabled = delete?.status !is LibraryDeleteStatus.LoadingLatest,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("최신 버전 확인")
                                 }
                             } else if (edit?.status?.requestIdForScreen() == entry.requestId) {
                                 Button(
@@ -726,6 +785,7 @@ private fun DetailFailureContent(
 private fun DetailContent(
     detail: LibraryDetailState.Loaded,
     edit: LibraryEditUiState?,
+    delete: LibraryDeleteUiState?,
     onBackToList: () -> Unit,
     onOpenOriginal: (String) -> Unit,
     onBeginEdit: () -> Unit,
@@ -735,8 +795,49 @@ private fun DetailContent(
     onCancelEdit: () -> Unit,
     onLoadLatest: () -> Unit,
     onConfirmAgain: () -> Unit,
+    onBeginDelete: () -> Unit,
+    onCancelDelete: () -> Unit,
+    onConfirmDelete: () -> Unit,
+    onLoadLatestDelete: () -> Unit,
 ) {
     val item = detail.item
+    val deleteStatus = delete?.status
+    if (
+        deleteStatus is LibraryDeleteStatus.Confirming ||
+        deleteStatus is LibraryDeleteStatus.ReadyToConfirm
+    ) {
+        val reviewingConflict = deleteStatus is LibraryDeleteStatus.ReadyToConfirm
+        AlertDialog(
+            onDismissRequest = onCancelDelete,
+            title = {
+                Text(if (reviewingConflict) "최신 버전 삭제 확인" else "링크 삭제 확인")
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (reviewingConflict) {
+                        Text("서버의 최신 버전을 확인했습니다. 삭제하려면 다시 명시적으로 확인해야 합니다.")
+                    }
+                    Text("서버가 요청을 수락하면 링크를 보관함에서 즉시 숨깁니다.")
+                    Text("서버에 저장된 사본과 앱이 소유한 첨부 파일은 백그라운드에서 물리적으로 정리되며, 완료 전까지 시간이 걸릴 수 있습니다.")
+                    Text("이 작업은 되돌릴 수 없습니다. 사용자가 보관한 원본 파일은 삭제하지 않습니다.")
+                    Text("오프라인이면 삭제 요청만 이 기기에 보관되고, 서버 수락 전까지 링크는 계속 표시됩니다.")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onConfirmDelete,
+                    modifier = Modifier.testTag("confirm-item-delete"),
+                ) {
+                    Text(if (reviewingConflict) "최신 버전 삭제" else "삭제 요청 보관")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onCancelDelete) {
+                    Text("취소")
+                }
+            },
+        )
+    }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         TextButton(onClick = onBackToList) {
             Text("보관함 목록")
@@ -765,7 +866,7 @@ private fun DetailContent(
         if (edit == null) {
             Button(
                 onClick = onBeginEdit,
-                enabled = item.version != null,
+                enabled = item.version != null && delete == null,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("제목·메모 수정")
@@ -774,6 +875,22 @@ private fun DetailContent(
                 Text(
                     text = "수정하려면 서버 버전이 포함된 최신 상세 정보가 필요해요.",
                     color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (delete == null) {
+                OutlinedButton(
+                    onClick = onBeginDelete,
+                    enabled = item.version != null,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("delete-item"),
+                ) {
+                    Text("링크 삭제")
+                }
+            } else {
+                DeleteStatusContent(
+                    delete = delete,
+                    onLoadLatest = onLoadLatestDelete,
                 )
             }
         } else {
@@ -810,6 +927,64 @@ private fun DetailContent(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("원문 열기")
+        }
+    }
+}
+
+@Composable
+private fun DeleteStatusContent(
+    delete: LibraryDeleteUiState,
+    onLoadLatest: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        shape = MaterialTheme.shapes.medium,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "링크 삭제",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            when (val status = delete.status) {
+                LibraryDeleteStatus.Confirming -> Unit
+                LibraryDeleteStatus.Queuing -> LoadingMessage("삭제 요청을 이 기기에 보관하고 있어요.")
+                is LibraryDeleteStatus.Queued -> Text(
+                    "삭제 요청을 이 기기에 보관했어요. 서버가 수락하기 전까지 링크는 계속 표시됩니다.",
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+                is LibraryDeleteStatus.Failed -> Text(
+                    status.message,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+                is LibraryDeleteStatus.Blocked -> {
+                    Text(
+                        if (status.reason == LibraryDeleteBlockReason.VERSION_CONFLICT) {
+                            "다른 변경으로 링크 버전이 달라졌습니다. 자동으로 삭제하지 않습니다."
+                        } else {
+                            "삭제 요청이 만료됐습니다. 최신 버전을 확인하고 다시 삭제를 확인해야 합니다."
+                        },
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
+                    Button(
+                        onClick = onLoadLatest,
+                        modifier = Modifier.fillMaxWidth().testTag("review-item-delete"),
+                    ) {
+                        Text("최신 버전 확인")
+                    }
+                }
+                is LibraryDeleteStatus.LoadingLatest -> LoadingMessage(
+                    "삭제 전에 서버의 최신 버전을 확인하고 있어요.",
+                )
+                is LibraryDeleteStatus.ReadyToConfirm -> Unit
+            }
+            delete.error?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.onErrorContainer)
+            }
         }
     }
 }
@@ -1030,6 +1205,24 @@ private fun OutboxState.queueMessage(): String = when (this) {
     OutboxState.SAVED -> "서버 저장 완료"
 }
 
+private fun OutboxEntry.queueMessage(): String {
+    if (!isItemDeleteForScreen()) return state.queueMessage()
+    return when (state) {
+        OutboxState.PENDING -> "삭제 요청 전송 대기 중"
+        OutboxState.RUNNING -> "삭제 요청을 서버에 전송 중"
+        OutboxState.RETRY -> "연결되면 삭제 요청 다시 전송"
+        OutboxState.WAITING_LOGIN -> "로그인 후 삭제 요청 전송"
+        OutboxState.FAILED -> "서버가 삭제를 수락하지 않음"
+        OutboxState.CONFLICT -> "최신 버전 확인 필요"
+        OutboxState.EXPIRED -> "삭제 요청 만료 · 다시 확인 필요"
+        OutboxState.SAVED -> if (isKnownMissingDeleteReceiptForScreen()) {
+            "서버에 이미 없어 이 기기에서도 삭제 완료로 정리 중"
+        } else {
+            "서버가 삭제를 수락함 · 물리적 정리 진행 중"
+        }
+    }
+}
+
 private fun LibraryEditStatus.requestIdForScreen(): String? = when (this) {
     is LibraryEditStatus.Queued -> requestId
     is LibraryEditStatus.Failed -> requestId
@@ -1042,6 +1235,30 @@ private fun LibraryEditStatus.requestIdForScreen(): String? = when (this) {
     is LibraryEditStatus.Saved,
     -> null
 }
+
+private fun LibraryDeleteStatus.requestIdForScreen(): String? = when (this) {
+    is LibraryDeleteStatus.Queued -> requestId
+    is LibraryDeleteStatus.Failed -> requestId
+    is LibraryDeleteStatus.Blocked -> requestId
+    is LibraryDeleteStatus.LoadingLatest -> requestId
+    is LibraryDeleteStatus.ReadyToConfirm -> requestId
+    LibraryDeleteStatus.Confirming,
+    LibraryDeleteStatus.Queuing,
+    -> null
+}
+
+private fun OutboxEntry.isItemDeleteForScreen(): Boolean {
+    if (method != "DELETE" || !path.startsWith("/items/")) return false
+    val itemId = path.removePrefix("/items/")
+    return itemId.isNotBlank() && '/' !in itemId
+}
+
+private fun OutboxEntry.isKnownMissingDeleteReceiptForScreen(): Boolean = runCatching {
+    Json.parseToJsonElement(checkNotNull(resultJson))
+        .jsonObject["state"]
+        ?.jsonPrimitive
+        ?.contentOrNull == "already_deleted"
+}.getOrDefault(false)
 
 private fun formatCachedAt(timestamp: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))

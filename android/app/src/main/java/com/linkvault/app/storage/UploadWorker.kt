@@ -12,6 +12,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.linkvault.app.LinkVaultApplication
 import com.linkvault.app.auth.AccountClientException
+import com.linkvault.app.auth.AccountAccess
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
@@ -29,7 +30,15 @@ class UploadWorker(
         val client = application.accountClient
 
         try {
-            client.restoreAccount()
+            when (val access = client.restoreAccount()) {
+                is AccountAccess.Deleting -> {
+                    if (access.receipt.ownerId != ownerId) return Result.success()
+                    val acceptance = client.clearAcceptedDeletionLocalData(ownerId)
+                    return if (acceptance.localDataCleared) Result.success() else Result.retry()
+                }
+                is AccountAccess.Active -> Unit
+                else -> return Result.success()
+            }
         } catch (error: AccountClientException) {
             return if (error.retryable) Result.retry() else Result.success()
         }

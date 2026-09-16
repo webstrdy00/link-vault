@@ -8,6 +8,7 @@
     "npm:fast-png@8.0.0": "8.0.0",
     "npm:fflate@0.8.2": "0.8.2",
     "npm:htmlparser2@12.0.0": "12.0.0",
+    "npm:jose@6.2.12": "6.2.12",
     "npm:jpeg-js@0.4.4": "0.4.4",
     "npm:undici@6.21.3": "6.21.3"
   },
@@ -144,6 +145,9 @@
     "iobuffer@6.0.1": {
       "integrity": "sha512-SZWYkWNfjIXIBYSDpXDYIgshqtbOPsi4lviawAEceR1Kqk+sHDlcQjWrzNQsii80AyBY0q5c8HCTNjqo74ul+Q=="
     },
+    "jose@6.2.12": {
+      "integrity": "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw=="
+    },
     "jpeg-js@0.4.4": {
       "integrity": "sha512-WZzeDOEtTOBK4Mdsar0IqEU5sMr3vSV2RqkAIzUEV2BHnUfKGyswWFPFwK5EeDo93K3FohSHbLAjj0s1Wzd+dg=="
     },
@@ -181,6 +185,7 @@
       "npm:fast-png@8.0.0",
       "npm:fflate@0.8.2",
       "npm:htmlparser2@12.0.0",
+      "npm:jose@6.2.12",
       "npm:jpeg-js@0.4.4",
       "npm:undici@6.21.3"
     ]

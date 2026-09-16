@@ -27,6 +27,13 @@ import {
   type PreparedAssetIndex,
   readActiveAssetContent,
 } from "./asset-service.ts";
+import {
+  AccountDeletionError,
+  type AccountDeletionService,
+  MAX_ACCOUNT_DELETE_BODY_BYTES,
+  parseDeleteChallengeBody,
+  type VerifiedAccountDeletionUser,
+} from "./account-deletion.ts";
 
 const MAX_BOOTSTRAP_BODY_BYTES = 8 * 1024;
 const MAX_ITEM_BODY_BYTES = 64 * 1024;
@@ -83,7 +90,11 @@ const HOST_FUNCTIONS_PREFIX = "/functions/v1";
 const API_PREFIX = "/library-api/v1";
 
 export type AuthVerification =
-  | { status: "verified"; userId: string }
+  | {
+    status: "verified";
+    userId: string;
+    user?: VerifiedAccountDeletionUser;
+  }
   | { status: "invalid" }
   | { status: "unavailable" };
 
@@ -98,6 +109,7 @@ export type ServiceRpcFunctionName =
   | "library_create_category"
   | "library_rename_category"
   | "library_delete_category"
+  | "library_delete_item"
   | "library_cue_dismiss"
   | "library_reclassify_item"
   | "library_retry_metadata";
@@ -146,6 +158,7 @@ export interface RpcResult {
 }
 
 export interface MemberGateway extends AssetGateway {
+  health?(): Promise<boolean>;
   verifyUser(accessToken: string): Promise<AuthVerification>;
   rpc(call: RpcCall): Promise<RpcResult>;
   createItem(call: CreateItemCall): Promise<RpcResult>;
@@ -155,7 +168,14 @@ export interface MemberGateway extends AssetGateway {
 }
 
 type Route =
-  | { kind: "health" | "bootstrap" | "me" }
+  | {
+    kind:
+      | "health"
+      | "bootstrap"
+      | "me"
+      | "accountDeleteChallenge"
+      | "accountDelete";
+  }
   | { kind: "items" }
   | { kind: "itemDetail"; itemId: string }
   | { kind: "itemAssetReserve"; itemId: string }
@@ -183,6 +203,7 @@ class ApiError extends Error {
 export function createHandler(
   gateway: MemberGateway,
   scheduleClassification?: () => void,
+  accountDeletionService?: AccountDeletionService,
 ): (request: Request) => Promise<Response> {
   return async (request: Request): Promise<Response> => {
     const incomingRequestId = request.headers.get("x-request-id");
@@ -211,7 +232,16 @@ export function createHandler(
 
       if (route.kind === "health") {
         requireNoQuery(requestUrl);
-        return jsonResponse({ status: "ok" });
+        let healthy = false;
+        try {
+          healthy = await gateway.health?.() === true;
+        } catch {
+          // Do not disclose database errors or infrastructure details publicly.
+        }
+        return jsonResponse(
+          { status: healthy ? "ok" : "unavailable" },
+          healthy ? 200 : 503,
+        );
       }
 
       const authorization = request.headers.get("authorization");
@@ -232,6 +262,41 @@ export function createHandler(
       }
       if (verification.status !== "verified") {
         throw dependencyUnavailableError();
+      }
+
+      if (
+        route.kind === "accountDeleteChallenge" ||
+        route.kind === "accountDelete"
+      ) {
+        requireNoQuery(requestUrl);
+        requireValidRequestId(hasValidIncomingRequestId);
+        if (
+          accountDeletionService === undefined ||
+          verification.user === undefined ||
+          verification.user.id.toLowerCase() !==
+            verification.userId.toLowerCase()
+        ) {
+          throw dependencyUnavailableError();
+        }
+        const rawBody = await readJsonText(
+          request,
+          MAX_ACCOUNT_DELETE_BODY_BYTES,
+        );
+        if (route.kind === "accountDeleteChallenge") {
+          parseDeleteChallengeBody(rawBody);
+          const result = await accountDeletionService.createChallenge({
+            user: verification.user,
+            requestId: incomingRequestId!,
+          });
+          return jsonResponse(result, 201, requestId);
+        }
+        const result = await accountDeletionService.deleteAccount({
+          user: verification.user,
+          requestId: incomingRequestId!,
+          rawBody,
+        });
+        scheduleAfterCommit(scheduleClassification);
+        return jsonResponse({ state: result.state }, 202, requestId);
       }
 
       if (route.kind === "bootstrap") {
@@ -718,6 +783,41 @@ export function createHandler(
           "An internal error occurred.",
         );
       }
+      if (method === "DELETE") {
+        requireNoQuery(requestUrl);
+        requireValidRequestId(hasValidIncomingRequestId);
+        const body = validateVersionBody(
+          await readJson(request, MAX_DISCOVERY_BODY_BYTES),
+          false,
+        );
+        const deleteResult = await callServiceRpc(gateway, {
+          functionName: "library_delete_item",
+          ownerId: verification.userId,
+          requestId: incomingRequestId!,
+          args: {
+            p_item_id: route.itemId,
+            p_body: body,
+          },
+        });
+        if (deleteResult.error !== null) {
+          throw mapRpcFailure(deleteResult.error);
+        }
+        if (isVersionConflictUpdateResult(deleteResult.data)) {
+          throw mapRpcFailure({
+            code: "P0001",
+            message: "VERSION_CONFLICT",
+          });
+        }
+        if (!isDeleteItemResult(deleteResult.data, route.itemId)) {
+          throw dependencyUnavailableError();
+        }
+        scheduleAfterCommit(scheduleClassification);
+        return jsonResponse(
+          { item_id: deleteResult.data.item_id, state: "deleting" },
+          202,
+          requestId,
+        );
+      }
       if (method === "GET") {
         const detailPlan = readDetailQuery(requestUrl);
         const rpcResult = await callCallerRpc(gateway, {
@@ -802,6 +902,13 @@ export function createHandler(
     } catch (error) {
       const apiError = error instanceof ApiError
         ? error
+        : error instanceof AccountDeletionError
+        ? new ApiError(
+          error.status,
+          error.code,
+          error.message,
+          error.retryable,
+        )
         : error instanceof AssetServiceUnavailableError
         ? dependencyUnavailableError()
         : new ApiError(500, "INTERNAL_ERROR", "An internal error occurred.");
@@ -822,6 +929,10 @@ function matchRoute(pathname: string): Route | null {
       return { kind: "bootstrap" };
     case `${API_PREFIX}/me`:
       return { kind: "me" };
+    case `${API_PREFIX}/account/delete-challenge`:
+      return { kind: "accountDeleteChallenge" };
+    case `${API_PREFIX}/account/delete`:
+      return { kind: "accountDelete" };
     case `${API_PREFIX}/items`:
       return { kind: "items" };
     case `${API_PREFIX}/categories`:
@@ -920,7 +1031,7 @@ function methodsFor(route: Route): string[] {
     case "itemAssetContent":
       return ["GET"];
     case "itemDetail":
-      return ["GET", "PATCH"];
+      return ["GET", "PATCH", "DELETE"];
     case "itemAssetReserve":
     case "itemAssetComplete":
     case "itemCueDismiss":
@@ -932,6 +1043,8 @@ function methodsFor(route: Route): string[] {
     case "itemAsset":
       return ["DELETE"];
     case "bootstrap":
+    case "accountDeleteChallenge":
+    case "accountDelete":
       return ["POST"];
     case "items":
     case "categories":
@@ -957,6 +1070,18 @@ async function readStrictEmptyJsonObject(request: Request): Promise<void> {
 }
 
 async function readJson(request: Request, maxBytes: number): Promise<unknown> {
+  const bodyText = await readJsonText(request, maxBytes);
+  try {
+    return JSON.parse(bodyText);
+  } catch {
+    throw invalidJsonError();
+  }
+}
+
+async function readJsonText(
+  request: Request,
+  maxBytes: number,
+): Promise<string> {
   const contentType = request.headers.get("content-type");
   const mediaType = contentType?.split(";", 1)[0].trim().toLowerCase();
   if (mediaType !== "application/json") {
@@ -1018,11 +1143,7 @@ async function readJson(request: Request, maxBytes: number): Promise<unknown> {
     reader.releaseLock();
   }
 
-  try {
-    return JSON.parse(bodyText);
-  } catch {
-    throw invalidJsonError();
-  }
+  return bodyText;
 }
 
 function validateItemBody(value: unknown): ItemPreparationInput {
@@ -2207,6 +2328,16 @@ function isDeleteAssetResult(
   return isObject(value) && Object.keys(value).length === 3 &&
     value.http_status === 202 && typeof value.asset_id === "string" &&
     isUuid(value.asset_id) && value.state === "deleting";
+}
+
+function isDeleteItemResult(
+  value: unknown,
+  itemId: string,
+): value is { http_status: 202; item_id: string; state: "deleting" } {
+  return isObject(value) && Object.keys(value).length === 3 &&
+    value.http_status === 202 && value.state === "deleting" &&
+    typeof value.item_id === "string" && isUuid(value.item_id) &&
+    value.item_id.toLowerCase() === itemId.toLowerCase();
 }
 
 function isAssetItemResult(

@@ -43,10 +43,15 @@ fun AccountScreen(
     val accountViewModel: AccountViewModel = viewModel(factory = factory)
     val state by accountViewModel.uiState.collectAsState()
     val activity = LocalContext.current.findActivity()
-    val confirmationVisible = state is AccountUiState.ConfirmLogout
+    val confirmationVisible =
+        state is AccountUiState.ConfirmLogout || state is AccountUiState.ConfirmAccountDeletion
 
     BackHandler(enabled = confirmationVisible) {
-        accountViewModel.cancelLogout()
+        when (state) {
+            is AccountUiState.ConfirmLogout -> accountViewModel.cancelLogout()
+            is AccountUiState.ConfirmAccountDeletion -> accountViewModel.cancelAccountDeletion()
+            else -> Unit
+        }
     }
 
     Column(
@@ -61,7 +66,12 @@ fun AccountScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TextButton(
-                onClick = if (confirmationVisible) accountViewModel::cancelLogout else onBack,
+                onClick = when (state) {
+                    is AccountUiState.ConfirmLogout -> accountViewModel::cancelLogout
+                    is AccountUiState.ConfirmAccountDeletion ->
+                        accountViewModel::cancelAccountDeletion
+                    else -> onBack
+                },
             ) {
                 Text("뒤로")
             }
@@ -100,15 +110,13 @@ fun AccountScreen(
                     }
                 },
                 onLogout = accountViewModel::requestLogout,
+                onDeleteAccount = accountViewModel::requestAccountDeletion,
             )
 
             is AccountUiState.Active -> ActiveContent(
                 summary = currentState.summary,
                 onLogout = accountViewModel::requestLogout,
-            )
-
-            AccountUiState.Deleting -> DeletingContent(
-                onLogout = accountViewModel::requestLogout,
+                onDeleteAccount = accountViewModel::requestAccountDeletion,
             )
 
             is AccountUiState.Error -> ErrorContent(
@@ -131,6 +139,28 @@ fun AccountScreen(
                 onConfirm = accountViewModel::confirmLogout,
                 onRetryCheck = accountViewModel::retryLogoutConfirmation,
                 onCancel = accountViewModel::cancelLogout,
+            )
+
+            is AccountUiState.ConfirmAccountDeletion -> ConfirmAccountDeletionContent(
+                state = currentState,
+                onConfirm = {
+                    if (activity == null) {
+                        accountViewModel.reportDeletionReauthenticationUnavailable()
+                    } else {
+                        accountViewModel.confirmAccountDeletion(activity)
+                    }
+                },
+                onCancel = accountViewModel::cancelAccountDeletion,
+            )
+
+            is AccountUiState.DeletionStatusUnknown -> DeletionStatusUnknownContent(
+                state = currentState,
+                onCheck = accountViewModel::checkAccountDeletionStatus,
+            )
+
+            is AccountUiState.DeletionAccepted -> DeletionAcceptedContent(
+                state = currentState,
+                onRetryLocalCleanup = accountViewModel::retryAcceptedDeletionLocalCleanup,
             )
         }
     }
@@ -198,6 +228,7 @@ private fun LoginContent(
 private fun PendingApprovalContent(
     onRetry: () -> Unit,
     onLogout: () -> Unit,
+    onDeleteAccount: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -205,7 +236,7 @@ private fun PendingApprovalContent(
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
         )
-        Text("로그인은 완료됐지만 아직 베타 이용 승인이 필요해요.")
+        Text("로그인은 완료됐지만 베타 이용 승인이 없거나 이용 권한이 회수됐어요.")
         Button(
             onClick = onRetry,
             modifier = Modifier.fillMaxWidth(),
@@ -218,6 +249,12 @@ private fun PendingApprovalContent(
         ) {
             Text("로그아웃")
         }
+        TextButton(
+            onClick = onDeleteAccount,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("계정과 서버 자료 삭제")
+        }
     }
 }
 
@@ -225,6 +262,7 @@ private fun PendingApprovalContent(
 private fun ActiveContent(
     summary: AccountSummary,
     onLogout: () -> Unit,
+    onDeleteAccount: () -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text(
@@ -244,23 +282,11 @@ private fun ActiveContent(
         ) {
             Text("로그아웃")
         }
-    }
-}
-
-@Composable
-private fun DeletingContent(onLogout: () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            text = "계정 삭제를 처리 중이에요",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
-        )
-        Text("삭제가 끝날 때까지 이 계정은 이용할 수 없어요.")
-        OutlinedButton(
-            onClick = onLogout,
+        TextButton(
+            onClick = onDeleteAccount,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("로그아웃")
+            Text("계정과 서버 자료 삭제")
         }
     }
 }
@@ -340,6 +366,9 @@ private fun ConfirmLogoutContent(
             "임시 공유 입력, 동기화 캐시, 수정 충돌 자료, 아직 서버에 저장되지 않은 요청은 삭제 후 복구할 수 없어요.",
             color = MaterialTheme.colorScheme.error,
         )
+        if (state.expectedSessionOwner != null) {
+            Text("로그아웃은 서버 계정과 서버에 보관된 자료를 삭제하지 않아요.")
+        }
         state.message?.let { message ->
             Text(message, color = MaterialTheme.colorScheme.error)
         }
@@ -369,6 +398,103 @@ private fun ConfirmLogoutContent(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text("취소")
+        }
+    }
+}
+
+@Composable
+private fun ConfirmAccountDeletionContent(
+    state: AccountUiState.ConfirmAccountDeletion,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = "계정과 서버 자료를 삭제할까요?",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Text(
+            "로그아웃과 달리 계정 삭제를 접수하면 서버의 보관 항목, 첨부, 계정은 복구할 수 없어요.",
+            color = MaterialTheme.colorScheme.error,
+        )
+        Text("Google 계정을 다시 선택해 현재 계정 본인인지 확인한 뒤에만 삭제를 접수해요.")
+        Text("운영 자료 정리는 72시간 이내를 목표로 하지만 완료 시간을 보장하지 않아요.")
+        Text("운영 백업은 최대 30일 순환을 목표로 하며, 복원 시 삭제 요청을 다시 적용해요.")
+        state.message?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.error)
+        }
+        if (state.canConfirm) {
+            Button(
+                onClick = onConfirm,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Google 재인증 후 되돌릴 수 없는 삭제")
+            }
+        }
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("계정 유지")
+        }
+    }
+}
+
+@Composable
+private fun DeletionStatusUnknownContent(
+    state: AccountUiState.DeletionStatusUnknown,
+    onCheck: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = "삭제 접수 결과를 확인해야 해요",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Text(state.message, color = MaterialTheme.colorScheme.error)
+        Text("확인 전에는 새 삭제 요청을 보내지 않아요.")
+        Button(
+            onClick = onCheck,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("계정 상태 확인")
+        }
+    }
+}
+
+@Composable
+private fun DeletionAcceptedContent(
+    state: AccountUiState.DeletionAccepted,
+    onRetryLocalCleanup: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            text = "계정 삭제가 접수됐어요",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+        )
+        Text("이 계정은 더 이상 보관함을 이용할 수 없어요.")
+        Text("운영 자료 정리는 72시간 이내를 목표로 하지만 완료 시간을 보장하지 않아요.")
+        if (!state.localDataCleared) {
+            Text(
+                "LOCAL_DATA_CLEAR_FAILED: 서버 삭제는 접수됐지만 이 기기의 대기 자료를 지우지 못했어요.",
+                color = MaterialTheme.colorScheme.error,
+            )
+            state.message?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+            Button(
+                onClick = onRetryLocalCleanup,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("기기 자료 정리 다시 시도")
+            }
+        } else {
+            Text("이 기기의 계정 자료와 로그인 정보도 정리했어요.")
+            state.message?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }

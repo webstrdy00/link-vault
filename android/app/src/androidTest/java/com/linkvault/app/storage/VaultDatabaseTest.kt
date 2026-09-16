@@ -257,6 +257,7 @@ class VaultDatabaseTest {
         listOf(
             "POST" to "/items",
             "PATCH" to "/items/$itemId",
+            "DELETE" to "/items/$itemId",
             "POST" to "/categories",
             "PATCH" to "/categories/$categoryId",
             "DELETE" to "/categories/$categoryId",
@@ -267,7 +268,7 @@ class VaultDatabaseTest {
         }
 
         listOf(
-            "DELETE" to "/items/$itemId",
+            "DELETE" to "/items/$itemId?unexpected=true",
             "POST" to "/items/$itemId",
             "DELETE" to "/categories",
             "POST" to "/categories/$categoryId",

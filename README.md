@@ -5,8 +5,9 @@ M2 오프라인 대기열·캐시·제목/메모 편집을 구현했습니다.
 M3 검색·분류·재적용과 검색 단서 안내는 로컬 서버·에뮬레이터 검증을 통과했습니다.
 M4의 제한된 네이버 메타정보, 이미지 1장 첨부·교체·삭제, 기기 OCR도
 로컬 서버·에뮬레이터 검증을 통과했습니다.
+M5의 서버 항목 삭제, 계정 탈퇴, 정리 작업, 암호화 백업과 격리 복원 리허설은
+로컬 구현·인수를 마쳤습니다.
 Google 로그인 코드는 연결했지만 실제 OAuth 공급자 교환은 설정 후 검증이 필요합니다.
-서버 항목 삭제와 계정 탈퇴는 M5 범위이며 아직 제공하지 않습니다.
 
 ## 개발 환경
 
@@ -86,7 +87,8 @@ Supabase CLI가 출력하는 키·토큰은 로그나 저장소에 공유하지 
 구현한 API: `/functions/v1/library-api/v1/health`, `/bootstrap`, `/me`,
 POST/GET `/items`, GET/PATCH `/items/{id}`, 분류 목록·생성·이름 변경·삭제,
 검색 규칙 조회, 단서 안내 닫기, 자동 분류 재적용, 메타정보 재시도,
-이미지 예약·완료·OCR 재시도와 인라인 이미지 DELETE입니다.
+이미지 예약·완료·OCR 재시도와 인라인 이미지 DELETE, 항목 DELETE,
+계정 삭제 challenge·접수입니다.
 GET `/items`는 검색어·분류·미분류·출처·기간·limit/offset을 지원합니다.
 승인된 회원만 접근하고 새 항목은 100개·분당 10건 제한을 적용합니다.
 재전송·중복 URL은 원래 메모를 덮어쓰지 않습니다.
@@ -161,8 +163,8 @@ GET `/items`는 검색어·분류·미분류·출처·기간·limit/offset을 �
 - Room schema v3는 회원과 세션 generation으로 대기 상태를 격리합니다.
   앱 소유 private 임시 파일은 24시간 경계로 정리하고 완료·취소 시 해당 작업 파일을
   제거합니다. 명시적 로그아웃·계정 변경도 기기의 관련 개인 자료를 정리합니다.
-  인라인 이미지 DELETE와 실제 Storage 객체 정리는 구현했지만,
-  서버 항목 삭제와 계정 삭제는 M5 범위로 남아 있습니다.
+  이 내용은 M4 당시 경계입니다. M5에서는 Room schema v4와 항목 삭제 묘비,
+  서버 항목 삭제·계정 삭제를 추가했습니다.
 
 ### 백그라운드 실행기와 기존 분류 정규화
 
@@ -183,6 +185,90 @@ GET `/items`는 검색어·분류·미분류·출처·기간·limit/offset을 �
 메타정보·파일 정리는 `ENRICHMENT_WORKER_NOT_CONFIGURED`로 실패합니다.
 운영 점검은 작업 상태, cron 결과, HTTP 상태와 고정 오류 코드만 확인하고 원문·쿼리·토큰을 남기지 않습니다.
 두 설정 스크립트는 로컬 전용입니다. 운영 백필·Vault/크론 설정과 배포 인수는 별도입니다.
+
+### M5 삭제·운영 계약
+
+- `DELETE /items/{id}`는 `expected_version`을 받아 원문·메모·검색 파생값·OCR을
+  트랜잭션에서 즉시 지우고 일반 작업을 취소하며 `202 state=deleting`을 반환합니다.
+  같은 회원·같은 요청 UUID·같은 본문의 정확한 재전송은 같은 202 영수증이고,
+  삭제 후 새 요청 UUID로 다시 삭제하면 404입니다. 보존 중인 생성·편집 요청을
+  재전송하면 410 `ITEM_DELETED`이며 항목을 되살리지 않습니다.
+- 파일 객체는 202 전에 없어졌다는 뜻이 아닙니다. DB 접근과 내용은 즉시 차단하지만
+  Storage 정리는 lease로 후속 실행하며, 늦은 worker는 lease token·묘비를 확인해야 합니다.
+  Room schema v4의 회원별 삭제 묘비는 늦은 목록·상세·검색·첨부 응답과 캐시가 삭제한
+  항목을 다시 표시하지 못하게 하고, 보존한 삭제 영수증 외 해당 항목의 대기 요청을 제거합니다.
+- 계정 삭제 challenge는 회원·`account_delete` 목적·nonce hash에 묶인 5분 일회성입니다.
+  Android는 Credential Manager에서 자동 선택을 끈 새 Google 증명을 요청합니다.
+  서버는 `jose`로 Google 공개 키의 RS256 서명, issuer, audience, `exp`·`iat`,
+  nonce와 `sub`를 검증하고, GoTrue에 연결된 Google 서버 identity의 subject와 대조합니다.
+  토큰이나 이메일 같은 클라이언트 주장을 계정 identity로 신뢰하지 않습니다.
+- 요청 UUID는 회원 UUID와 함께 private claim으로 원문 UUID 그대로 고정합니다.
+  일반 API·challenge의 route·본문 hash는 7일, 접수된 계정 삭제 claim은 30일 보존합니다.
+  Google ID 토큰 원문은 DB·Room에 저장하지 않습니다. 적용된 migration
+  `020`은 만료 challenge를 생성 시점부터 7일 보존하되 재전송으로 5분을 연장하지 않고,
+  Auth 행은 `NO KEY UPDATE`, claim 확인은 `KEY SHARE`, 만료 claim 정리는
+  `SKIP LOCKED`로 동시 실행을 직렬화합니다.
+- 계정 삭제 202는 물리 정리나 기기 삭제 완료가 아닙니다. 서버 작업은 Storage 부재 확인 →
+  업무 데이터 purge → Auth 사용자 삭제 → lease가 유효한 최종화 순서입니다.
+  Android는 `SessionBoundary` 아래 persistent `data_owner`를 확인하고 접수된 회원 A의
+  세션 owner가 null이어도 로컬 소유자가 A이면 기기 자료 정리를 재시도하며,
+  현재 세션이나 로컬 소유자가 B이면 B 자료를 지우지 않습니다.
+  응답 유실 뒤 401이나 계정 상태 확인 불가를 ‘삭제 시작 안 됨’으로 바꾸지 않고
+  결과 미확인 상태에서 기존 요청의 복구 확인만 제공합니다.
+- 첫 버전에는 휴지통·삭제 취소·사용자 export·운영자 관리 UI가 없습니다.
+
+### M5 로컬 운영·백업 리허설
+
+다음 명령은 고정된 로컬 Supabase 프로젝트 전용입니다.
+
+```powershell
+npm run operations:check
+npm run operations:run
+npm run backup:local -- snapshot --output C:\secure\link-vault-snapshot.bin
+npm run backup:local -- ledger --output C:\secure\link-vault-ledger.bin
+npm run restore:verify -- --backup C:\secure\link-vault-snapshot.bin --ledger C:\secure\link-vault-ledger.bin
+```
+
+`operations:check`는 상태만 확인하고 `operations:run`은 한 배치 실행 후 같은 검사를 합니다.
+정리 cron은 5분마다 최대 10건을 dispatch합니다. 출력은 pending/retry/overdue, 만료 lease,
+사용량 불일치, 미추적 Storage 객체, ledger export와 최근 dispatch 같은 집계·고정 경고뿐이며
+경고가 하나라도 있으면 명령도 실패 상태로 끝납니다. URL·제목·검색어·메모·OCR·이미지·
+토큰·원문 오류를 출력하지 않습니다. 72시간은 overdue 경보를 내는 운영 목표이지
+물리 삭제 완료 보증이 아닙니다.
+
+현재 실제 로컬 `operations:run`과 `operations:check`는 둘 다 exit 1이며 경고는
+`DELETION_LEDGER_NOT_EXPORTED` 하나뿐입니다. pending/retry/overdue, 사용량 불일치,
+만료 lease와 미추적 객체는 모두 0이고 maintenance schedule은 true, 최근 cron은
+fresh입니다.
+통합 fixture의 암호화 archive와 ACK export는 시험 소유 cleanup에서 제거했으므로,
+이는 실제 운영 archive·키 보관이 아직 준비되지 않았다는 예상된 fail-closed 경고입니다.
+CLI가 정상 exit 0이거나 경고 없이 healthy하다고 해석하지 않습니다.
+
+백업·복원 명령 전에는 **정확히 하나**의 환경변수
+`LINK_VAULT_BACKUP_PASSWORD`(UTF-8 12바이트 이상) 또는
+`LINK_VAULT_BACKUP_KEY_BASE64`(32바이트 키의 canonical Base64)를 프로세스 환경에
+설정합니다. 값은 명령 인자·출력·저장소에 넣지 않습니다. 스크립트는 `.env`를 자동으로
+읽지 않으며, 별도 도구로 쓰는 `.env`는 민감 파일로 취급해 커밋하지 않습니다.
+snapshot은 실제 source DB의 PostgreSQL custom dump와 실제 private 활성 파일을
+AES-256-GCM으로 함께 봉인합니다.
+삭제 ledger는 내용 원문 없는 별도 암호화 파일로 frozen export 전체를 검증한 뒤에만 ACK합니다.
+두 출력은 저장소 밖에 둡니다.
+
+`restore:verify`는 **로컬 복원 리허설 전용**이며 운영 장애 복원 명령이 아닙니다.
+복원 전후 살아 있는 source DB에서 database identity·DB clock·최신 ledger sequence를 읽고,
+ledger가 5분보다 오래됐거나 snapshot이 30일보다 오래됐거나 source를 읽지 못하면 닫힌 채
+실패합니다. source와 같은 immutable image로 무작위 token label의 새 Docker container를
+`--network none`, 공개 port 없음으로 만들고, 새 `link_vault_restore` DB를 `template0`에서
+생성합니다. source DB나 bootstrap `postgres` DB를 drop하지 않습니다.
+인증된 확장 이름·버전 inventory를 먼저 구성하고 `cron.database_name`을 새 DB로 설정해
+소유권을 확인한 container만 재시작한 뒤, 실제 `pg_restore`의 ACL/RLS를 포함해 복원합니다.
+삭제 ledger를 DB에 먼저 재생한 다음 살아남은 파일만 추출하고 DB·Storage·사용량을 audit합니다.
+container 소유권/정리 확인이 실패하면 마운트된 임시 자료를 보존한 채 실패하며 verified
+영수증을 내지 않습니다. 알 수 없는 파일을 임의로 지우는 운영 cleanup 도구가 아닙니다.
+
+암호화 archive의 실제 30일 순환·물리 보관, offsite key custody, 운영 cron·경보 연결,
+운영 복원 절차는 별도 운영 전제입니다. 실제 Google OAuth 공급자 교환, 사용자 대상 OAuth,
+S23·실제 SNS도 이 로컬 도구의 검증 범위가 아닙니다.
 
 WebP 디코더 `webp_dec.wasm`은 Edge 번들에 정적으로 포함해야 하며
 `supabase/config.toml`의 `static_files`에서 빠지면 안 됩니다. 런타임 네트워크로 WASM을
@@ -211,7 +297,41 @@ WebP 디코더 `webp_dec.wasm`은 Edge 번들에 정적으로 포함해야 하�
 
 ### 확인된 범위
 
-2026-09-16 M4 로컬 구현 인수 결과:
+2026-09-16 현재 M5 구현 검증 결과:
+
+- 최종 로컬 audit 1725에서 migration `020`까지 DB 15파일·685개, API 200개,
+  Node 운영·암호화·cleanup 24개, 실제 Auth/API/RLS 42개, 검색 80개,
+  enrichment 69개, 삭제 38개, 동시성 3개와 백업/복원 12개가 통과했습니다.
+  적용된 `001`~`020`은 이력을 다시 쓰지 않는 immutable migration입니다.
+  항목만 삭제한 A 계정은 유지되고, B의 PNG·OCR은
+  복원되며, 삭제한 C 계정은 복원되지 않았습니다. 오래된 ledger는 거부하고 새 ledger는
+  복원했으며 source DB가 바뀌지 않은 것도 확인했습니다.
+- Deno fmt 23파일·lint 20파일·check가 통과했습니다.
+- 최종 Android 결과 1730에서 JVM XML 9 suite·98개가 실패·오류·skip 0,
+  기본 기기 54개, Lint 오류 0·경고 48개와 debug APK 빌드가 통과했습니다.
+- 실제 M5 에뮬레이터는 immutable offline DELETE의 동일 UUID 재연결, 충돌 검토 뒤
+  새 UUID, 묘비의 늦은 cache 차단, 실제 queued PNG+OCR purge, cold restore의 typed
+  receipt, 화면 recreation, Google 설정 누락, 공급자 장애 시 계정 보존을 모두 통과했습니다.
+  파일 purge 뒤 Auth clear가 실패하면 typed `AccountAccess.Deleting` receipt의
+  `localDataCleared=false`를 유지하고, 정확한 `acceptanceGeneration`과
+  `presentationGeneration`으로 B 계정 fallback·개인정보 노출을 막는 최종 경계도
+  확인했습니다.
+- 현재 소스의 실제 M1은 1735, M2·M3·M4 순차 회귀는 마지막
+  `LibraryViewModel` logout observer 수정 뒤 1728에서 모두 통과했습니다.
+- lifecycle fixture는 실제 recreate/close 전에 non-private `ACTION_MAIN`을 복원합니다.
+  제품 logout intent sanitization은 변경하지 않았습니다.
+- 로컬 활성 backend의 100개 항목·30회 표본 p95는 검색 85.4ms,
+  저장+색인 90.1ms였습니다.
+  운영 배포 성능이나 상한이 아닙니다.
+- Edge 70은 APPROVE, native 71은 최종 CLEAR/APPROVE,
+  SQL `020` 72와 restore cleanup 74는 CLEAR입니다.
+
+따라서 M5의 **로컬 구현·인수는 완료**했습니다. 변경은 커밋·push하지 않았고 M6는
+시작하지 않았습니다. 실제 Google OAuth 공급자 교환,
+S23·실제 SNS, 운영 배포·스케줄·경보, 실제 운영 archive·키 보관·offsite custody와
+30일 물리 purge도 보류입니다.
+
+아래는 2026-09-16 M4 종료 당시의 역사적 로컬 구현 인수 결과입니다.
 
 - 최종 재검증에서도 API 162개·검색 80개·enrichment 69개(아티팩트 1098),
   M4 에뮬레이터·JVM·Lint/빌드(1100), Edge 진입점 타입 검사(1102)가 통과했습니다.
@@ -245,7 +365,7 @@ WebP 디코더 `webp_dec.wasm`은 Edge 번들에 정적으로 포함해야 하�
 래핑되지 않은 완료 API 응답 처리, Edge가 지원하지 않는 `https.lookup` 사용과
 취소 시 crash를 수정했습니다.
 
-M4의 **로컬 구현·검증 완료**는 M5 서버 항목/계정 삭제·운영, M6, 전체 베타,
+당시 M4의 **로컬 구현·검증 완료**는 M5 서버 항목/계정 삭제·운영, M6, 전체 베타,
 실제 Google OAuth 공급자 교환, S23·실제 SNS, 운영 배포·성능 인수를 뜻하지 않습니다.
 Google 공급자 교환, 실기기/SNS와 운영 설정·배포·관측·백업/복원 인수는 명시적으로 보류합니다.
 
@@ -275,6 +395,34 @@ Kapt의 언어 모드 하향 안내와 테스트 소스 처리 옵션 경고도 
 Google 공급자 교환·실제 SNS 공유·S23 호환성·운영 배포는 이 결과에 포함하지 않습니다.
 M2의 에뮬레이터 개발 검증과 실제 Google 로그인·실기기 인수는 별개입니다.
 전체 베타 완료를 뜻하지 않습니다.
+
+## 개인정보·삭제 안내 초안
+
+아래는 M5 개발용 안내 초안이며 공개 서비스의 확정 처리방침이나 법률 검토 결과가 아닙니다.
+운영자 연락처, 실제 서비스 지역·처리자·국외 이전, 공급자 보존 조건은 공개 전에 확정해야 합니다.
+
+- Google 계정은 회원 인증에 사용합니다. URL·제목·메모·직접 선택한 이미지와 OCR 텍스트는
+  해당 회원의 비공개 보관함과 검색·분류 제공에 사용합니다.
+- OCR은 번들된 ML Kit로 기기에서 실행합니다. 보관을 선택한 이미지와 인식 결과는
+  Supabase의 비공개 저장소·DB로 전송합니다. 사진 전체나 SNS 계정을 자동 수집하지 않습니다.
+- 네이버 메타정보 요청은 허용된 호스트의 제한된 공개 정보만 대상으로 합니다.
+  생성형 AI 호출, 광고 SDK, 개인 자료의 광고 타기팅은 첫 베타에 포함하지 않습니다.
+- 일반 진단에는 작업 종류·요청 ID·고정 결과 코드·시간만 사용하며
+  URL·검색어·메모·OCR·이미지·인증 토큰을 기록하지 않습니다.
+  자체 진단 정보의 보존 목표는 최대 7일이며 공급자 로그의 실제 보존 조건과는 별개입니다.
+- 기기 대기 입력은 최대 24시간 자동 재시도 대상으로 보관합니다.
+  로그아웃·계정 변경 시 관련 기기 자료를 정리하며 사용자의 사진 원본을 삭제하지 않습니다.
+- 서버 항목 삭제가 수락되면 조회에서 즉시 제외하고 파일·관련 자료는 후속 정리합니다.
+  탈퇴는 Google 재인증 후 접근을 차단하고 파일, 업무 데이터, Auth 계정 순서로 정리하는 계약입니다.
+  최초 삭제 요청에 사용한 Google ID 토큰은 Room 대기열에 보관하지 않습니다.
+- 운영 저장소 정리는 72시간 내 완료를 목표로 하지만 휴면·장애를 포함한 운영 검증 전에는
+  확정 기한으로 보증하지 않습니다. 휴지통·삭제 취소 기능은 제공 범위에 없습니다.
+- 일반 API 멱등 기록은 7일, 계정 삭제 claim은 30일 보존합니다.
+  내용 없는 서버 삭제 묘비·복원 검사와 운영자 백업은 최대 30일을
+  기준으로 관리합니다. 백업의 모든 사본까지 즉시 지워졌다고 안내하지 않습니다.
+  별도로 암호화한 삭제 기록을 복원본에 적용하고 파일·사용량을 검증하기 전에는 공개하지 않습니다.
+- 이 안내의 M5 삭제 계약은 위 최종 로컬 인수를 통과했습니다. 이는 실제 운영 archive,
+  key custody·offsite 보관, 30일 물리 disposal이나 운영 배포 인수를 대신하지 않습니다.
 
 ## M0 실기기 인수
 

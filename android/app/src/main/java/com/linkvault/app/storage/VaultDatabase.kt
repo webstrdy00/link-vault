@@ -93,6 +93,19 @@ data class CachedItem(
     val isDetail: Boolean,
 )
 
+@Entity(
+    tableName = "item_deletion_tombstones",
+    primaryKeys = ["owner_id", "item_id"],
+)
+data class ItemDeletionTombstone(
+    @ColumnInfo(name = "owner_id")
+    val ownerId: String,
+    @ColumnInfo(name = "item_id")
+    val itemId: String,
+    @ColumnInfo(name = "observed_deleted_at")
+    val observedDeletedAt: Long,
+)
+
 @Entity(tableName = "cached_categories")
 data class CachedCategories(
     @PrimaryKey
@@ -269,6 +282,71 @@ abstract class OutboxDao {
 
     @Query(
         """
+        SELECT EXISTS(
+            SELECT 1 FROM outbox
+            WHERE owner_id = :ownerId
+              AND request_id = :requestId
+              AND state = 'running'
+              AND lease_until = :leaseUntil
+        )
+        """,
+    )
+    abstract suspend fun isClaimed(
+        ownerId: String,
+        requestId: String,
+        leaseUntil: Long,
+    ): Boolean
+
+    @Query(
+        """
+        DELETE FROM outbox
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state = 'running'
+          AND lease_until = :leaseUntil
+        """,
+    )
+    abstract suspend fun discardClaimed(
+        ownerId: String,
+        requestId: String,
+        leaseUntil: Long,
+    ): Int
+
+    @Query(
+        """
+        SELECT EXISTS(
+            SELECT 1 FROM outbox
+            WHERE owner_id = :ownerId
+              AND request_id = :requestId
+              AND method = 'DELETE'
+              AND path = '/items/' || :itemId
+              AND state IN ('running', 'saved')
+        )
+        """,
+    )
+    abstract suspend fun isItemDeleteReceipt(
+        ownerId: String,
+        itemId: String,
+        requestId: String,
+    ): Boolean
+
+    @Query(
+        """
+        DELETE FROM outbox
+        WHERE owner_id = :ownerId
+          AND (path = :exactItemPath OR path LIKE :nestedItemPathPattern)
+          AND (:preservedRequestId IS NULL OR request_id != :preservedRequestId)
+        """,
+    )
+    abstract suspend fun deleteItemRequests(
+        ownerId: String,
+        exactItemPath: String,
+        nestedItemPathPattern: String,
+        preservedRequestId: String?,
+    ): Int
+
+    @Query(
+        """
         UPDATE outbox
         SET state = 'expired', lease_until = NULL,
             error_code = 'REQUEST_EXPIRED',
@@ -369,6 +447,16 @@ abstract class CachedItemDao {
 
     @Query(
         """
+        SELECT EXISTS(
+            SELECT 1 FROM item_deletion_tombstones
+            WHERE owner_id = :ownerId AND item_id = :itemId
+        )
+        """,
+    )
+    protected abstract suspend fun isDeleted(ownerId: String, itemId: String): Boolean
+
+    @Query(
+        """
         UPDATE cached_items
         SET response_json = :responseJson,
             server_version = :serverVersion,
@@ -378,6 +466,10 @@ abstract class CachedItemDao {
           AND item_id = :itemId
           AND is_detail = :isDetail
           AND server_version <= :serverVersion
+          AND NOT EXISTS(
+            SELECT 1 FROM item_deletion_tombstones
+            WHERE owner_id = :ownerId AND item_id = :itemId
+          )
         """,
     )
     protected abstract suspend fun updateIfNotOlder(
@@ -392,6 +484,7 @@ abstract class CachedItemDao {
 
     @Transaction
     open suspend fun upsert(item: CachedItem) {
+        if (isDeleted(item.ownerId, item.itemId)) return
         if (insertIfAbsent(item) != -1L) return
         updateIfNotOlder(
             ownerId = item.ownerId,
@@ -440,6 +533,10 @@ abstract class CachedItemDao {
         """
         SELECT * FROM cached_items
         WHERE owner_id = :ownerId AND is_detail = 0
+          AND NOT EXISTS(
+            SELECT 1 FROM item_deletion_tombstones
+            WHERE owner_id = :ownerId AND item_id = cached_items.item_id
+          )
         ORDER BY server_created_at DESC, item_id DESC
         """,
     )
@@ -449,6 +546,10 @@ abstract class CachedItemDao {
         """
         SELECT * FROM cached_items
         WHERE owner_id = :ownerId AND item_id = :itemId AND is_detail = 1
+          AND NOT EXISTS(
+            SELECT 1 FROM item_deletion_tombstones
+            WHERE owner_id = :ownerId AND item_id = :itemId
+          )
         """,
     )
     abstract suspend fun readDetail(ownerId: String, itemId: String): CachedItem?
@@ -460,6 +561,84 @@ abstract class CachedItemDao {
     abstract suspend fun deleteOwner(ownerId: String): Int
 
     @Query("DELETE FROM cached_items")
+    abstract suspend fun deleteAll(): Int
+}
+
+@Dao
+abstract class ItemDeletionTombstoneDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    protected abstract suspend fun insertIfAbsent(tombstone: ItemDeletionTombstone): Long
+
+    @Query(
+        """
+        UPDATE item_deletion_tombstones
+        SET observed_deleted_at = :observedDeletedAt
+        WHERE owner_id = :ownerId
+          AND item_id = :itemId
+          AND observed_deleted_at < :observedDeletedAt
+        """,
+    )
+    protected abstract suspend fun updateObservedDeletedAt(
+        ownerId: String,
+        itemId: String,
+        observedDeletedAt: Long,
+    ): Int
+
+    @Query(
+        """
+        UPDATE pending_attachments
+        SET stage = 'expired',
+            resume_stage = NULL,
+            expires_at = MIN(expires_at, :observedDeletedAt),
+            lease_token = NULL,
+            lease_until = NULL,
+            error_code = 'ITEM_DELETED',
+            error_message = 'The item was deleted before the attachment was saved.'
+        WHERE owner_id = :ownerId AND item_id = :itemId
+        """,
+    )
+    abstract suspend fun cancelItemAttachments(
+        ownerId: String,
+        itemId: String,
+        observedDeletedAt: Long,
+    ): Int
+
+    @Transaction
+    open suspend fun markDeleted(ownerId: String, itemId: String, observedDeletedAt: Long) {
+        if (
+            insertIfAbsent(
+                ItemDeletionTombstone(
+                    ownerId = ownerId,
+                    itemId = itemId,
+                    observedDeletedAt = observedDeletedAt,
+                ),
+            ) == -1L
+        ) {
+            updateObservedDeletedAt(ownerId, itemId, observedDeletedAt)
+        }
+        cancelItemAttachments(ownerId, itemId, observedDeletedAt)
+    }
+
+    @Query(
+        """
+        SELECT EXISTS(
+            SELECT 1 FROM item_deletion_tombstones
+            WHERE owner_id = :ownerId AND item_id = :itemId
+        )
+        """,
+    )
+    abstract suspend fun isDeleted(ownerId: String, itemId: String): Boolean
+
+    @Query("SELECT item_id FROM item_deletion_tombstones WHERE owner_id = :ownerId")
+    abstract fun observeItemIds(ownerId: String): Flow<List<String>>
+
+    @Query("SELECT item_id FROM item_deletion_tombstones WHERE owner_id = :ownerId")
+    abstract suspend fun readItemIds(ownerId: String): List<String>
+
+    @Query("DELETE FROM item_deletion_tombstones WHERE owner_id = :ownerId")
+    abstract suspend fun deleteOwner(ownerId: String): Int
+
+    @Query("DELETE FROM item_deletion_tombstones")
     abstract suspend fun deleteAll(): Int
 }
 
@@ -575,8 +754,9 @@ class VaultConverters {
         CachedCategories::class,
         PendingInput::class,
         PendingAttachment::class,
+        ItemDeletionTombstone::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 @TypeConverters(VaultConverters::class)
@@ -586,6 +766,33 @@ abstract class VaultDatabase : RoomDatabase() {
     abstract fun cachedCategoriesDao(): CachedCategoriesDao
     abstract fun pendingInputDao(): PendingInputDao
     abstract fun attachmentDao(): AttachmentDao
+    abstract fun deletedItems(): ItemDeletionTombstoneDao
+
+    suspend fun markItemDeleted(
+        ownerId: String,
+        itemId: String,
+        observedDeletedAt: Long,
+        preservedRequestId: String,
+    ): Boolean = withTransaction {
+        val preservedReceiptEligible = outboxDao().isItemDeleteReceipt(
+            ownerId = ownerId,
+            itemId = itemId,
+            requestId = preservedRequestId,
+        )
+        deletedItems().markDeleted(ownerId, itemId, observedDeletedAt)
+        cachedItemDao().deleteItem(ownerId, itemId)
+        val exactItemPath = "/items/$itemId"
+        outboxDao().deleteItemRequests(
+            ownerId = ownerId,
+            exactItemPath = exactItemPath,
+            nestedItemPathPattern = "$exactItemPath/%",
+            preservedRequestId = preservedRequestId,
+        )
+        preservedReceiptEligible
+    }
+
+    suspend fun isItemDeleted(ownerId: String, itemId: String): Boolean =
+        deletedItems().isDeleted(ownerId, itemId)
 
     suspend fun clearOwner(ownerId: String) {
         withTransaction {
@@ -594,6 +801,7 @@ abstract class VaultDatabase : RoomDatabase() {
             cachedItemDao().deleteOwner(ownerId)
             cachedCategoriesDao().deleteOwner(ownerId)
             pendingInputDao().deleteAll()
+            deletedItems().deleteOwner(ownerId)
         }
     }
 
@@ -604,6 +812,7 @@ abstract class VaultDatabase : RoomDatabase() {
             cachedItemDao().deleteAll()
             cachedCategoriesDao().deleteAll()
             pendingInputDao().deleteAll()
+            deletedItems().deleteAll()
         }
     }
 
@@ -614,7 +823,7 @@ abstract class VaultDatabase : RoomDatabase() {
             context.applicationContext,
             VaultDatabase::class.java,
             DATABASE_NAME,
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
     }
 }
 
@@ -686,6 +895,21 @@ internal val MIGRATION_2_3 = object : Migration(2, 3) {
             """
             CREATE INDEX IF NOT EXISTS `index_pending_attachments_owner_id_expires_at`
             ON `pending_attachments` (`owner_id`, `expires_at`)
+            """.trimIndent(),
+        )
+    }
+}
+
+internal val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(database: SupportSQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `item_deletion_tombstones` (
+                `owner_id` TEXT NOT NULL,
+                `item_id` TEXT NOT NULL,
+                `observed_deleted_at` INTEGER NOT NULL,
+                PRIMARY KEY(`owner_id`, `item_id`)
+            )
             """.trimIndent(),
         )
     }

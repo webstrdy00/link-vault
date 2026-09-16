@@ -4,6 +4,7 @@ import android.app.Application
 import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.attachment.IncomingImageStore
 import com.linkvault.app.auth.AccountClient
+import com.linkvault.app.auth.AccountAccess
 import com.linkvault.app.storage.OutboxRepository
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -36,6 +37,7 @@ class LinkVaultApplication : Application() {
             key = BuildConfig.SUPABASE_PUBLISHABLE_KEY,
             googleWebClientId = BuildConfig.GOOGLE_WEB_CLIENT_ID,
             debug = BuildConfig.DEBUG,
+            localDataOwner = { localState.getString("data_owner", null) },
             beforeSignOut = { clearLocalBoundary(nextOwner = null) },
             onSessionOwner = ::bindLocalOwner,
         )
@@ -87,8 +89,9 @@ class LinkVaultApplication : Application() {
                 mutableDraftError.value = "만료된 임시 입력을 정리하지 못했어요."
             }
             if (!accountClient.isConfigured) return@launch
+            var restoredAccess: AccountAccess? = null
             try {
-                accountClient.restoreAccount()
+                restoredAccess = accountClient.restoreAccount()
             } catch (error: CancellationException) {
                 throw error
             } catch (_: Exception) {
@@ -96,6 +99,16 @@ class LinkVaultApplication : Application() {
                 // The worker, not this startup path, records transport errors.
             }
             try {
+                if (restoredAccess is AccountAccess.Deleting) {
+                    val acceptance = accountClient.clearAcceptedDeletionLocalData(
+                        restoredAccess.receipt.ownerId,
+                    )
+                    if (!acceptance.localDataCleared) {
+                        mutableDraftError.value = "탈퇴는 접수됐지만 기기의 개인 자료를 정리하지 못했어요."
+                    }
+                    return@launch
+                }
+                if (restoredAccess !is AccountAccess.Active) return@launch
                 accountClient.sessionUserId()?.let { owner ->
                     outboxRepository.resumeOwner(owner)
                     attachmentRepository.resumeOwner(owner)

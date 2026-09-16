@@ -1,7 +1,10 @@
 package com.linkvault.app.auth
 
 import io.ktor.http.HttpMethod
+import io.ktor.http.HttpStatusCode
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -39,6 +42,9 @@ class AccountConfigTest {
             "/categories/not-a-uuid",
             "/categories/$id/reclassify",
             "/items/$id/unknown",
+            "/items/$id/delete",
+            "/items/$id/delete/extra",
+            "/items/$id%2Fdelete",
             "/items/$id/reclassify/extra",
             "/items/$id#fragment",
             "/items/$id/../categories",
@@ -59,6 +65,8 @@ class AccountConfigTest {
             "/items/$id/assets/$assetId/../content",
             "/items/$id/assets/$assetId/internal/op",
             "/internal/items/$id/assets/$assetId/content",
+            "/account/delete",
+            "/account/delete-challenge",
         ).forEach { path ->
             assertThrows(path, AccountClientException::class.java) { validateLibraryPath(path) }
         }
@@ -75,6 +83,7 @@ class AccountConfigTest {
             "/items/$itemId/assets/$assetId" to HttpMethod.Delete,
             "/items/$itemId/assets/$assetId/ocr" to HttpMethod.Patch,
             "/items/$itemId/assets/$assetId/content" to HttpMethod.Get,
+            "/items/$itemId" to HttpMethod.Delete,
         ).forEach { (path, method) ->
             validateLibraryRouteMethod(validateLibraryPath(path), method)
         }
@@ -86,11 +95,226 @@ class AccountConfigTest {
             "/items/$itemId/assets/$assetId" to HttpMethod.Get,
             "/items/$itemId/assets/$assetId/ocr" to HttpMethod.Post,
             "/items/$itemId/assets/$assetId/content" to HttpMethod.Post,
+            "/items" to HttpMethod.Delete,
+            "/items/$itemId?q=delete" to HttpMethod.Delete,
+            "/items/$itemId/reclassify" to HttpMethod.Delete,
+            "/categories/$itemId" to HttpMethod.Post,
         ).forEach { (path, method) ->
             assertThrows(path, AccountClientException::class.java) {
                 validateLibraryRouteMethod(validateLibraryPath(path), method)
             }
         }
+    }
+
+    @Test
+    fun `item deletion accepts only expected version body and exact accepted response`() {
+        val itemId = "00000000-0000-0000-0000-000000000001"
+        val path = "/items/$itemId"
+
+        validateLibraryRequestBody(
+            path = path,
+            method = HttpMethod.Delete,
+            body = """{"expected_version":7}""",
+        )
+        assertEquals(
+            setOf("item_id", "state"),
+            validateItemDeleteResponse(
+                path = path,
+                status = HttpStatusCode.Accepted,
+                body = """{"item_id":"$itemId","state":"deleting"}""",
+            ).keys,
+        )
+
+        listOf(
+            null,
+            "{}",
+            """{"expected_version":0}""",
+            """{"expected_version":-1}""",
+            """{"expected_version":1.5}""",
+            """{"expected_version":"7"}""",
+            """{"expected_version":7,"force":true}""",
+            """{"expected_version":7,"expectedVersion":7}""",
+        ).forEach { body ->
+            val error = assertThrows(AccountClientException::class.java) {
+                validateLibraryRequestBody(path, HttpMethod.Delete, body)
+            }
+            assertEquals("INVALID_REQUEST_BODY", error.code)
+        }
+
+        listOf(
+            HttpStatusCode.OK to """{"item_id":"$itemId","state":"deleting"}""",
+            HttpStatusCode.Accepted to """{"item_id":"$itemId","state":"deleted"}""",
+            HttpStatusCode.Accepted to """{"item_id":"00000000-0000-0000-0000-000000000002","state":"deleting"}""",
+            HttpStatusCode.Accepted to """{"item_id":"$itemId","state":"deleting","extra":true}""",
+            HttpStatusCode.Accepted to """{"state":"deleting"}""",
+        ).forEach { (status, body) ->
+            val error = assertThrows(AccountClientException::class.java) {
+                validateItemDeleteResponse(path, status, body)
+            }
+            assertEquals("INVALID_ITEM_DELETE_RESPONSE", error.code)
+        }
+    }
+
+    @Test
+    fun `accepted deletion retries failed owner cleanup after the auth session is cleared`() = runBlocking {
+        val ownerA = "00000000-0000-0000-0000-000000000001"
+        val tracker = AcceptedDeletionCleanupTracker()
+
+        assertEquals(
+            AcceptedDeletionCleanupAction.PURGE_EXPECTED_OWNER,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = ownerA,
+                localDataOwnerId = ownerA,
+            ),
+        )
+
+        val failedPurge = runCatching {
+            tracker.purge(ownerA) { error("filesystem cleanup failed") }
+        }
+        assertTrue(failedPurge.isFailure)
+        assertFalse(tracker.wasSuccessfullyPurged(ownerA))
+
+        // A failed purge was not recorded. A later definitive 401 may clear the auth
+        // session, but persistent ownership still requires the same purge.
+        assertEquals(
+            AcceptedDeletionCleanupAction.PURGE_EXPECTED_OWNER,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = null,
+                localDataOwnerId = ownerA,
+            ),
+        )
+
+        tracker.purge(ownerA) {}
+        assertTrue(tracker.wasSuccessfullyPurged(ownerA))
+        assertEquals(
+            AcceptedDeletionCleanupAction.CLEAR_AUTH_ONLY,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = null,
+                localDataOwnerId = null,
+            ),
+        )
+        assertEquals(
+            AcceptedDeletionCleanupAction.PURGE_EXPECTED_OWNER,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = null,
+                localDataOwnerId = ownerA,
+            ),
+        )
+    }
+
+    @Test
+    fun `accepted deletion cleanup never purges a different local owner`() {
+        val ownerA = "00000000-0000-0000-0000-000000000001"
+        val ownerB = "00000000-0000-0000-0000-000000000002"
+        val tracker = AcceptedDeletionCleanupTracker()
+
+        assertEquals(
+            AcceptedDeletionCleanupAction.REFUSE_OWNER_MISMATCH,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = ownerA,
+                localDataOwnerId = ownerB,
+            ),
+        )
+        assertEquals(
+            AcceptedDeletionCleanupAction.ALREADY_ABSENT,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = ownerB,
+                localDataOwnerId = ownerB,
+            ),
+        )
+        assertEquals(
+            AcceptedDeletionCleanupAction.ALREADY_ABSENT,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = null,
+                localDataOwnerId = ownerB,
+            ),
+        )
+        assertEquals(
+            AcceptedDeletionCleanupAction.REFUSE_OWNER_MISMATCH,
+            tracker.action(
+                expectedOwnerId = ownerA,
+                sessionOwnerId = ownerB,
+                localDataOwnerId = ownerA,
+            ),
+        )
+    }
+
+    @Test
+    fun `authentication failure after delete send remains an unknown deletion result`() {
+        val authenticationFailure = AccountAuthenticationRequiredException()
+        assertFalse(
+            accountDeletionResultIsUnknown(
+                deleteRequestMayHaveReachedServer = false,
+                error = authenticationFailure,
+            ),
+        )
+        assertTrue(
+            accountDeletionResultIsUnknown(
+                deleteRequestMayHaveReachedServer = true,
+                error = authenticationFailure,
+            ),
+        )
+
+        val unknown = AccountUiState.DeletionStatusUnknown(
+            expectedSessionOwner = "00000000-0000-0000-0000-000000000001",
+            expectedSessionGeneration = 9,
+            message = "응답을 확인하지 못했어요.",
+        )
+        val afterRecovery401 = preserveUnknownDeletionStatus(
+            unknown = unknown,
+            message = "로그인이 만료되어 삭제 접수 여부를 확인할 수 없어요.",
+        )
+        assertEquals(unknown.expectedSessionOwner, afterRecovery401.expectedSessionOwner)
+        assertEquals(unknown.expectedSessionGeneration, afterRecovery401.expectedSessionGeneration)
+        assertTrue(afterRecovery401.message.contains("삭제 접수 여부"))
+    }
+
+    @Test
+    fun `ambiguous delete stays unknown when recovery clears origin before retry`() = runBlocking {
+        val ownerId = "00000000-0000-0000-0000-000000000001"
+        val generation = 17L
+        val ambiguousNetworkFailure = AccountClientException(
+            message = "Delete response was lost.",
+            retryable = true,
+        )
+        var originPresent = true
+
+        // A definitive 401 while checking /me clears the captured session origin.
+        val recoveryResult: Boolean? = run {
+            originPresent = false
+            null
+        }
+        assertEquals(null, recoveryResult)
+
+        val thrown = runCatching {
+            guardAmbiguousAccountDeletionRetry(
+                expectedOwnerId = ownerId,
+                expectedGeneration = generation,
+                ambiguousFailure = ambiguousNetworkFailure,
+            ) {
+                if (!originPresent) {
+                    throw AccountClientException(
+                        message = "The authenticated session changed",
+                        retryable = false,
+                        code = "SESSION_CHANGED",
+                    )
+                }
+            }
+        }.exceptionOrNull()
+
+        assertTrue(thrown is AccountDeletionStatusUnknownException)
+        val unknown = thrown as AccountDeletionStatusUnknownException
+        assertEquals(ownerId, unknown.expectedOwnerId)
+        assertEquals(generation, unknown.expectedGeneration)
+        assertEquals("SESSION_CHANGED", (unknown.cause as AccountClientException).code)
+        assertTrue(unknown.cause?.suppressed?.contains(ambiguousNetworkFailure) == true)
     }
 
     @Test

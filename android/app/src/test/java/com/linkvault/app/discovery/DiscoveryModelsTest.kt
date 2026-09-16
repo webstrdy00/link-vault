@@ -1,5 +1,6 @@
 package com.linkvault.app.discovery
 
+import com.linkvault.app.library.LibraryItemSummary
 import java.time.ZoneId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -9,6 +10,32 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class DiscoveryModelsTest {
+    @Test
+    fun deletionFence_removesPrivateResultsAndDisclosureWithoutChangingServerPagination() {
+        val deleted = LibraryItemSummary("deleted", url = "https://example.test/deleted")
+        val retained = LibraryItemSummary("retained", url = "https://example.test/retained")
+        val state = DiscoveryUiState(
+            availability = DiscoveryAvailability.Ready,
+            displayZoneId = "UTC",
+            items = listOf(deleted, retained),
+            nextOffset = 20,
+            hasMore = true,
+            aliasDisclosure = DiscoveryAliasDisclosure.Loaded(
+                DiscoveryAliasDetail(itemId = deleted.id, explanations = emptyList()),
+            ),
+        )
+        val filtered = state.withoutDeletedItems(setOf(deleted.id))
+        assertEquals(listOf(retained), filtered.items)
+        assertEquals(DiscoveryAliasDisclosure.None, filtered.aliasDisclosure)
+        assertEquals(20, filtered.nextOffset)
+        assertTrue(filtered.hasMore)
+
+        val otherDisclosure = state.copy(
+            aliasDisclosure = DiscoveryAliasDisclosure.Loading(retained.id),
+        ).withoutDeletedItems(setOf(deleted.id))
+        assertEquals(DiscoveryAliasDisclosure.Loading(retained.id), otherDisclosure.aliasDisclosure)
+    }
+
     @Test
     fun queryEncoding_preservesLiteralPercentAndUnderscoreWithoutPatternEscaping() {
         val snapshot = validSnapshot(

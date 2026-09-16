@@ -9,6 +9,7 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import io.github.jan.supabase.SupabaseClient
@@ -44,6 +45,7 @@ import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -53,8 +55,12 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlin.time.Duration.Companion.seconds
 
 class AccountClient(
@@ -64,12 +70,15 @@ class AccountClient(
     googleWebClientId: String,
     debug: Boolean,
     private val beforeSignOut: suspend () -> Unit,
+    private val localDataOwner: () -> String?,
     private val onSessionOwner: suspend (ownerId: String) -> Unit,
 ) {
     private val configuration = validateAccountConfig(url, key, googleWebClientId, debug)
     private val credentialManager = CredentialManager.create(context.applicationContext)
     private val json = Json { ignoreUnknownKeys = true }
     private val sessionBoundary = SessionBoundary()
+    private val acceptedDeletionCleanup = AcceptedDeletionCleanupTracker()
+    private val acceptedDeletionReceipts = AcceptedDeletionReceiptStore()
 
     private val configured: ValidatedAccountConfig?
         get() = (configuration as? AccountConfigValidation.Configured)?.config
@@ -122,33 +131,42 @@ class AccountClient(
 
     suspend fun restoreAccount(): AccountAccess? = try {
         val auth = requireSupabase().auth
-        val hasRestoredSession = sessionBoundary.locked {
+        val restoredOrigin = sessionBoundary.locked {
             when (val status = auth.sessionStatus.value) {
                 is SessionStatus.Authenticated -> {
                     if (status.session.expiresAt <= kotlinx.datetime.Clock.System.now()) {
-                        return@locked restoreStoredSession(auth)
+                        if (!restoreStoredSession(auth)) return@locked null
+                        return@locked currentOrigin()
                     }
                     val ownerId = status.session.user?.id
                         ?: throw invalidSdkSession()
                     prepareLocalOwner(ownerId)
-                    val origin = currentOrigin() ?: commitLogin(ownerId)
+                    val origin = currentOrigin() ?: commitIdentity(ownerId)
                     if (origin.ownerId != ownerId) {
                         auth.clearSession()
                         clear(origin)
                         throw AccountAuthenticationRequiredException()
                     }
                     confirmAuthenticated(origin, ownerId)
-                    true
+                    origin
                 }
                 is SessionStatus.RefreshFailure -> {
-                    restoreStoredSession(auth)
+                    if (restoreStoredSession(auth)) currentOrigin() else null
                 }
                 is SessionStatus.NotAuthenticated,
                 SessionStatus.Initializing,
-                -> restoreStoredSession(auth)
+                -> if (restoreStoredSession(auth)) currentOrigin() else null
             }
         }
-        if (hasRestoredSession) getAccount() else null
+        if (restoredOrigin == null) {
+            acceptedDeletionAccessForCurrentPresentation()
+        } else {
+            try {
+                getAccount(restoredOrigin.ownerId, restoredOrigin.generation)
+            } catch (error: AccountClientException) {
+                acceptedDeletionAccessAfterSessionRace(restoredOrigin, error) ?: throw error
+            }
+        }
     } catch (error: SessionBoundaryChangedException) {
         throw sessionChanged()
     } finally {
@@ -218,7 +236,7 @@ class AccountClient(
                     throw invalidSdkSession()
                 }
                 prepareLocalOwner(ownerId)
-                commitLogin(ownerId)
+                commitIdentity(ownerId)
             }
         } catch (error: SessionBoundaryChangedException) {
             throw sessionChanged()
@@ -248,12 +266,15 @@ class AccountClient(
             }
             RawResponse(httpResponse.status, httpResponse.bodyAsText())
         }
-        return acceptResponse(response, ::parseBootstrap)
+        return acceptAccountAccessResponse(response, ::parseBootstrap)
     }
 
-    suspend fun getAccount(): AccountAccess {
+    suspend fun getAccount(
+        expectedOwnerId: String? = null,
+        expectedGeneration: Long? = null,
+    ): AccountAccess {
         val requestId = UUID.randomUUID().toString()
-        val response = authorizedRequest { accessToken ->
+        val response = authorizedRequest(expectedOwnerId, expectedGeneration) { accessToken ->
             val httpResponse = requireHttpClient().get(
                 "${requireConfig().url}$FUNCTIONS_PATH/me",
             ) {
@@ -263,8 +284,150 @@ class AccountClient(
             }
             RawResponse(httpResponse.status, httpResponse.bodyAsText())
         }
-        return acceptResponse(response, ::parseMe)
+        return acceptAccountAccessResponse(response, ::parseMe)
     }
+
+    suspend fun requestAccountDeletion(
+        activity: Activity,
+        expectedOwnerId: String,
+        expectedGeneration: Long,
+    ): AccountDeletionAcceptance {
+        val challengeRequestId = UUID.randomUUID().toString()
+        val challengeResponse = authorizedRequest(
+            expectedOwnerId,
+            expectedGeneration,
+        ) { accessToken ->
+            val httpResponse = requireHttpClient().post(
+                "${requireConfig().url}$FUNCTIONS_PATH/account/delete-challenge",
+            ) {
+                header(HttpHeaders.Authorization, "Bearer $accessToken")
+                header(API_KEY_HEADER, requireConfig().key)
+                header(REQUEST_ID_HEADER, challengeRequestId)
+                contentType(ContentType.Application.Json)
+                setBody(EMPTY_JSON_OBJECT)
+            }
+            RawResponse(httpResponse.status, httpResponse.bodyAsText())
+        }
+        val origin = challengeResponse.origin
+        val challenge = acceptResponse(challengeResponse, ::parseDeletionChallenge)
+        requireUsableDeletionChallenge(origin, challenge.expiresAt)
+
+        val googleIdToken = requestFreshDeletionProof(
+            activity = activity,
+            rawNonce = challenge.nonce,
+        )
+        requireUsableDeletionChallenge(origin, challenge.expiresAt)
+
+        val requestId = UUID.randomUUID().toString()
+        val frozenBody = json.encodeToString(
+            AccountDeletionRequest(
+                challengeId = challenge.challengeId,
+                googleIdToken = googleIdToken,
+            ),
+        )
+        var ambiguousFailure: AccountClientException? = null
+        var deleteRequestMayHaveReachedServer = false
+        repeat(ACCOUNT_DELETE_ATTEMPTS) { attempt ->
+            try {
+                val deleteResponse = authorizedRequest(
+                    expectedOwnerId,
+                    origin.generation,
+                ) { accessToken ->
+                    deleteRequestMayHaveReachedServer = true
+                    val httpResponse = requireHttpClient().post(
+                        "${requireConfig().url}$FUNCTIONS_PATH/account/delete",
+                    ) {
+                        header(HttpHeaders.Authorization, "Bearer $accessToken")
+                        header(API_KEY_HEADER, requireConfig().key)
+                        header(REQUEST_ID_HEADER, requestId)
+                        contentType(ContentType.Application.Json)
+                        setBody(frozenBody)
+                    }
+                    RawResponse(
+                        httpResponse.status,
+                        httpResponse.bodyAsText(),
+                        parseRetryAfter(httpResponse.headers[HttpHeaders.RetryAfter]),
+                    )
+                }
+                acceptDeletionResponse(deleteResponse)
+                return finishAcceptedDeletion(origin)
+            } catch (error: AccountClientException) {
+                if (
+                    accountDeletionResultIsUnknown(
+                        deleteRequestMayHaveReachedServer = deleteRequestMayHaveReachedServer,
+                        error = error,
+                    )
+                ) {
+                    throw AccountDeletionStatusUnknownException(
+                        expectedOwnerId = origin.ownerId,
+                        expectedGeneration = origin.generation,
+                        cause = error,
+                    )
+                }
+                if (!error.retryable) {
+                    if (ambiguousFailure != null) {
+                        when (recoverDeletionState(origin, expectedOwnerId)) {
+                            true -> return finishAcceptedDeletion(origin)
+                            false -> Unit
+                            null -> throw AccountDeletionStatusUnknownException(
+                                expectedOwnerId = origin.ownerId,
+                                expectedGeneration = origin.generation,
+                                cause = ambiguousFailure,
+                            )
+                        }
+                    }
+                    throw error
+                }
+                ambiguousFailure = error
+                when (recoverDeletionState(origin, expectedOwnerId)) {
+                    true -> return finishAcceptedDeletion(origin)
+                    false -> Unit
+                    null -> Unit
+                }
+                if (attempt + 1 < ACCOUNT_DELETE_ATTEMPTS) {
+                    guardAmbiguousAccountDeletionRetry(
+                        expectedOwnerId = origin.ownerId,
+                        expectedGeneration = origin.generation,
+                        ambiguousFailure = error,
+                    ) {
+                        requireUsableDeletionChallenge(origin, challenge.expiresAt)
+                    }
+                }
+            }
+        }
+        throw AccountDeletionStatusUnknownException(
+            expectedOwnerId = origin.ownerId,
+            expectedGeneration = origin.generation,
+            cause = ambiguousFailure,
+        )
+    }
+
+    suspend fun recoverAccountDeletionState(
+        expectedOwnerId: String,
+        expectedGeneration: Long,
+    ): AccountAccess {
+        requireDeletionOrigin(expectedOwnerId, expectedGeneration)
+        val access = getAccount(expectedOwnerId, expectedGeneration)
+        if (access is AccountAccess.Deleting) return access
+        requireDeletionOrigin(expectedOwnerId, expectedGeneration)
+        return access
+    }
+
+    suspend fun currentAcceptedDeletionReceipt(
+        expectedOwnerId: String,
+        acceptanceGeneration: Long,
+    ): AccountDeletionReceipt? = sessionBoundary.locked {
+        acceptedDeletionReceipts.current(
+            ownerId = expectedOwnerId,
+            acceptanceGeneration = acceptanceGeneration,
+            presentationGeneration = generation(),
+        )
+    }
+
+    suspend fun clearAcceptedDeletionLocalData(
+        expectedOwnerId: String,
+    ): AccountDeletionAcceptance =
+        finishAcceptedDeletion(expectedOwnerId = expectedOwnerId, expectedOrigin = null)
 
     suspend fun libraryRequest(
         expectedOwnerId: String,
@@ -291,7 +454,7 @@ class AccountClient(
                 code = INVALID_REQUEST_ID,
             )
         }
-        body?.let { validateJsonObject(it) }
+        validateLibraryRequestBody(safePath, httpMethod, body)
 
         val response = authorizedRequest(expectedOwnerId) { accessToken ->
             val httpResponse = requireHttpClient().request(
@@ -321,8 +484,13 @@ class AccountClient(
                 return@acceptResponse JsonObject(emptyMap())
             }
             try {
-                json.decodeFromString<JsonObject>(rawResponse.body)
+                if (isItemDeleteRoute(safePath, httpMethod)) {
+                    validateItemDeleteResponse(safePath, rawResponse.status, rawResponse.body)
+                } else {
+                    json.decodeFromString<JsonObject>(rawResponse.body)
+                }
             } catch (error: Exception) {
+                if (error is AccountClientException) throw error
                 throw AccountClientException(
                     message = "서버 응답을 읽지 못했어요. 잠시 후 다시 시도해 주세요.",
                     retryable = true,
@@ -449,40 +617,58 @@ class AccountClient(
     }
 
     suspend fun signOut() {
+        signOutBound(null)
+    }
+
+    private suspend fun signOutBound(expectedOrigin: SessionOrigin?) {
         val auth = requireSupabase().auth
-        var failure: Exception? = null
-        withContext(NonCancellable) {
-            sessionBoundary.locked {
-                try {
-                    beforeSignOut()
-                } catch (error: Exception) {
-                    throw AccountClientException(
-                        message = "기기 대기 자료를 정리하지 못해 로그아웃하지 않았어요. 다시 시도해 주세요.",
-                        retryable = true,
-                        code = "LOCAL_DATA_CLEAR_FAILED",
-                        cause = error,
-                    )
-                }
-                try {
-                    auth.signOut()
-                } catch (error: Exception) {
-                    failure = error
-                }
-                try {
-                    auth.clearSession()
-                } catch (error: Exception) {
-                    if (failure == null) failure = error
-                }
-                clearCurrent()
-                try {
-                    credentialManager.clearCredentialState(ClearCredentialStateRequest())
-                } catch (error: Exception) {
-                    if (failure == null) failure = error
+        var localAuthFailure: Exception? = null
+        var remoteFailure: Exception? = null
+        try {
+            withContext(NonCancellable) {
+                sessionBoundary.locked {
+                    expectedOrigin?.let(::requireCurrent)
+                    try {
+                        beforeSignOut()
+                    } catch (error: Exception) {
+                        throw AccountClientException(
+                            message = "기기 대기 자료를 정리하지 못해 로그아웃하지 않았어요. 다시 시도해 주세요.",
+                            retryable = true,
+                            code = LOCAL_DATA_CLEAR_FAILED,
+                            cause = error,
+                        )
+                    }
+                    try {
+                        auth.signOut()
+                    } catch (error: Exception) {
+                        remoteFailure = error
+                    }
+                    try {
+                        auth.clearSession()
+                    } catch (error: Exception) {
+                        localAuthFailure = error
+                    }
+                    if (localAuthFailure == null) clearCurrent()
+                    try {
+                        credentialManager.clearCredentialState(ClearCredentialStateRequest())
+                    } catch (error: Exception) {
+                        if (remoteFailure == null) remoteFailure = error
+                    }
                 }
             }
+        } catch (error: SessionBoundaryChangedException) {
+            throw sessionChanged()
         }
 
-        failure?.let { error ->
+        localAuthFailure?.let { error ->
+            throw AccountClientException(
+                message = "기기 자료는 지웠지만 로그인 정보를 완전히 지우지 못했어요. 다시 시도해 주세요.",
+                retryable = true,
+                code = LOCAL_DATA_CLEAR_FAILED,
+                cause = error,
+            )
+        }
+        remoteFailure?.let { error ->
             if (error is CancellationException) throw error
             throw AccountClientException(
                 message = "이 기기의 로그인 정보는 지웠지만 서버 또는 Google 로그인 상태를 정리하지 못했어요.",
@@ -492,12 +678,351 @@ class AccountClient(
         }
     }
 
+    private suspend fun requestFreshDeletionProof(
+        activity: Activity,
+        rawNonce: String,
+    ): String {
+        val googleOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(false)
+            .setServerClientId(requireConfig().googleWebClientId)
+            .setAutoSelectEnabled(false)
+            .setNonce(rawNonce)
+            .build()
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleOption)
+            .build()
+        val credential = try {
+            credentialManager.getCredential(
+                context = MutableContextWrapper(activity),
+                request = request,
+            ).credential
+        } catch (error: GetCredentialCancellationException) {
+            throw AccountDeletionReauthenticationCancelledException(error)
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            throw AccountClientException(
+                message = "계정 삭제를 위한 Google 재인증 화면을 열지 못했어요.",
+                retryable = true,
+                code = "GOOGLE_REAUTH_UNAVAILABLE",
+                cause = error,
+            )
+        }
+        if (
+            credential !is CustomCredential ||
+            credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+        ) {
+            throw AccountClientException(
+                message = "Google에서 지원하지 않는 재인증 응답을 받았어요.",
+                retryable = false,
+                code = "GOOGLE_PROOF_INVALID",
+            )
+        }
+        return try {
+            GoogleIdTokenCredential.createFrom(credential.data).idToken.takeIf(String::isNotBlank)
+                ?: throw IllegalArgumentException("Blank Google ID token")
+        } catch (error: Exception) {
+            throw AccountClientException(
+                message = "Google 재인증 응답을 확인하지 못했어요.",
+                retryable = false,
+                code = "GOOGLE_PROOF_INVALID",
+                cause = error,
+            )
+        }
+    }
+
+    private fun parseDeletionChallenge(response: RawResponse): DeletionChallenge {
+        if (response.status != HttpStatusCode.Created) throw apiException(response)
+        requireExactJsonKeys(
+            body = response.body,
+            expectedKeys = setOf("challenge_id", "nonce", "expires_at"),
+            code = "INVALID_DELETE_CHALLENGE_RESPONSE",
+        )
+        val body = decodeOrThrow<DeleteChallengeResponse>(response.body)
+        if (!body.challengeId.isCanonicalUuid()) {
+            throw invalidDeletionResponse("삭제 확인 ID 형식이 올바르지 않아요.")
+        }
+        if (
+            body.nonce.isBlank() ||
+            body.nonce.length > MAX_DELETE_NONCE_LENGTH ||
+            body.nonce.any { Character.isISOControl(it.code) }
+        ) {
+            throw invalidDeletionResponse("삭제 재인증 값을 확인하지 못했어요.")
+        }
+        val expiresAt = try {
+            Instant.parse(body.expiresAt)
+        } catch (error: Exception) {
+            throw invalidDeletionResponse("삭제 재인증 만료 시간을 확인하지 못했어요.", error)
+        }
+        if (!expiresAt.isAfter(Instant.now())) {
+            throw AccountClientException(
+                message = "삭제 재인증 시간이 만료됐어요. 다시 확인해 주세요.",
+                retryable = false,
+                code = DELETE_CHALLENGE_EXPIRED,
+            )
+        }
+        return DeletionChallenge(
+            challengeId = body.challengeId,
+            nonce = body.nonce,
+            expiresAt = expiresAt,
+        )
+    }
+
+    private fun parseDeletionAcceptance(response: RawResponse) {
+        if (response.status != HttpStatusCode.Accepted) throw apiException(response)
+        requireExactJsonKeys(
+            body = response.body,
+            expectedKeys = setOf("state"),
+            code = "INVALID_ACCOUNT_DELETE_RESPONSE",
+        )
+        val body = decodeOrThrow<DeleteAccountResponse>(response.body)
+        if (body.state != PROFILE_DELETING) {
+            throw invalidDeletionResponse("서버가 계정 삭제 접수 상태를 반환하지 않았어요.")
+        }
+    }
+
+    private suspend fun requireUsableDeletionChallenge(
+        origin: SessionOrigin,
+        expiresAt: Instant,
+    ) {
+        try {
+            sessionBoundary.locked { requireCurrent(origin) }
+        } catch (error: SessionBoundaryChangedException) {
+            throw sessionChanged()
+        }
+        if (!expiresAt.isAfter(Instant.now())) {
+            throw AccountClientException(
+                message = "삭제 재인증 시간이 만료됐어요. 다시 확인해 주세요.",
+                retryable = false,
+                code = DELETE_CHALLENGE_EXPIRED,
+            )
+        }
+    }
+
+    private suspend fun recoverDeletionState(
+        origin: SessionOrigin,
+        expectedOwnerId: String,
+    ): Boolean? = try {
+        requireUsableDeletionOrigin(origin)
+        val access = getAccount(expectedOwnerId, origin.generation)
+        requireUsableDeletionOrigin(origin)
+        access is AccountAccess.Deleting
+    } catch (error: AccountClientException) {
+        if (error is AccountAuthenticationRequiredException || error.code == SESSION_CHANGED) {
+            null
+        } else {
+            if (!error.retryable) throw error
+            null
+        }
+    }
+
+    private suspend fun requireUsableDeletionOrigin(origin: SessionOrigin) {
+        try {
+            sessionBoundary.locked { requireCurrent(origin) }
+        } catch (error: SessionBoundaryChangedException) {
+            throw sessionChanged()
+        }
+    }
+
+    private suspend fun requireDeletionOrigin(
+        expectedOwnerId: String,
+        expectedGeneration: Long,
+    ) {
+        try {
+            sessionBoundary.locked {
+                val current = currentOrigin() ?: throw SessionBoundaryChangedException()
+                if (
+                    current.ownerId != expectedOwnerId ||
+                    current.generation != expectedGeneration
+                ) {
+                    throw SessionBoundaryChangedException()
+                }
+            }
+        } catch (error: SessionBoundaryChangedException) {
+            throw sessionChanged()
+        }
+    }
+
+    private suspend fun finishAcceptedDeletion(
+        origin: SessionOrigin,
+    ): AccountDeletionAcceptance = finishAcceptedDeletion(
+        expectedOwnerId = origin.ownerId,
+        expectedOrigin = origin,
+    )
+
+    private suspend fun finishAcceptedDeletion(
+        expectedOwnerId: String,
+        expectedOrigin: SessionOrigin?,
+    ): AccountDeletionAcceptance {
+        val auth = requireSupabase().auth
+        var localAuthFailure: Exception? = null
+        var remoteFailure: Exception? = null
+        var refusalMessage: String? = null
+        return try {
+            val localDataCleared = withContext(NonCancellable) {
+                sessionBoundary.locked {
+                    expectedOrigin?.let(::requireCurrent)
+                    val acceptedReceipt = expectedOrigin?.let {
+                        acceptedDeletionReceipts.current(
+                            ownerId = it.ownerId,
+                            acceptanceGeneration = it.generation,
+                            presentationGeneration = generation(),
+                        )
+                    } ?: acceptedDeletionReceipts.currentForPresentation(
+                        ownerId = expectedOwnerId,
+                        presentationGeneration = generation(),
+                    )
+                    if (acceptedReceipt == null) {
+                        refusalMessage =
+                            "이 계정의 삭제 접수 증거를 확인하지 못해 기기 자료를 지우지 않았어요."
+                        return@locked false
+                    }
+                    val currentOwnerId = currentOrigin()?.ownerId
+                    val persistedOwnerId = try {
+                        localDataOwner()
+                    } catch (error: Exception) {
+                        if (acceptedDeletionCleanup.wasSuccessfullyPurged(expectedOwnerId)) {
+                            clearAuthenticationForAcceptedDeletion(
+                                auth = auth,
+                                expectedOwnerId = expectedOwnerId,
+                                currentOwnerId = currentOwnerId,
+                                onLocalFailure = { localAuthFailure = it },
+                                onRemoteFailure = { remoteFailure = it },
+                            )
+                            acceptedDeletionReceipts.recordLocalCleanup(
+                                expectedOwnerId,
+                                generation(),
+                                localAuthenticationCleared = localAuthFailure == null,
+                            )
+                            return@locked localAuthFailure == null
+                        }
+                        refusalMessage = "기기 자료의 소유 계정을 확인하지 못했어요. 다른 계정 자료는 지우지 않았어요."
+                        return@locked false
+                    }
+                    when (
+                        acceptedDeletionCleanup.action(
+                            expectedOwnerId = expectedOwnerId,
+                            sessionOwnerId = currentOwnerId,
+                            localDataOwnerId = persistedOwnerId,
+                        )
+                    ) {
+                        AcceptedDeletionCleanupAction.PURGE_EXPECTED_OWNER -> {
+                            try {
+                                acceptedDeletionCleanup.purge(expectedOwnerId) {
+                                    beforeSignOut()
+                                }
+                            } catch (error: Exception) {
+                                refusalMessage =
+                                    "기기 대기 자료를 정리하지 못했어요. 다시 시도해 주세요."
+                                return@locked false
+                            }
+                            clearAuthenticationForAcceptedDeletion(
+                                auth = auth,
+                                expectedOwnerId = expectedOwnerId,
+                                currentOwnerId = currentOwnerId,
+                                onLocalFailure = { localAuthFailure = it },
+                                onRemoteFailure = { remoteFailure = it },
+                            )
+                            acceptedDeletionReceipts.recordLocalCleanup(
+                                expectedOwnerId,
+                                generation(),
+                                localAuthenticationCleared = localAuthFailure == null,
+                            )
+                            true
+                        }
+                        AcceptedDeletionCleanupAction.CLEAR_AUTH_ONLY -> {
+                            clearAuthenticationForAcceptedDeletion(
+                                auth = auth,
+                                expectedOwnerId = expectedOwnerId,
+                                currentOwnerId = currentOwnerId,
+                                onLocalFailure = { localAuthFailure = it },
+                                onRemoteFailure = { remoteFailure = it },
+                            )
+                            acceptedDeletionReceipts.recordLocalCleanup(
+                                expectedOwnerId,
+                                generation(),
+                                localAuthenticationCleared = localAuthFailure == null,
+                            )
+                            localAuthFailure == null
+                        }
+                        AcceptedDeletionCleanupAction.ALREADY_ABSENT -> {
+                            acceptedDeletionReceipts.recordLocalCleanup(
+                                expectedOwnerId,
+                                generation(),
+                                localAuthenticationCleared = true,
+                            )
+                            true
+                        }
+                        AcceptedDeletionCleanupAction.REFUSE_OWNER_MISMATCH -> {
+                            refusalMessage =
+                                "기기 자료의 소유 계정이 달라 다른 계정 자료는 지우지 않았어요."
+                            false
+                        }
+                    }
+                }
+            }
+            if (!localDataCleared) {
+                return AccountDeletionAcceptance(
+                    localDataCleared = false,
+                    message = refusalMessage,
+                )
+            }
+            localAuthFailure?.let { error ->
+                return AccountDeletionAcceptance(
+                    localDataCleared = false,
+                    message = "기기 자료는 지웠지만 로그인 정보를 완전히 지우지 못했어요. 다시 시도해 주세요.",
+                )
+            }
+            AccountDeletionAcceptance(
+                localDataCleared = true,
+                message = remoteFailure?.let {
+                    "기기 자료와 로그인 정보는 지웠지만 서버 또는 Google 로그아웃을 확인하지 못했어요."
+                },
+            )
+        } catch (error: SessionBoundaryChangedException) {
+            AccountDeletionAcceptance(
+                localDataCleared = false,
+                message = "로그인 계정이 변경되어 다른 계정 자료는 지우지 않았어요.",
+            )
+        }
+    }
+
+    private suspend fun SessionBoundary.clearAuthenticationForAcceptedDeletion(
+        auth: Auth,
+        expectedOwnerId: String,
+        currentOwnerId: String?,
+        onLocalFailure: (Exception) -> Unit,
+        onRemoteFailure: (Exception) -> Unit,
+    ) {
+        if (currentOwnerId != null && currentOwnerId != expectedOwnerId) return
+        try {
+            auth.signOut()
+        } catch (error: Exception) {
+            onRemoteFailure(error)
+        }
+        var localFailure: Exception? = null
+        try {
+            auth.clearSession()
+        } catch (error: Exception) {
+            localFailure = error
+            onLocalFailure(error)
+        }
+        if (localFailure == null && currentOrigin()?.ownerId == expectedOwnerId) {
+            clearCurrent()
+        }
+        try {
+            credentialManager.clearCredentialState(ClearCredentialStateRequest())
+        } catch (error: Exception) {
+            onRemoteFailure(error)
+        }
+    }
+
     private suspend fun authorizedRequest(
         expectedOwnerId: String? = null,
+        expectedGeneration: Long? = null,
         request: suspend (accessToken: String) -> RawResponse,
     ): BoundResponse {
         val auth = requireSupabase().auth
-        val initialCredential = captureCredential(auth, expectedOwnerId)
+        val initialCredential = captureCredential(auth, expectedOwnerId, expectedGeneration)
         var response = performRequest(initialCredential, request)
         if (response.status != HttpStatusCode.Unauthorized) {
             return BoundResponse(initialCredential.origin, response)
@@ -524,7 +1049,7 @@ class AccountClient(
                     }
                     val currentOwnerId = status.session.user?.id ?: throw invalidSdkSession()
                     if (currentOwnerId != retryCredential.origin.ownerId) {
-                        commitLogin(currentOwnerId)
+                        commitIdentity(currentOwnerId)
                         throw sessionChanged()
                     }
                     if (status.session.accessToken != retryCredential.accessToken) {
@@ -557,6 +1082,51 @@ class AccountClient(
         throw sessionChanged()
     }
 
+    private suspend fun acceptAccountAccessResponse(
+        response: BoundResponse,
+        accept: (RawResponse, SessionOrigin) -> AccountAccess,
+    ): AccountAccess = try {
+        sessionBoundary.locked {
+            requireCurrent(response.origin)
+            accept(response.raw, response.origin)
+        }
+    } catch (error: SessionBoundaryChangedException) {
+        throw sessionChanged()
+    }
+
+    private suspend fun acceptDeletionResponse(response: BoundResponse) {
+        try {
+            sessionBoundary.locked {
+                requireCurrent(response.origin)
+                parseDeletionAcceptance(response.raw)
+                acceptedDeletionReceipts.recordServerAcceptance(response.origin)
+            }
+        } catch (error: SessionBoundaryChangedException) {
+            throw sessionChanged()
+        }
+    }
+
+    private suspend fun acceptedDeletionAccessAfterSessionRace(
+        expectedOrigin: SessionOrigin,
+        error: AccountClientException,
+    ): AccountAccess? = sessionBoundary.locked {
+        resolveAcceptedDeletionSessionRace(
+            expectedOrigin = expectedOrigin,
+            error = error,
+            receipt = acceptedDeletionReceipts.current(
+                ownerId = expectedOrigin.ownerId,
+                acceptanceGeneration = expectedOrigin.generation,
+                presentationGeneration = generation(),
+            ),
+        )
+    }
+
+    private suspend fun acceptedDeletionAccessForCurrentPresentation(): AccountAccess.Deleting? =
+        sessionBoundary.locked {
+            acceptedDeletionReceipts.currentForPresentation(generation())
+                ?.let { AccountAccess.Deleting(it) }
+        }
+
     private suspend fun performRequest(
         credential: BoundCredential,
         request: suspend (accessToken: String) -> RawResponse,
@@ -584,10 +1154,17 @@ class AccountClient(
         )
     }
 
-    private suspend fun captureCredential(auth: Auth, expectedOwnerId: String?): BoundCredential = try {
+    private suspend fun captureCredential(
+        auth: Auth,
+        expectedOwnerId: String?,
+        expectedGeneration: Long?,
+    ): BoundCredential = try {
         sessionBoundary.locked {
             val origin = currentOrigin() ?: throw AccountAuthenticationRequiredException()
             if (expectedOwnerId != null && origin.ownerId != expectedOwnerId) throw sessionChanged()
+            if (expectedGeneration != null && origin.generation != expectedGeneration) {
+                throw sessionChanged()
+            }
             when (val status = auth.sessionStatus.value) {
                 is SessionStatus.Authenticated -> {
                     val ownerId = status.session.user?.id ?: throw invalidSdkSession()
@@ -689,8 +1266,26 @@ class AccountClient(
         throw sessionChanged()
     }
 
+    private fun SessionBoundary.commitIdentity(ownerId: String): SessionOrigin {
+        val origin = commitLogin(ownerId)
+        acceptedDeletionReceipts.invalidateForNewIdentity(origin)
+        return origin
+    }
+
+    private fun SessionBoundary.beginRestoreIdentity(ownerId: String): SessionOrigin {
+        val previous = currentOrigin()
+        val origin = beginRestore(ownerId)
+        if (previous != origin) {
+            acceptedDeletionReceipts.invalidateForNewIdentity(origin)
+        }
+        return origin
+    }
+
     private suspend fun SessionBoundary.prepareLocalOwner(ownerId: String) {
-        if (currentOrigin()?.ownerId?.let { it != ownerId } == true) clearCurrent()
+        acceptedDeletionReceipts.invalidateForOwner(ownerId)
+        if (currentOrigin()?.ownerId?.let { it != ownerId } == true) {
+            clearCurrent()
+        }
         try {
             onSessionOwner(ownerId)
         } catch (error: CancellationException) {
@@ -725,7 +1320,7 @@ class AccountClient(
             throw invalidSdkSession()
         }
         prepareLocalOwner(storedOwnerId)
-        val origin = beginRestore(storedOwnerId)
+        val origin = beginRestoreIdentity(storedOwnerId)
         try {
             withTimeout(AUTH_SESSION_OPERATION_TIMEOUT_MILLIS) {
                 auth.importSession(storedSession, autoRefresh = false)
@@ -776,8 +1371,8 @@ class AccountClient(
         }
     }
 
-    private fun parseBootstrap(response: RawResponse): AccountAccess {
-        if (!response.status.isSuccess()) return parseApiError(response)
+    private fun parseBootstrap(response: RawResponse, origin: SessionOrigin): AccountAccess {
+        if (!response.status.isSuccess()) return parseApiError(response, origin)
         val body = decodeOrThrow<BootstrapResponse>(response.body)
         return accountAccess(
             state = body.profile.state,
@@ -786,11 +1381,12 @@ class AccountClient(
                 limits = body.limits.toAccountLimits(),
                 usage = body.usage.toAccountUsage(),
             ),
+            origin = origin,
         )
     }
 
-    private fun parseMe(response: RawResponse): AccountAccess {
-        if (!response.status.isSuccess()) return parseApiError(response)
+    private fun parseMe(response: RawResponse, origin: SessionOrigin): AccountAccess {
+        if (!response.status.isSuccess()) return parseApiError(response, origin)
         val body = decodeOrThrow<MeResponse>(response.body)
         return accountAccess(
             state = body.state,
@@ -803,16 +1399,17 @@ class AccountClient(
             } else {
                 null
             },
+            origin = origin,
         )
     }
 
-    private fun parseApiError(response: RawResponse): AccountAccess {
+    private fun parseApiError(response: RawResponse, origin: SessionOrigin): AccountAccess {
         val envelope = decodeApiError(response.body)
         return when {
             response.status == HttpStatusCode.Forbidden &&
                 envelope?.error?.code == BETA_ACCESS_REQUIRED -> AccountAccess.PendingApproval
             response.status == HttpStatusCode.Forbidden &&
-                envelope?.error?.code == ACCOUNT_DELETING -> AccountAccess.Deleting
+                envelope?.error?.code == ACCOUNT_DELETING -> deletingAccess(origin)
             else -> throw apiException(response, envelope)
         }
     }
@@ -850,20 +1447,35 @@ class AccountClient(
             (error.statusCode == "409" && error.error == "Duplicate")
     }
 
-    private fun validateJsonObject(body: String) {
-        try {
+    private fun requireExactJsonKeys(
+        body: String,
+        expectedKeys: Set<String>,
+        code: String,
+    ) {
+        val objectBody = try {
             json.decodeFromString<JsonObject>(body)
         } catch (error: Exception) {
             throw AccountClientException(
-                message = "요청 본문은 JSON 객체여야 해요.",
-                retryable = false,
-                code = INVALID_REQUEST_BODY,
+                message = "서버 응답을 읽지 못했어요. 잠시 후 다시 시도해 주세요.",
+                retryable = true,
+                code = code,
                 cause = error,
+            )
+        }
+        if (objectBody.keys != expectedKeys) {
+            throw AccountClientException(
+                message = "서버 응답 형식이 올바르지 않아요. 잠시 후 다시 시도해 주세요.",
+                retryable = true,
+                code = code,
             )
         }
     }
 
-    private fun accountAccess(state: String, summary: AccountSummary?): AccountAccess = when (state) {
+    private fun accountAccess(
+        state: String,
+        summary: AccountSummary?,
+        origin: SessionOrigin,
+    ): AccountAccess = when (state) {
         PROFILE_ACTIVE -> AccountAccess.Active(
             summary ?: throw AccountClientException(
                 message = "계정 응답에 사용량 정보가 없어요.",
@@ -871,11 +1483,23 @@ class AccountClient(
             ),
         )
         PROFILE_PENDING -> AccountAccess.PendingApproval
-        PROFILE_DELETING -> AccountAccess.Deleting
+        PROFILE_DELETING -> deletingAccess(origin)
         else -> throw AccountClientException(
             message = "서버에서 알 수 없는 계정 상태를 받았어요.",
             retryable = false,
         )
+    }
+
+    private fun deletingAccess(origin: SessionOrigin): AccountAccess.Deleting {
+        acceptedDeletionReceipts.recordServerAcceptance(origin)
+        val receipt = requireNotNull(
+            acceptedDeletionReceipts.current(
+                ownerId = origin.ownerId,
+                acceptanceGeneration = origin.generation,
+                presentationGeneration = sessionBoundary.generation(),
+            ),
+        )
+        return AccountAccess.Deleting(receipt)
     }
 
     private inline fun <reified T> decodeOrThrow(body: String): T = try {
@@ -915,7 +1539,9 @@ class AccountClient(
         const val BETA_ACCESS_REQUIRED = "BETA_ACCESS_REQUIRED"
         const val ACCOUNT_DELETING = "ACCOUNT_DELETING"
         const val INVALID_REQUEST_ID = "INVALID_REQUEST_ID"
-        const val INVALID_REQUEST_BODY = "INVALID_REQUEST_BODY"
+        const val DELETE_CHALLENGE_EXPIRED = "DELETE_CHALLENGE_EXPIRED"
+        const val LOCAL_DATA_CLEAR_FAILED = "LOCAL_DATA_CLEAR_FAILED"
+        const val SESSION_CHANGED = "SESSION_CHANGED"
         const val ASSET_OBJECT_EXISTS = "ASSET_OBJECT_EXISTS"
         const val ASSET_MIME_MISMATCH = "ASSET_MIME_MISMATCH"
         const val PROFILE_ACTIVE = "active"
@@ -927,13 +1553,159 @@ class AccountClient(
         const val AUTH_SESSION_OPERATION_TIMEOUT_MILLIS = 16_000L
         const val API_REQUEST_TIMEOUT_MILLIS = 15_000L
         const val API_CONNECT_TIMEOUT_MILLIS = 10_000L
+        const val ACCOUNT_DELETE_ATTEMPTS = 2
+        const val MAX_DELETE_NONCE_LENGTH = 1024
     }
 }
 
 sealed interface AccountAccess {
     data class Active(val summary: AccountSummary) : AccountAccess
     data object PendingApproval : AccountAccess
-    data object Deleting : AccountAccess
+    data class Deleting(val receipt: AccountDeletionReceipt) : AccountAccess
+}
+
+data class AccountDeletionAcceptance(
+    val localDataCleared: Boolean,
+    val message: String? = null,
+)
+
+data class AccountDeletionReceipt(
+    val ownerId: String,
+    val acceptanceGeneration: Long,
+    val presentationGeneration: Long,
+    val localDataCleared: Boolean,
+)
+
+internal class AcceptedDeletionReceiptStore {
+    private var receipt: AccountDeletionReceipt? = null
+
+    fun recordServerAcceptance(origin: SessionOrigin) {
+        val current = receipt
+        receipt = if (
+            current?.ownerId == origin.ownerId &&
+            current.acceptanceGeneration == origin.generation
+        ) {
+            current.copy(presentationGeneration = origin.generation)
+        } else {
+            AccountDeletionReceipt(
+                ownerId = origin.ownerId,
+                acceptanceGeneration = origin.generation,
+                presentationGeneration = origin.generation,
+                localDataCleared = false,
+            )
+        }
+    }
+
+    fun recordLocalCleanup(
+        ownerId: String,
+        presentationGeneration: Long,
+        localAuthenticationCleared: Boolean,
+    ) {
+        val current = receipt ?: return
+        if (current.ownerId == ownerId) {
+            receipt = current.copy(
+                presentationGeneration = presentationGeneration,
+                localDataCleared = localAuthenticationCleared,
+            )
+        }
+    }
+
+    fun current(
+        ownerId: String,
+        acceptanceGeneration: Long,
+        presentationGeneration: Long,
+    ): AccountDeletionReceipt? = receipt?.takeIf {
+        it.ownerId == ownerId &&
+            it.acceptanceGeneration == acceptanceGeneration &&
+            it.presentationGeneration == presentationGeneration
+    }
+
+    fun currentForPresentation(
+        ownerId: String,
+        presentationGeneration: Long,
+    ): AccountDeletionReceipt? = receipt?.takeIf {
+        it.ownerId == ownerId && it.presentationGeneration == presentationGeneration
+    }
+
+    fun currentForPresentation(presentationGeneration: Long): AccountDeletionReceipt? =
+        receipt?.takeIf { it.presentationGeneration == presentationGeneration }
+
+    fun invalidateForNewIdentity(origin: SessionOrigin) {
+        if (
+            receipt?.let {
+                it.ownerId != origin.ownerId ||
+                    it.presentationGeneration != origin.generation
+            } == true
+        ) {
+            receipt = null
+        }
+    }
+
+    fun invalidateForOwner(ownerId: String) {
+        if (receipt?.ownerId?.let { it != ownerId } == true) {
+            receipt = null
+        }
+    }
+}
+
+internal fun resolveAcceptedDeletionSessionRace(
+    expectedOrigin: SessionOrigin,
+    error: AccountClientException,
+    receipt: AccountDeletionReceipt?,
+): AccountAccess? {
+    if (error !is AccountAuthenticationRequiredException && error.code != "SESSION_CHANGED") {
+        return null
+    }
+    val current = receipt ?: return null
+    if (
+        current.ownerId != expectedOrigin.ownerId ||
+        current.acceptanceGeneration != expectedOrigin.generation
+    ) {
+        return null
+    }
+    return AccountAccess.Deleting(current)
+}
+
+internal enum class AcceptedDeletionCleanupAction {
+    PURGE_EXPECTED_OWNER,
+    CLEAR_AUTH_ONLY,
+    ALREADY_ABSENT,
+    REFUSE_OWNER_MISMATCH,
+}
+
+internal class AcceptedDeletionCleanupTracker {
+    private val successfullyPurgedOwners = mutableSetOf<String>()
+
+    fun action(
+        expectedOwnerId: String,
+        sessionOwnerId: String?,
+        localDataOwnerId: String?,
+    ): AcceptedDeletionCleanupAction {
+        if (sessionOwnerId != null && sessionOwnerId != expectedOwnerId) {
+            return if (localDataOwnerId == expectedOwnerId) {
+                AcceptedDeletionCleanupAction.REFUSE_OWNER_MISMATCH
+            } else {
+                AcceptedDeletionCleanupAction.ALREADY_ABSENT
+            }
+        }
+        return when (localDataOwnerId) {
+            expectedOwnerId -> AcceptedDeletionCleanupAction.PURGE_EXPECTED_OWNER
+            null -> AcceptedDeletionCleanupAction.CLEAR_AUTH_ONLY
+            else -> if (sessionOwnerId == expectedOwnerId) {
+                AcceptedDeletionCleanupAction.REFUSE_OWNER_MISMATCH
+            } else {
+                AcceptedDeletionCleanupAction.ALREADY_ABSENT
+            }
+        }
+    }
+
+    suspend fun purge(ownerId: String, action: suspend () -> Unit) {
+        action()
+        successfullyPurgedOwners += ownerId
+    }
+
+    fun wasSuccessfullyPurged(ownerId: String): Boolean =
+        ownerId in successfullyPurgedOwners
 }
 
 data class AccountSummary(
@@ -975,6 +1747,47 @@ internal class AccountSignInCancelledException(
     cause: Throwable,
 ) : Exception("로그인이 취소됐어요.", cause)
 
+internal class AccountDeletionReauthenticationCancelledException(
+    cause: Throwable,
+) : Exception("계정 삭제 재인증이 취소됐어요.", cause)
+
+internal class AccountDeletionStatusUnknownException(
+    val expectedOwnerId: String,
+    val expectedGeneration: Long,
+    cause: Throwable?,
+) : AccountClientException(
+    message = "삭제 요청 결과를 확인하지 못했어요. 새 삭제 요청을 보내지 말고 계정 상태를 확인해 주세요.",
+    retryable = true,
+    code = "ACCOUNT_DELETE_STATUS_UNKNOWN",
+    cause = cause,
+)
+
+internal fun accountDeletionResultIsUnknown(
+    deleteRequestMayHaveReachedServer: Boolean,
+    error: AccountClientException,
+): Boolean = deleteRequestMayHaveReachedServer &&
+    (error is AccountAuthenticationRequiredException || error.code == "SESSION_CHANGED")
+
+internal suspend fun guardAmbiguousAccountDeletionRetry(
+    expectedOwnerId: String,
+    expectedGeneration: Long,
+    ambiguousFailure: AccountClientException,
+    validateRetry: suspend () -> Unit,
+) {
+    try {
+        validateRetry()
+    } catch (validationError: AccountClientException) {
+        if (validationError !== ambiguousFailure) {
+            validationError.addSuppressed(ambiguousFailure)
+        }
+        throw AccountDeletionStatusUnknownException(
+            expectedOwnerId = expectedOwnerId,
+            expectedGeneration = expectedGeneration,
+            cause = validationError,
+        )
+    }
+}
+
 private fun refreshUnavailable(cause: Throwable? = null) = AccountClientException(
     message = "로그인 세션을 새로 고치지 못했어요. 네트워크 연결을 확인하고 다시 시도해 주세요.",
     retryable = true,
@@ -986,6 +1799,16 @@ private fun sessionChanged() = AccountClientException(
     message = "로그인 계정이 변경되어 요청을 중단했어요.",
     retryable = false,
     code = "SESSION_CHANGED",
+)
+
+private fun invalidDeletionResponse(
+    message: String,
+    cause: Throwable? = null,
+) = AccountClientException(
+    message = message,
+    retryable = true,
+    code = "INVALID_ACCOUNT_DELETE_RESPONSE",
+    cause = cause,
 )
 
 private fun invalidSdkSession() = AccountClientException(
@@ -1130,27 +1953,45 @@ private fun validateLibraryQuery(rawPath: String, rawQuery: String?) {
 }
 
 internal fun validateLibraryRouteMethod(path: String, method: HttpMethod) {
-    val rawPath = try {
-        URI(path).rawPath
+    val uri = try {
+        URI(path)
     } catch (error: Exception) {
         throw invalidLibraryPath(error)
     }
+    val rawPath = uri.rawPath
     val parts = rawPath?.split('/')?.drop(1) ?: throw invalidLibraryPath()
-    val requiredMethod = when {
-        parts.size == 3 && parts[0] == "items" && parts[2] == "retry-metadata" ->
-            HttpMethod.Post
-        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" &&
-            parts[3] == "reserve" -> HttpMethod.Post
-        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" -> HttpMethod.Delete
-        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
-            parts[4] == "complete" -> HttpMethod.Post
-        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
-            parts[4] == "ocr" -> HttpMethod.Patch
-        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
-            parts[4] == "content" -> HttpMethod.Get
-        else -> return
+    if (method != HttpMethod.Get && uri.rawQuery != null) {
+        throw AccountClientException(
+            message = "이 보관함 경로에서 지원하지 않는 요청 방식이에요.",
+            retryable = false,
+            code = "INVALID_METHOD",
+        )
     }
-    if (method != requiredMethod) {
+    val allowedMethods = when {
+        rawPath == "/items" -> setOf(HttpMethod.Get, HttpMethod.Post)
+        rawPath == "/categories" -> setOf(HttpMethod.Get, HttpMethod.Post)
+        parts.size == 2 && parts[0] == "items" ->
+            setOf(HttpMethod.Get, HttpMethod.Patch, HttpMethod.Delete)
+        parts.size == 2 && parts[0] == "categories" ->
+            setOf(HttpMethod.Patch, HttpMethod.Delete)
+        parts.size == 3 && parts[0] == "items" && parts[2] == "retry-metadata" ->
+            setOf(HttpMethod.Post)
+        parts.size == 3 && parts[0] == "items" &&
+            (parts[2] == "reclassify" || parts[2] == "cue-dismiss") ->
+            setOf(HttpMethod.Post)
+        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[3] == "reserve" -> setOf(HttpMethod.Post)
+        parts.size == 4 && parts[0] == "items" && parts[2] == "assets" ->
+            setOf(HttpMethod.Delete)
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "complete" -> setOf(HttpMethod.Post)
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "ocr" -> setOf(HttpMethod.Patch)
+        parts.size == 5 && parts[0] == "items" && parts[2] == "assets" &&
+            parts[4] == "content" -> setOf(HttpMethod.Get)
+        else -> emptySet()
+    }
+    if (method !in allowedMethods) {
         throw AccountClientException(
             message = "이 보관함 경로에서 지원하지 않는 요청 방식이에요.",
             retryable = false,
@@ -1158,6 +1999,90 @@ internal fun validateLibraryRouteMethod(path: String, method: HttpMethod) {
         )
     }
 }
+
+internal fun validateLibraryRequestBody(
+    path: String,
+    method: HttpMethod,
+    body: String?,
+) {
+    val objectBody = body?.let {
+        try {
+            Json.decodeFromString<JsonObject>(it)
+        } catch (error: Exception) {
+            throw AccountClientException(
+                message = "요청 본문은 JSON 객체여야 해요.",
+                retryable = false,
+                code = "INVALID_REQUEST_BODY",
+                cause = error,
+            )
+        }
+    }
+    if (!isItemDeleteRoute(path, method)) return
+    if (objectBody?.keys != setOf("expected_version")) throw invalidItemDeleteBody()
+    val version = objectBody["expected_version"] as? JsonPrimitive
+    if (
+        version == null ||
+        version.isString ||
+        version.longOrNull == null ||
+        version.longOrNull !in 1..Int.MAX_VALUE.toLong()
+    ) {
+        throw invalidItemDeleteBody()
+    }
+}
+
+internal fun validateItemDeleteResponse(
+    path: String,
+    status: HttpStatusCode,
+    body: String,
+): JsonObject {
+    if (!isItemDeleteRoute(path, HttpMethod.Delete) || status != HttpStatusCode.Accepted) {
+        throw invalidItemDeleteResponse()
+    }
+    val response = try {
+        Json.decodeFromString<JsonObject>(body)
+    } catch (error: Exception) {
+        throw invalidItemDeleteResponse(error)
+    }
+    if (response.keys != setOf("item_id", "state")) throw invalidItemDeleteResponse()
+    val expectedItemId = URI(path).rawPath.substringAfterLast('/')
+    val itemId = (response["item_id"] as? JsonPrimitive)?.contentOrNull
+    val state = (response["state"] as? JsonPrimitive)?.contentOrNull
+    if (
+        itemId == null ||
+        !itemId.isCanonicalUuid() ||
+        !itemId.equals(expectedItemId, ignoreCase = true) ||
+        state != "deleting"
+    ) {
+        throw invalidItemDeleteResponse()
+    }
+    return response
+}
+
+private fun isItemDeleteRoute(path: String, method: HttpMethod): Boolean {
+    if (method != HttpMethod.Delete) return false
+    val rawPath = try {
+        val uri = URI(path)
+        if (uri.rawQuery != null) return false
+        uri.rawPath
+    } catch (_: Exception) {
+        return false
+    }
+    val parts = rawPath?.split('/')?.drop(1) ?: return false
+    return parts.size == 2 && parts[0] == "items" && parts[1].isCanonicalUuid()
+}
+
+private fun invalidItemDeleteBody() = AccountClientException(
+    message = "항목 삭제에는 현재 버전 하나만 필요해요.",
+    retryable = false,
+    code = "INVALID_REQUEST_BODY",
+)
+
+private fun invalidItemDeleteResponse(cause: Throwable? = null) = AccountClientException(
+    message = "서버가 올바른 항목 삭제 접수 결과를 반환하지 않았어요.",
+    retryable = true,
+    code = "INVALID_ITEM_DELETE_RESPONSE",
+    cause = cause,
+)
 
 private fun parseLibraryMethod(method: String): HttpMethod = when (method.trim().uppercase()) {
     "GET" -> HttpMethod.Get
@@ -1378,6 +2303,30 @@ private data class MeResponse(
     val id: String? = null,
     val limits: LimitsResponse? = null,
     val usage: UsageResponse? = null,
+)
+
+private data class DeletionChallenge(
+    val challengeId: String,
+    val nonce: String,
+    val expiresAt: Instant,
+)
+
+@Serializable
+private data class DeleteChallengeResponse(
+    @SerialName("challenge_id") val challengeId: String,
+    val nonce: String,
+    @SerialName("expires_at") val expiresAt: String,
+)
+
+@Serializable
+private data class AccountDeletionRequest(
+    @SerialName("challenge_id") val challengeId: String,
+    @SerialName("google_id_token") val googleIdToken: String,
+)
+
+@Serializable
+private data class DeleteAccountResponse(
+    val state: String,
 )
 
 @Serializable

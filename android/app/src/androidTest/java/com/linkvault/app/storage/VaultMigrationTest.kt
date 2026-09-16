@@ -1,11 +1,17 @@
 package com.linkvault.app.storage
 
+import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import java.util.UUID
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -218,6 +224,201 @@ class VaultMigrationTest {
         }
     }
 
+    @Test
+    fun migration3To4PersistsDeletionFenceAndBlocksOldAndNewLateCacheRows() = runBlocking {
+        val databaseName = "vault-deletion-migration-${UUID.randomUUID()}.db"
+        helper.createDatabase(databaseName, 3).apply {
+            execSQL(
+                """
+                INSERT INTO outbox (
+                    request_id, owner_id, method, path, payload_json, state,
+                    attempt_count, created_at, expires_at, next_attempt_at,
+                    result_json, error_code, error_message, lease_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    DELETE_REQUEST_ID,
+                    OWNER_A,
+                    "DELETE",
+                    "/items/$ITEM_ID",
+                    "{}",
+                    "running",
+                    1,
+                    1_000L,
+                    90_000L,
+                    1_000L,
+                    null,
+                    null,
+                    null,
+                    10_000L,
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO outbox (
+                    request_id, owner_id, method, path, payload_json, state,
+                    attempt_count, created_at, expires_at, next_attempt_at,
+                    result_json, error_code, error_message, lease_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    ITEM_MUTATION_REQUEST_ID,
+                    OWNER_A,
+                    "POST",
+                    "/items/$ITEM_ID/assets/reserve",
+                    "{}",
+                    "retry",
+                    1,
+                    1_100L,
+                    90_000L,
+                    2_000L,
+                    null,
+                    null,
+                    null,
+                    null,
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO cached_items (
+                    owner_id, item_id, response_json, server_version,
+                    server_created_at, fetched_at, is_detail
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    OWNER_A,
+                    ITEM_ID,
+                    "{\"id\":\"$ITEM_ID\",\"version\":7}",
+                    7L,
+                    "2026-09-16T00:00:00Z",
+                    2_000L,
+                    1,
+                ),
+            )
+            close()
+        }
+
+        helper.runMigrationsAndValidate(
+            databaseName,
+            4,
+            true,
+            MIGRATION_3_4,
+        ).apply {
+            query("SELECT response_json FROM cached_items").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("{\"id\":\"$ITEM_ID\",\"version\":7}", cursor.getString(0))
+            }
+            query("SELECT COUNT(*) FROM item_deletion_tombstones").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(0, cursor.getInt(0))
+            }
+            close()
+        }
+
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        var reopened = Room.databaseBuilder(context, VaultDatabase::class.java, databaseName)
+            .addMigrations(MIGRATION_3_4)
+            .build()
+        try {
+            assertTrue(
+                reopened.markItemDeleted(
+                    ownerId = OWNER_A,
+                    itemId = ITEM_ID,
+                    observedDeletedAt = 5_000L,
+                    preservedRequestId = DELETE_REQUEST_ID,
+                ),
+            )
+            assertNull(reopened.cachedItemDao().readDetail(OWNER_A, ITEM_ID))
+            assertNull(reopened.outboxDao().findByRequestId(ITEM_MUTATION_REQUEST_ID))
+            assertTrue(reopened.outboxDao().findByRequestId(DELETE_REQUEST_ID) != null)
+        } finally {
+            reopened.close()
+        }
+
+        reopened = Room.databaseBuilder(context, VaultDatabase::class.java, databaseName)
+            .addMigrations(MIGRATION_3_4)
+            .build()
+        try {
+            assertTrue(reopened.isItemDeleted(OWNER_A, ITEM_ID))
+            val cache = reopened.cachedItemDao()
+            cache.upsert(cachedItem(OWNER_A, ITEM_ID, version = 1L, isDetail = true))
+            cache.upsert(cachedItem(OWNER_A, ITEM_ID, version = 999L, isDetail = true))
+            assertNull(cache.readDetail(OWNER_A, ITEM_ID))
+
+            cache.cacheList(
+                ownerId = OWNER_A,
+                items = listOf(
+                    cachedItem(OWNER_A, ITEM_ID, version = 999L, isDetail = false),
+                    cachedItem(OWNER_A, OTHER_ITEM_ID, version = 1L, isDetail = false),
+                ),
+                replace = true,
+            )
+            assertEquals(
+                listOf(OTHER_ITEM_ID),
+                cache.observeList(OWNER_A).first().map(CachedItem::itemId),
+            )
+            assertTrue(reopened.isItemDeleted(OWNER_A, ITEM_ID))
+            reopened.openHelper.writableDatabase.query(
+                """
+                SELECT COUNT(*) FROM cached_items
+                WHERE owner_id = '$OWNER_A' AND item_id = '$ITEM_ID'
+                """.trimIndent(),
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(0, cursor.getInt(0))
+            }
+
+            cache.upsert(cachedItem(OWNER_B, ITEM_ID, version = 1L, isDetail = true))
+            assertEquals(ITEM_ID, cache.readDetail(OWNER_B, ITEM_ID)?.itemId)
+
+            assertFalse(
+                reopened.markItemDeleted(
+                    ownerId = OWNER_A,
+                    itemId = ITEM_ID,
+                    observedDeletedAt = 4_000L,
+                    preservedRequestId = UUID.randomUUID().toString(),
+                ),
+            )
+            reopened.openHelper.writableDatabase.query(
+                """
+                SELECT observed_deleted_at FROM item_deletion_tombstones
+                WHERE owner_id = '$OWNER_A' AND item_id = '$ITEM_ID'
+                """.trimIndent(),
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(5_000L, cursor.getLong(0))
+            }
+
+            reopened.markItemDeleted(
+                ownerId = OWNER_B,
+                itemId = ITEM_ID,
+                observedDeletedAt = 6_000L,
+                preservedRequestId = UUID.randomUUID().toString(),
+            )
+            reopened.clearOwner(OWNER_A)
+            assertFalse(reopened.isItemDeleted(OWNER_A, ITEM_ID))
+            assertTrue(reopened.isItemDeleted(OWNER_B, ITEM_ID))
+        } finally {
+            reopened.close()
+            context.deleteDatabase(databaseName)
+        }
+    }
+
+    private fun cachedItem(
+        ownerId: String,
+        itemId: String,
+        version: Long,
+        isDetail: Boolean,
+    ) = CachedItem(
+        ownerId = ownerId,
+        itemId = itemId,
+        responseJson = "{\"id\":\"$itemId\",\"version\":$version}",
+        serverVersion = version,
+        serverCreatedAt = "2026-09-16T00:00:00Z",
+        fetchedAt = version,
+        isDetail = isDetail,
+    )
+
     private fun SupportSQLiteDatabase.assertIdentityHashSetup(expected: String) {
         query("SELECT identity_hash FROM room_master_table WHERE id = 42").use { cursor ->
             assertTrue(cursor.moveToFirst())
@@ -232,5 +433,10 @@ class VaultMigrationTest {
         const val ITEM_ID = "10000000-0000-4000-8000-000000000001"
         const val SAVED_REQUEST_ID = "40000000-0000-4000-8000-000000000004"
         const val RETRY_REQUEST_ID = "50000000-0000-4000-8000-000000000005"
+        const val OWNER_A = "10000000-0000-4000-8000-000000000010"
+        const val OWNER_B = "10000000-0000-4000-8000-000000000011"
+        const val OTHER_ITEM_ID = "10000000-0000-4000-8000-000000000002"
+        const val DELETE_REQUEST_ID = "40000000-0000-4000-8000-000000000010"
+        const val ITEM_MUTATION_REQUEST_ID = "40000000-0000-4000-8000-000000000011"
     }
 }

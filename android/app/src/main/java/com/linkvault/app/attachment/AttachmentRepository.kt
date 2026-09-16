@@ -122,19 +122,22 @@ class AttachmentRepository(
         var preserveExistingFile = false
         val queued = try {
             withBoundSession(initialSession) {
-                require(destination.length() in 1L..AttachmentPolicy.MAX_BYTES) {
-                    "Prepared attachment changed before it was queued."
-                }
-                val existing = attachments.find(operation)
-                if (existing != null) {
-                    preserveExistingFile = existing.matchesPreparedInput(entry)
-                    check(preserveExistingFile) {
-                        "The attachment operation is already bound to different input."
+                database.withTransaction {
+                    require(destination.length() in 1L..AttachmentPolicy.MAX_BYTES) {
+                        "Prepared attachment changed before it was queued."
                     }
-                    existing
-                } else {
-                    attachments.insertImmutable(entry)
-                    entry
+                    requireItemNotDeleted(owner, item)
+                    val existing = attachments.find(operation)
+                    if (existing != null) {
+                        preserveExistingFile = existing.matchesPreparedInput(entry)
+                        check(preserveExistingFile) {
+                            "The attachment operation is already bound to different input."
+                        }
+                        existing
+                    } else {
+                        attachments.insertImmutable(entry)
+                        entry
+                    }
                 }
             }
         } catch (error: Exception) {
@@ -173,6 +176,30 @@ class AttachmentRepository(
             }
         }
         removed?.let(::deleteQueueFile)
+    }
+
+    suspend fun cancelItem(ownerId: String, itemId: String) {
+        val owner = ownerId.requireCanonicalUuid("Owner ID")
+        val item = itemId.requireCanonicalUuid("Item ID")
+        val session = currentSession(owner)
+        val removed = withBoundSession(session) {
+            database.withTransaction {
+                check(database.isItemDeleted(owner, item)) {
+                    "Attachments can only be cancelled after the item deletion is recorded."
+                }
+                database.deletedItems().cancelItemAttachments(
+                    owner,
+                    item,
+                    System.currentTimeMillis(),
+                )
+                val entries = attachments.findItem(owner, item)
+                attachments.deleteItem(owner, item)
+                entries
+            }
+        }
+        check(removed.all(::deleteQueueFile)) {
+            "Could not remove the deleted item's private attachment files."
+        }
     }
 
     suspend fun confirmLatest(
@@ -237,6 +264,7 @@ class AttachmentRepository(
         try {
             withBoundSession(session) {
                 database.withTransaction {
+                    requireItemNotDeleted(owner, old.itemId)
                     val latestOld = attachments.find(oldOperation)
                     check(
                         latestOld?.ownerId == owner &&
@@ -760,6 +788,16 @@ class AttachmentRepository(
         }
     }
 
+    private suspend fun requireItemNotDeleted(ownerId: String, itemId: String) {
+        if (database.isItemDeleted(ownerId, itemId)) {
+            throw AccountClientException(
+                message = "The item was deleted before the attachment was queued.",
+                retryable = false,
+                code = "ITEM_DELETED",
+            )
+        }
+    }
+
     private fun validateOcr(
         state: AttachmentOcrState,
         text: String?,
@@ -863,12 +901,13 @@ class AttachmentRepository(
         attachments.filesReadyForDeletion(
             ownerId,
             System.currentTimeMillis(),
-        ).forEach(::deleteQueueFile)
+        ).forEach { deleteQueueFile(it) }
     }
 
-    private fun deleteQueueFile(entry: PendingAttachment) {
-        runCatching { resolveQueueFile(entry.localFileName).delete() }
-    }
+    private fun deleteQueueFile(entry: PendingAttachment): Boolean = runCatching {
+        val file = resolveQueueFile(entry.localFileName)
+        file.delete() || !file.exists()
+    }.getOrDefault(false)
 
     private fun queueFile(ownerId: String, operationId: String): File =
         resolveQueueFile(queueRelativeName(ownerId, operationId))

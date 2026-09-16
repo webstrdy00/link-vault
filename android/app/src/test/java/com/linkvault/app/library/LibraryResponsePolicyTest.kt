@@ -1,10 +1,22 @@
 package com.linkvault.app.library
 
+import com.linkvault.app.auth.AccountAuthenticationRequiredException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LibraryResponsePolicyTest {
+    private val owner = "10000000-0000-0000-0000-000000000001"
+    private val item = "20000000-0000-0000-0000-000000000001"
+    private val request = "30000000-0000-0000-0000-000000000001"
+
     @Test
     fun unownedRestoredSavedReceiptIsReconciledWithoutTakingEditorOwnership() {
         assertFalse(
@@ -220,4 +232,186 @@ class LibraryResponsePolicyTest {
             ),
         )
     }
+
+    @Test
+    fun deleteIntentFreezesVersionAndCanonicalRequestIdentity() {
+        val operation = prepareLibraryDelete(
+            ownerId = owner,
+            itemId = item,
+            requestId = request,
+            expectedVersion = 17,
+        )
+
+        assertEquals(owner, operation.ownerId)
+        assertEquals(item, operation.itemId)
+        assertEquals(request, operation.requestId)
+        assertEquals(17L, operation.expectedVersion)
+        assertEquals("""{"expected_version":17}""", operation.body)
+    }
+
+    @Test
+    fun deleteReceiptRequiresExactAcceptedShapeAndMatchingItem() {
+        fun json(value: String) = Json.decodeFromString<JsonObject>(value)
+
+        assertEquals(
+            item,
+            parseLibraryDeleteReceipt(
+                json("""{"item_id":"$item","state":"deleting"}"""),
+                item,
+            ),
+        )
+        for (response in listOf(
+            """{"item_id":"$request","state":"deleting"}""",
+            """{"item_id":"$item","state":"deleted"}""",
+            """{"item_id":"$item","state":"deleting","extra":true}""",
+            """{"item":{"id":"$item"},"state":"deleting"}""",
+        )) {
+            assertTrue(
+                runCatching {
+                    parseLibraryDeleteReceipt(json(response), item)
+                }.isFailure,
+            )
+        }
+    }
+
+    @Test
+    fun localAlreadyDeletedReceiptIsDistinctFromServerAcceptance() {
+        val localReceipt = Json.decodeFromString<JsonObject>(
+            """{"item_id":"$item","state":"already_deleted"}""",
+        )
+
+        assertTrue(
+            runCatching {
+                parseLibraryDeleteReceipt(localReceipt, item)
+            }.isFailure,
+        )
+        assertEquals(
+            StoredLibraryDeleteReceipt(itemId = item, alreadyDeleted = true),
+            parseStoredLibraryDeleteReceipt(localReceipt, item),
+        )
+    }
+
+    @Test
+    fun anotherViewCannotAcknowledgeDeleteBeforeItsLiveOwnerAppliesIt() {
+        val registry = LibraryEditRequestOwnershipRegistry()
+        registry.acquire(owner, request, "deleting-view")
+
+        assertFalse(
+            shouldApplyLibraryDeleteReceipt(
+                receiptRequestId = request,
+                receiptItemId = item,
+                ownedRequestId = "unrelated-edit",
+                ownedItemId = "40000000-0000-0000-0000-000000000001",
+            ),
+        )
+        assertFalse(
+            shouldAcknowledgeLibraryDeleteReceipt(
+                receiptRequestId = request,
+                receiptItemId = item,
+                appliedItemId = item,
+                hasLiveRequestOwner = registry.hasLiveOwner(owner, request),
+            ),
+        )
+
+        registry.release(owner, request, "deleting-view")
+        assertTrue(
+            shouldAcknowledgeLibraryDeleteReceipt(
+                receiptRequestId = request,
+                receiptItemId = item,
+                appliedItemId = item,
+                hasLiveRequestOwner = registry.hasLiveOwner(owner, request),
+            ),
+        )
+    }
+
+    @Test
+    fun tombstoneCommittedDuringFinalCacheReadBlocksLatePrivateBodyPublication() = runBlocking {
+        val cacheReadStarted = CompletableDeferred<Unit>()
+        val resumeCacheRead = CompletableDeferred<Unit>()
+        val reconciledDeletedIds = mutableSetOf<String>()
+        var tombstoneCommitted = false
+        var activeBody: String? = null
+
+        val publication = async {
+            publishLatestLibraryValue(
+                itemId = item,
+                awaitLastSuspension = {
+                    cacheReadStarted.complete(Unit)
+                    resumeCacheRead.await()
+                },
+                isDeletedAfterLastSuspension = { tombstoneCommitted },
+                deletedItemIds = { reconciledDeletedIds },
+                publish = { activeBody = "private body" },
+            )
+        }
+
+        cacheReadStarted.await()
+        tombstoneCommitted = true
+        reconciledDeletedIds += item
+        resumeCacheRead.complete(Unit)
+
+        assertFalse(publication.await())
+        assertNull(activeBody)
+    }
+
+    @Test
+    fun tombstoneCommittedDuringNoChangeDiscardBlocksLatestDetailPublication() = runBlocking {
+        val discardStarted = CompletableDeferred<Unit>()
+        val resumeDiscard = CompletableDeferred<Unit>()
+        val reconciledDeletedIds = mutableSetOf<String>()
+        var tombstoneCommitted = false
+        var activeBody: String? = null
+
+        val publication = async {
+            publishLatestLibraryValue(
+                itemId = item,
+                awaitLastSuspension = {
+                    discardStarted.complete(Unit)
+                    resumeDiscard.await()
+                },
+                isDeletedAfterLastSuspension = { tombstoneCommitted },
+                deletedItemIds = { reconciledDeletedIds },
+                publish = { activeBody = "latest private body" },
+            )
+        }
+
+        discardStarted.await()
+        tombstoneCommitted = true
+        reconciledDeletedIds += item
+        resumeDiscard.complete(Unit)
+
+        assertFalse(publication.await())
+        assertNull(activeBody)
+    }
+
+    @Test
+    fun authorizationLossDuringFinalFenceEscapesToTheOwnerBoundCallerWithoutPublishing() =
+        runBlocking {
+            val lastSuspensionStarted = CompletableDeferred<Unit>()
+            val loseAuthorization = CompletableDeferred<Unit>()
+            var activeBody: String? = null
+
+            val publication = async {
+                runCatching {
+                    publishLatestLibraryValue(
+                        itemId = item,
+                        awaitLastSuspension = {
+                            lastSuspensionStarted.complete(Unit)
+                            loseAuthorization.await()
+                        },
+                        isDeletedAfterLastSuspension = {
+                            throw AccountAuthenticationRequiredException()
+                        },
+                        deletedItemIds = { emptySet() },
+                        publish = { activeBody = "private body" },
+                    )
+                }.exceptionOrNull()
+            }
+
+            lastSuspensionStarted.await()
+            loseAuthorization.complete(Unit)
+
+            assertTrue(publication.await() is AccountAuthenticationRequiredException)
+            assertNull(activeBody)
+        }
 }

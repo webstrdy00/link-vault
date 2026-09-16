@@ -282,6 +282,95 @@ class AttachmentQueueTest {
     }
 
     @Test
+    fun itemDeletionCancelsLeasesAndCleanupDeletesOnlyMatchingQueueFiles() = runBlocking {
+        val now = System.currentTimeMillis()
+        val ownerDirectory = File(context.noBackupFilesDir, "attachment_queue/$OWNER_A")
+        assertTrue(ownerDirectory.mkdirs() || ownerDirectory.isDirectory)
+        val deletedItemFile = File(ownerDirectory, "$OPERATION_A.asset").apply {
+            writeBytes(byteArrayOf(1, 2, 3))
+        }
+        val otherItemFile = File(ownerDirectory, "$OPERATION_B.asset").apply {
+            writeBytes(byteArrayOf(4, 5, 6))
+        }
+        val externalPrivateFile = File(context.filesDir, "attachment-source-${UUID.randomUUID()}").apply {
+            writeBytes(byteArrayOf(7, 8, 9))
+        }
+        val dao = database.attachmentDao()
+        val deletedItem = attachment(createdAt = now)
+        val otherItem = attachment(
+            operationId = OPERATION_B,
+            itemId = ITEM_B,
+            createdAt = now + 1L,
+        )
+        dao.insertImmutable(deletedItem)
+        dao.insertImmutable(otherItem)
+        assertNotNull(
+            dao.claimNext(
+                OWNER_A,
+                deletedItem.sessionGeneration,
+                now,
+                now + 10_000L,
+                LEASE_A,
+            ),
+        )
+
+        assertFalse(
+            database.markItemDeleted(
+                ownerId = OWNER_A,
+                itemId = ITEM_A,
+                observedDeletedAt = now,
+                preservedRequestId = UUID.randomUUID().toString(),
+            ),
+        )
+
+        val cancelled = dao.find(OPERATION_A)
+        assertEquals(AttachmentStage.EXPIRED, cancelled?.stage)
+        assertNull(cancelled?.leaseToken)
+        assertNull(cancelled?.leaseUntil)
+        assertEquals("ITEM_DELETED", cancelled?.errorCode)
+        assertEquals(
+            0,
+            dao.completeReservation(
+                OWNER_A,
+                OPERATION_A,
+                deletedItem.sessionGeneration,
+                LEASE_A,
+                now + 1L,
+                COMPLETE_REQUEST_A,
+                ASSET_A,
+                "$OWNER_A/$ITEM_A/$ASSET_A",
+                now + FIFTEEN_MINUTES,
+            ),
+        )
+        assertEquals(AttachmentStage.RESERVE, dao.find(OPERATION_B)?.stage)
+
+        val client = AccountClient(
+            context = context,
+            url = "",
+            key = "",
+            googleWebClientId = "",
+            debug = true,
+            localDataOwner = { OWNER_A },
+            beforeSignOut = {},
+            onSessionOwner = {},
+        )
+        val repository = AttachmentRepository(
+            context,
+            client,
+            OutboxRepository(context, client, database),
+            database,
+        )
+        repository.cleanup()
+
+        assertFalse(deletedItemFile.exists())
+        assertTrue(otherItemFile.exists())
+        assertTrue(externalPrivateFile.exists())
+        assertEquals(1, dao.deleteItem(OWNER_A, ITEM_A))
+        assertTrue(otherItemFile.delete())
+        assertTrue(externalPrivateFile.delete())
+    }
+
+    @Test
     fun expiredFifteenMinuteReservationGetsNewRequestWithoutChangingBaseOrDayExpiry() = runBlocking {
         val createdAt = 100_000L
         val entry = attachment(createdAt = createdAt)
@@ -410,6 +499,7 @@ class AttachmentQueueTest {
             key = "",
             googleWebClientId = "",
             debug = true,
+            localDataOwner = { OWNER_A },
             beforeSignOut = {},
             onSessionOwner = {},
         )

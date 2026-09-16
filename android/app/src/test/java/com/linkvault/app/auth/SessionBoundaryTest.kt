@@ -225,6 +225,166 @@ class SessionBoundaryTest {
         )
     }
 
+    @Test
+    fun `late same owner restore resolves from exact accepted deletion receipt`() = runBlocking {
+        val boundary = SessionBoundary()
+        val receipts = AcceptedDeletionReceiptStore()
+        val originA = boundary.locked { commitLogin(OWNER_A) }
+        val readStarted = CompletableDeferred<Unit>()
+        val releaseLateRead = CompletableDeferred<Unit>()
+
+        val lateRestore = async {
+            readStarted.complete(Unit)
+            releaseLateRead.await()
+            val error = runCatching {
+                boundary.locked { requireCurrent(originA) }
+            }.exceptionOrNull()
+            assertTrue(error is SessionBoundaryChangedException)
+            boundary.locked {
+                resolveAcceptedDeletionSessionRace(
+                    expectedOrigin = originA,
+                    error = AccountClientException(
+                        message = "The authenticated session changed.",
+                        retryable = false,
+                        code = "SESSION_CHANGED",
+                        cause = error,
+                    ),
+                    receipt = receipts.current(
+                        ownerId = originA.ownerId,
+                        acceptanceGeneration = originA.generation,
+                        presentationGeneration = boundary.generation(),
+                    ),
+                )
+            }
+        }
+
+        readStarted.await()
+        boundary.locked {
+            receipts.recordServerAcceptance(originA)
+            clear(originA)
+            receipts.recordLocalCleanup(OWNER_A, generation(), localAuthenticationCleared = true)
+        }
+        releaseLateRead.complete(Unit)
+
+        val expectedReceipt = AccountDeletionReceipt(
+            ownerId = OWNER_A,
+            acceptanceGeneration = originA.generation,
+            presentationGeneration = originA.generation + 1,
+            localDataCleared = true,
+        )
+        assertEquals(AccountAccess.Deleting(expectedReceipt), lateRestore.await())
+        assertEquals(
+            expectedReceipt,
+            receipts.current(
+                ownerId = OWNER_A,
+                acceptanceGeneration = originA.generation,
+                presentationGeneration = originA.generation + 1,
+            ),
+        )
+    }
+
+    @Test
+    fun `new identity invalidates accepted deletion receipt before B can observe it`() = runBlocking {
+        val boundary = SessionBoundary()
+        val receipts = AcceptedDeletionReceiptStore()
+        val originA = boundary.locked { commitLogin(OWNER_A) }
+        boundary.locked {
+            receipts.recordServerAcceptance(originA)
+            clear(originA)
+        }
+
+        val originB = boundary.locked {
+            val committed = commitLogin(OWNER_B)
+            receipts.invalidateForNewIdentity(committed)
+            committed
+        }
+
+        assertNull(
+            receipts.current(
+                ownerId = OWNER_A,
+                acceptanceGeneration = originA.generation,
+                presentationGeneration = originB.generation,
+            ),
+        )
+        assertNull(
+            receipts.current(
+                ownerId = OWNER_B,
+                acceptanceGeneration = originB.generation,
+                presentationGeneration = originB.generation,
+            ),
+        )
+        assertNull(receipts.currentForPresentation(originB.generation))
+        assertNull(
+            resolveAcceptedDeletionSessionRace(
+                expectedOrigin = originB,
+                error = AccountClientException(
+                    message = "The authenticated session changed.",
+                    retryable = false,
+                    code = "SESSION_CHANGED",
+                ),
+                receipt = receipts.current(
+                    ownerId = OWNER_B,
+                    acceptanceGeneration = originB.generation,
+                    presentationGeneration = originB.generation,
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `already cleaned A remains a typed bound outcome before the VM restores`() = runBlocking {
+        val boundary = SessionBoundary()
+        val receipts = AcceptedDeletionReceiptStore()
+
+        assertNull(boundary.currentOrigin())
+        val originA = boundary.locked { beginRestore(OWNER_A) }
+        boundary.locked {
+            receipts.recordServerAcceptance(originA)
+            clear(originA)
+            receipts.recordLocalCleanup(OWNER_A, generation(), localAuthenticationCleared = true)
+        }
+
+        val access = boundary.locked {
+            receipts.currentForPresentation(generation())?.let { AccountAccess.Deleting(it) }
+        }
+
+        assertTrue(access is AccountAccess.Deleting)
+        val deleting = access as AccountAccess.Deleting
+        assertEquals(OWNER_A, deleting.receipt.ownerId)
+        assertEquals(originA.generation, deleting.receipt.acceptanceGeneration)
+        assertEquals(boundary.generation(), deleting.receipt.presentationGeneration)
+        assertTrue(deleting.receipt.localDataCleared)
+        assertFalse(boundary.hasSession())
+    }
+
+    @Test
+    fun `purged files do not complete the receipt until local authentication clears`() = runBlocking {
+        val boundary = SessionBoundary()
+        val receipts = AcceptedDeletionReceiptStore()
+        val origin = boundary.locked { beginRestore(OWNER_A) }
+        boundary.locked {
+            receipts.recordServerAcceptance(origin)
+            receipts.recordLocalCleanup(OWNER_A, generation(), localAuthenticationCleared = false)
+        }
+        val failed = boundary.locked {
+            checkNotNull(receipts.currentForPresentation(generation()))
+        }
+        assertFalse(AccountAccess.Deleting(failed).receipt.localDataCleared)
+        assertTrue(boundary.hasSession())
+
+        boundary.locked {
+            clear(origin)
+            receipts.recordLocalCleanup(OWNER_A, generation(), localAuthenticationCleared = true)
+        }
+        val retried = boundary.locked {
+            checkNotNull(receipts.currentForPresentation(generation()))
+        }
+        assertTrue(AccountAccess.Deleting(retried).receipt.localDataCleared)
+        assertEquals(origin.generation, retried.acceptanceGeneration)
+        assertEquals(boundary.generation(), retried.presentationGeneration)
+        assertFalse(boundary.hasSession())
+    }
+
     private companion object {
         const val OWNER_A = "00000000-0000-0000-0000-00000000000a"
         const val OWNER_B = "00000000-0000-0000-0000-00000000000b"

@@ -11,6 +11,11 @@ import {
   type UpdateItemCall,
 } from "./handler.ts";
 import {
+  type AccountDeletionGateway,
+  type AccountDeletionRpcResult,
+  AccountDeletionService,
+} from "./account-deletion.ts";
+import {
   type ClassificationGateway,
   type CompleteClassificationCall,
   createClassificationHandler,
@@ -62,6 +67,10 @@ Deno.test("private worker routing matches the configured versioned deployment pa
 });
 
 class FakeGateway implements MemberGateway {
+  healthy = true;
+  health(): Promise<boolean> {
+    return Promise.resolve(this.healthy);
+  }
   verification: AuthVerification = {
     status: "verified",
     userId: VERIFIED_USER_ID,
@@ -290,6 +299,22 @@ Deno.test("health is public and generic with either supported host path", async 
   assertEquals(gateway.createCalls, []);
 });
 
+Deno.test("health reports dependency failures without exposing their details", async () => {
+  const gateway = new FakeGateway();
+  gateway.healthy = false;
+  let response = await createHandler(gateway)(
+    request("/library-api/v1/health"),
+  );
+  assertEquals(response.status, 503);
+  assertEquals(await response.json(), { status: "unavailable" });
+  gateway.health = () =>
+    Promise.reject(new Error("private dependency fixture"));
+  response = await createHandler(gateway)(request("/library-api/v1/health"));
+  assertEquals(response.status, 503);
+  assertEquals(await response.json(), { status: "unavailable" });
+  assertEquals(gateway.verifiedTokens, []);
+});
+
 Deno.test("authenticated routes reject a missing bearer token", async () => {
   const gateway = new FakeGateway();
   const response = await createHandler(gateway)(request("/library-api/v1/me"));
@@ -426,7 +451,7 @@ Deno.test("known paths return 405 for wrong methods and unknown paths return 404
     { method: "POST" },
   ));
   assertEquals(detailWrongMethod.status, 405);
-  assertEquals(detailWrongMethod.headers.get("allow"), "GET, PATCH");
+  assertEquals(detailWrongMethod.headers.get("allow"), "GET, PATCH, DELETE");
 
   const unknownRoute = await handler(request("/library-api/v1/items/a/b"));
   assertEquals(unknownRoute.status, 404);
@@ -2524,6 +2549,365 @@ Deno.test("category raw character limits do not truncate expanding Unicode norma
     );
   }
 });
+
+Deno.test("item DELETE is versioned, owner-scoped, and returns the frozen receipt", async () => {
+  const gateway = new FakeGateway();
+  gateway.serviceResult = {
+    data: {
+      http_status: 202,
+      item_id: VALID_ITEM_ID,
+      state: "deleting",
+    },
+    error: null,
+  };
+  let scheduled = 0;
+  const response = await createHandler(gateway, () => scheduled++)(
+    discoveryMutationRequest(
+      `/library-api/v1/items/${VALID_ITEM_ID}`,
+      "DELETE",
+      { expected_version: 4 },
+    ),
+  );
+
+  assertEquals(response.status, 202);
+  assertEquals(await response.json(), {
+    item_id: VALID_ITEM_ID,
+    state: "deleting",
+  });
+  assertEquals(gateway.serviceCalls, [{
+    functionName: "library_delete_item",
+    ownerId: VERIFIED_USER_ID,
+    requestId: VALID_REQUEST_ID,
+    args: {
+      p_item_id: VALID_ITEM_ID,
+      p_body: { expected_version: 4 },
+    },
+  }]);
+  assertEquals(scheduled, 1);
+});
+
+Deno.test("item DELETE rejects query, malformed bodies, and missing request identity", async () => {
+  for (
+    const testCase of [
+      {
+        path: `/library-api/v1/items/${VALID_ITEM_ID}?force=true`,
+        headers: authenticatedJsonHeaders(),
+        body: { expected_version: 4 },
+        code: "INVALID_QUERY",
+      },
+      {
+        path: `/library-api/v1/items/${VALID_ITEM_ID}`,
+        headers: authenticatedJsonHeaders(),
+        body: { expected_version: 4, force: true },
+        code: "INVALID_BODY",
+      },
+      {
+        path: `/library-api/v1/items/${VALID_ITEM_ID}`,
+        headers: new Headers({
+          authorization: "Bearer caller-access-token",
+          "content-type": "application/json",
+        }),
+        body: { expected_version: 4 },
+        code: "INVALID_REQUEST_ID",
+      },
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    const response = await createHandler(gateway)(request(testCase.path, {
+      method: "DELETE",
+      headers: testCase.headers,
+      body: JSON.stringify(testCase.body),
+    }));
+    assertEquals(response.status, 400);
+    assertEquals(await errorCode(response), testCase.code);
+    assertEquals(gateway.serviceCalls, []);
+  }
+});
+
+Deno.test("item DELETE preserves sticky conflict and hidden not-found sentinels", async () => {
+  const conflict = new FakeGateway();
+  conflict.serviceResult = {
+    data: { http_status: 409, error_code: "VERSION_CONFLICT" },
+    error: null,
+  };
+  const conflictResponse = await createHandler(conflict)(
+    discoveryMutationRequest(
+      `/library-api/v1/items/${VALID_ITEM_ID}`,
+      "DELETE",
+      { expected_version: 3 },
+    ),
+  );
+  assertEquals(conflictResponse.status, 409);
+  assertEquals(await errorCode(conflictResponse), "VERSION_CONFLICT");
+
+  const hidden = new FakeGateway();
+  hidden.serviceResult = {
+    data: null,
+    error: { code: "P0001", message: "ITEM_NOT_FOUND" },
+  };
+  const hiddenResponse = await createHandler(hidden)(
+    discoveryMutationRequest(
+      `/library-api/v1/items/${VALID_ITEM_ID}`,
+      "DELETE",
+      { expected_version: 4 },
+    ),
+  );
+  assertEquals(hiddenResponse.status, 404);
+  assertEquals(await errorCode(hiddenResponse), "ITEM_NOT_FOUND");
+
+  const mismatchedReceipt = new FakeGateway();
+  mismatchedReceipt.serviceResult = {
+    data: {
+      http_status: 202,
+      item_id: VALID_CATEGORY_ID,
+      state: "deleting",
+    },
+    error: null,
+  };
+  const mismatchedResponse = await createHandler(mismatchedReceipt)(
+    discoveryMutationRequest(
+      `/library-api/v1/items/${VALID_ITEM_ID}`,
+      "DELETE",
+      { expected_version: 4 },
+    ),
+  );
+  assertEquals(mismatchedResponse.status, 503);
+  assertEquals(await errorCode(mismatchedResponse), "DEPENDENCY_UNAVAILABLE");
+});
+
+Deno.test("account deletion uses the trusted Auth user and unwrapped responses", async () => {
+  const gateway = accountVerifiedGateway("google-subject");
+  const accountGateway = new FakeAccountDeletionGateway();
+  let scheduled = 0;
+  const handler = createHandler(
+    gateway,
+    () => scheduled++,
+    fakeAccountDeletionService(accountGateway, "google-subject"),
+  );
+
+  const challenge = await handler(request(
+    "/library-api/v1/account/delete-challenge",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: "{}",
+    },
+  ));
+  assertEquals(challenge.status, 201);
+  assertEquals(await challenge.json(), {
+    challenge_id: VALID_CATEGORY_ID,
+    nonce: "n".repeat(43),
+    expires_at: "2026-09-16T00:05:00Z",
+  });
+  assertEquals(accountGateway.createCalls[0].ownerId, VERIFIED_USER_ID);
+
+  const accepted = await handler(request("/library-api/v1/account/delete", {
+    method: "POST",
+    headers: authenticatedJsonHeaders(),
+    body: JSON.stringify({
+      challenge_id: VALID_CATEGORY_ID,
+      google_id_token: "signed-google-proof",
+    }),
+  }));
+  assertEquals(accepted.status, 202);
+  assertEquals(await accepted.json(), { state: "deleting" });
+  assertEquals(accountGateway.acceptCalls[0].ownerId, VERIFIED_USER_ID);
+  assertEquals(scheduled, 1);
+});
+
+Deno.test("account deletion fails closed for missing capability and Google mismatch", async () => {
+  const gateway = accountVerifiedGateway("linked-subject");
+  const unavailable = await createHandler(gateway)(request(
+    "/library-api/v1/account/delete-challenge",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: "{}",
+    },
+  ));
+  assertEquals(unavailable.status, 503);
+  assertEquals(await errorCode(unavailable), "DEPENDENCY_UNAVAILABLE");
+
+  const accountGateway = new FakeAccountDeletionGateway();
+  const mismatch = await createHandler(
+    gateway,
+    undefined,
+    fakeAccountDeletionService(accountGateway, "different-subject"),
+  )(request("/library-api/v1/account/delete", {
+    method: "POST",
+    headers: authenticatedJsonHeaders(),
+    body: JSON.stringify({
+      challenge_id: VALID_CATEGORY_ID,
+      google_id_token: "signed-google-proof",
+    }),
+  }));
+  assertEquals(mismatch.status, 403);
+  assertEquals(await errorCode(mismatch), "GOOGLE_IDENTITY_MISMATCH");
+  assertEquals(accountGateway.acceptCalls, []);
+});
+
+Deno.test("account deletion maps rejected Google proof without reflecting the token", async () => {
+  const gateway = accountVerifiedGateway("google-subject");
+  const accountGateway = new FakeAccountDeletionGateway();
+  const service = new AccountDeletionService(
+    accountGateway,
+    { verify: () => Promise.reject(new Error("provider detail")) },
+    { derive: () => Promise.resolve("n".repeat(43)) },
+  );
+  const response = await createHandler(gateway, undefined, service)(request(
+    "/library-api/v1/account/delete",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: JSON.stringify({
+        challenge_id: VALID_CATEGORY_ID,
+        google_id_token: "secret-raw-token",
+      }),
+    },
+  ));
+
+  assertEquals(response.status, 401);
+  const payload = await response.text();
+  assertMatch(payload, /GOOGLE_PROOF_INVALID/);
+  assertEquals(payload.includes("secret-raw-token"), false);
+  assertEquals(payload.includes("provider detail"), false);
+  assertEquals(accountGateway.acceptCalls, []);
+});
+
+Deno.test("account deletion enforces method, query, body, and authentication", async () => {
+  const service = fakeAccountDeletionService(
+    new FakeAccountDeletionGateway(),
+    "google-subject",
+  );
+  const wrongMethod = await createHandler(
+    new FakeGateway(),
+    undefined,
+    service,
+  )(request("/library-api/v1/account/delete", { method: "GET" }));
+  assertEquals(wrongMethod.status, 405);
+
+  const unauthenticated = await createHandler(
+    new FakeGateway(),
+    undefined,
+    service,
+  )(request("/library-api/v1/account/delete-challenge", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }));
+  assertEquals(unauthenticated.status, 401);
+
+  const gateway = accountVerifiedGateway("google-subject");
+  const query = await createHandler(gateway, undefined, service)(request(
+    "/library-api/v1/account/delete-challenge?extra=true",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: "{}",
+    },
+  ));
+  assertEquals(query.status, 400);
+  assertEquals(await errorCode(query), "INVALID_QUERY");
+
+  const body = await createHandler(gateway, undefined, service)(request(
+    "/library-api/v1/account/delete-challenge",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: JSON.stringify({ extra: true }),
+    },
+  ));
+  assertEquals(body.status, 400);
+  assertEquals(await errorCode(body), "INVALID_REQUEST");
+});
+
+class FakeAccountDeletionGateway implements AccountDeletionGateway {
+  createCalls: {
+    ownerId: string;
+    requestId: string;
+    nonceHash: string;
+  }[] = [];
+  acceptCalls: {
+    ownerId: string;
+    requestId: string;
+    requestHash: string;
+    challengeId: string;
+  }[] = [];
+
+  createDeleteChallenge(
+    call: { ownerId: string; requestId: string; nonceHash: string },
+  ): Promise<AccountDeletionRpcResult> {
+    this.createCalls.push(call);
+    return Promise.resolve({
+      data: {
+        http_status: 201,
+        challenge_id: VALID_CATEGORY_ID,
+        expires_at: "2026-09-16T00:05:00Z",
+      },
+      error: null,
+    });
+  }
+
+  replayAccountDeletion(): Promise<AccountDeletionRpcResult> {
+    return Promise.resolve({ data: null, error: null });
+  }
+
+  checkDeleteChallengeBinding(): Promise<AccountDeletionRpcResult> {
+    return Promise.resolve({
+      data: {
+        http_status: 200,
+        state: "valid",
+      },
+      error: null,
+    });
+  }
+
+  acceptAccountDeletion(
+    call: {
+      ownerId: string;
+      requestId: string;
+      requestHash: string;
+      challengeId: string;
+    },
+  ): Promise<AccountDeletionRpcResult> {
+    this.acceptCalls.push(call);
+    return Promise.resolve({
+      data: { http_status: 202, state: "deleting" },
+      error: null,
+    });
+  }
+}
+
+function accountVerifiedGateway(googleSubject: string): FakeGateway {
+  const gateway = new FakeGateway();
+  gateway.verification = {
+    status: "verified",
+    userId: VERIFIED_USER_ID,
+    user: {
+      id: VERIFIED_USER_ID,
+      identities: [{
+        provider: "google",
+        provider_id: googleSubject,
+        identity_data: { sub: googleSubject },
+      }],
+    },
+  };
+  return gateway;
+}
+
+function fakeAccountDeletionService(
+  gateway: AccountDeletionGateway,
+  proofSubject: string,
+): AccountDeletionService {
+  return new AccountDeletionService(
+    gateway,
+    {
+      verify: () =>
+        Promise.resolve({ subject: proofSubject, nonce: "0".repeat(64) }),
+    },
+    { derive: () => Promise.resolve("n".repeat(43)) },
+  );
+}
 
 function request(path: string, init: RequestInit = {}): Request {
   return new Request(`https://example.test${path}`, init);

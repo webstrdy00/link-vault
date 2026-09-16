@@ -2482,7 +2482,11 @@ select is(
 );
 
 update public.items
-set deleted_at = now()
+set deleted_at = now(),
+    original_url = null, normalized_url = null, url_hash = null,
+    source = null, display_fallback = null, metadata_state = null,
+    user_title = null, fetched_title = null, shared_text = null,
+    description = null, body_text = null, note = null, extraction_meta = '{}'::jsonb
 where id = 'a2000000-0000-0000-0000-000000000001';
 
 select throws_ok(

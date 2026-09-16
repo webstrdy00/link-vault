@@ -30,6 +30,7 @@ class EnrichmentOutboxTest {
         assertEquals(listOf(item), effect.invalidatesItemIds)
         assertTrue(effect.invalidatesCategories)
         assertTrue(effect.cachedItems.isEmpty())
+        assertEquals(null, effect.deletedItemId)
     }
 
     @Test
@@ -71,5 +72,73 @@ class EnrichmentOutboxTest {
             "DELETE" to "/items/$item/assets/$asset/extra",
             "POST" to "/items/$item/assets/reserve",
         )) assertTrue(runCatching { requireValidOutboxRoute(method, path) }.isFailure)
+    }
+
+    @Test
+    fun acceptedItemDeletionHasAnExactDeletingReceiptAndDoesNotCollideWithImageDeletion() {
+        requireValidOutboxRoute("DELETE", "/items/$item")
+        val effect = mapOutboxResponse(
+            entry("DELETE", "/items/$item"),
+            json("""{"item_id":"$item","state":"deleting"}"""),
+            2,
+        )
+
+        assertEquals(item, effect.deletedItemId)
+        assertEquals(listOf(item), effect.invalidatesItemIds)
+        assertTrue(effect.invalidatesCategories)
+        assertTrue(effect.cachedItems.isEmpty())
+
+        val imageEffect = mapOutboxResponse(
+            entry("DELETE", "/items/$item/assets/$asset"),
+            json("""{"asset_id":"$asset"}"""),
+            2,
+        )
+        assertEquals(null, imageEffect.deletedItemId)
+    }
+
+    @Test
+    fun itemDeletionRejectsWrongIdentityStateAndEnvelope() {
+        for (response in listOf(
+            """{"item_id":"$asset","state":"deleting"}""",
+            """{"item_id":"$item","state":"deleted"}""",
+            """{"item":{"id":"$item"},"state":"deleting"}""",
+            """{"item_id":"$item","state":"deleting","deleted":true}""",
+        )) {
+            assertTrue(
+                runCatching {
+                    mapOutboxResponse(
+                        entry("DELETE", "/items/$item"),
+                        json(response),
+                        2,
+                    )
+                }.isFailure,
+            )
+        }
+    }
+
+    @Test
+    fun itemDeletionIntentRequiresOnlyAFrozenPositiveVersion() {
+        assertEquals(7L, requireItemDeleteExpectedVersion(json("""{"expected_version":7}""")))
+        for (payload in listOf(
+            "{}",
+            """{"expected_version":0}""",
+            """{"expected_version":"7"}""",
+            """{"expected_version":7,"item_id":"$item"}""",
+        )) {
+            assertTrue(runCatching { requireItemDeleteExpectedVersion(json(payload)) }.isFailure)
+        }
+    }
+
+    @Test
+    fun knownOwnedMissingItemUsesAnExplicitLocalResolutionReceipt() {
+        assertEquals(
+            json("""{"item_id":"$item","state":"already_deleted"}"""),
+            knownMissingItemDeleteReceipt(item),
+        )
+        assertTrue(
+            runCatching {
+                knownMissingItemDeleteReceipt("not-an-item-id")
+            }.isFailure,
+        )
     }
 }

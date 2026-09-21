@@ -3,7 +3,10 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "beta:check": "node scripts/beta-acceptance.mjs",
+    "test:beta": "node --test scripts/beta-acceptance.test.mjs",
     "backend:start": "node scripts/start-local-backend.mjs",
+    "test:backend-start": "node --test scripts/start-local-backend.test.mjs",
     "backend:migrate": "supabase migration up --local && node scripts/normalize-existing-categories.mjs",
     "backend:configure-worker": "node scripts/configure-local-worker.mjs",
     "operations:check": "node scripts/library-operations.mjs",
@@ -26,6 +29,7 @@
     "test:offline-integration": "node scripts/offline-integration.mjs"
   },
   "devDependencies": {
+    "csv-parse": "7.0.2",
     "deno": "2.9.6",
     "supabase": "2.117.0"
   }

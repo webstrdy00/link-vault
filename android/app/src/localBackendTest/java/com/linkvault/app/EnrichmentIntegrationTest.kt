@@ -105,6 +105,13 @@ class EnrichmentIntegrationTest {
             .performClick()
     }
 
+    private fun clickRoot(tag: String) {
+        awaitTag(tag)
+        compose.onNodeWithTag(tag, useUnmergedTree = true)
+            .assertIsEnabled()
+            .performClick()
+    }
+
     private fun awaitPreviewImage() {
         compose.waitUntil(SERVER_TIMEOUT_MILLIS) {
             compose.onAllNodesWithContentDescription(
@@ -226,10 +233,16 @@ class EnrichmentIntegrationTest {
         val itemId = fixtureItemId()
         awaitTag("detail-$itemId")
         clickTag("detail-$itemId")
-        awaitText("서버 처리 상태")
+        awaitText("처리 정보 보기")
+        compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
+        awaitText("처리 정보")
+        awaitText("링크 정보 ·", substring = true)
     }
 
     private fun assertMetadataUiIsIndependent() {
+        if (compose.onAllNodesWithText("세부 정보 보기").fetchSemanticsNodes().isNotEmpty()) {
+            compose.onNodeWithText("세부 정보 보기").performScrollTo().performClick()
+        }
         val possibleMessages = listOf(
             "메타데이터 조회를 완료했어요. 페이지 전체 보존을 의미하지는 않아요.",
             "일부 메타데이터만 저장됐어요.",
@@ -271,7 +284,7 @@ class EnrichmentIntegrationTest {
         }
 
     private fun openSearch() {
-        compose.onNodeWithText("검색·분류").performScrollTo().performClick()
+        clickRoot("root-discovery")
         awaitTag("search-query")
     }
 
@@ -396,7 +409,7 @@ class EnrichmentIntegrationTest {
         assertRecognizedFixture(retained, "서울")
 
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
-            compose.onNodeWithText("보관함").performScrollTo().performClick()
+            clickRoot("root-library")
             openFixtureDetail()
             awaitText("이미지 첨부 ·", substring = true)
             setNetwork(enabled = true)
@@ -512,7 +525,7 @@ class EnrichmentIntegrationTest {
         app.accountClient.restoreAccount()
         assertEquals(argument("fixtureOwnerId"), app.accountClient.sessionUserId())
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
-            compose.onNodeWithText("보관함").performScrollTo().performClick()
+            clickRoot("root-library")
             openFixtureDetail()
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             compose.onNodeWithTag("attachment-delete", useUnmergedTree = true)

@@ -100,9 +100,9 @@ class OfflineLibraryIntegrationTest {
             app.accountClient.restoreAccount()
             val owner = checkNotNull(app.accountClient.sessionUserId())
             ActivityScenario.launch<MainActivity>(launchIntent()).use {
-                compose.onNodeWithText("보관함").performScrollTo().performClick()
-                awaitText("온라인 캐시 기준")
-                compose.onNodeWithText("뒤로").performClick()
+                compose.onNodeWithTag("root-library").performClick()
+                awaitText("내 보관함")
+                compose.onNodeWithTag("root-capture").performClick()
                 shell("svc wifi disable")
                 shell("svc data disable")
                 val connectivity = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -111,9 +111,9 @@ class OfflineLibraryIntegrationTest {
                     .performTextReplacement(argument("fixtureUrl"))
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
                 awaitOfflineSaveForm()
-                compose.onNodeWithText("나중에 찾을 메모").performScrollTo()
+                compose.onNodeWithText("메모 (선택 사항)").performScrollTo()
                     .performTextReplacement("오프라인 재시작 보관 검증")
-                compose.onNodeWithText("서버에 보관").performScrollTo().assertIsEnabled().performClick()
+                compose.onNodeWithText("저장").performScrollTo().assertIsEnabled().performClick()
                 val pending = withTimeout(15_000) {
                     app.outboxRepository.observeOutbox(owner).first { rows -> rows.isNotEmpty() }
                 }.single()
@@ -143,10 +143,16 @@ class OfflineLibraryIntegrationTest {
         app.accountClient.restoreAccount()
         val owner = checkNotNull(app.accountClient.sessionUserId())
         ActivityScenario.launch<MainActivity>(launchIntent()).use { scenario ->
-            compose.onNodeWithText("보관함").performScrollTo().performClick()
+            compose.onNodeWithTag("root-library").performClick()
             awaitText("오프라인 재시작 보관 검증", substring = true)
             compose.onNodeWithTag("detail-${argument("fixtureItemId")}").performScrollTo().performClick()
-            awaitText("서버 처리 상태")
+            awaitText("처리 정보 보기")
+            compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
+            awaitText("링크 정보", substring = true)
+            compose.onNodeWithText("처리 정보 접기").performScrollTo().performClick()
+            compose.onNodeWithText("카테고리 관리").performScrollTo().performClick()
+            awaitText("직접 선택 (", substring = true)
+            compose.onNodeWithText("관리 닫기").performScrollTo().performClick()
             compose.onNodeWithText("오프라인 재시작 보관 검증").assertExists()
             // A wrong queued owner must be rejected before any HTTP request can write it.
             val rejected = runCatching {
@@ -160,6 +166,7 @@ class OfflineLibraryIntegrationTest {
             }.exceptionOrNull()
             assertTrue(rejected is com.linkvault.app.auth.AccountClientException)
             assertEquals(owner, app.accountClient.sessionUserId())
+            compose.onNodeWithText("더보기").performScrollTo().performClick()
             compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
             val current = app.accountClient.libraryRequest(owner, "/items/${argument("fixtureItemId")}")
             app.accountClient.libraryRequest(
@@ -172,18 +179,18 @@ class OfflineLibraryIntegrationTest {
                     put("note", "외부에서 먼저 수정한 메모")
                 }.toString(),
             )
-            compose.onNodeWithText("나중에 찾을 메모").performScrollTo()
+            compose.onNodeWithText("메모 (선택 사항)").performScrollTo()
                 .performTextReplacement("재시작 후 편집 검증")
-            compose.onNodeWithText("수정 요청 보관").performScrollTo().performClick()
+            compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
             awaitText("변경 충돌", substring = true)
             compose.onAllNodesWithText("최신 내용 확인")[0].performScrollTo().performClick()
             awaitText("외부에서 먼저 수정한 메모", substring = true)
             compose.onNodeWithText("다시 저장").performScrollTo().performClick()
             awaitText("제목·메모를 저장했어요.")
-            compose.onNodeWithText("수정 닫기").performScrollTo().performClick()
+            compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
             scenario.recreate()
             awaitText("재시작 후 편집 검증")
-            compose.onNodeWithText("뒤로").performClick()
+            compose.onNodeWithText("보관함 목록").performScrollTo().performClick()
             shell("svc wifi disable")
             shell("svc data disable")
             val connectivity = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -193,7 +200,7 @@ class OfflineLibraryIntegrationTest {
                 owner, cancelledRequest, "POST", "/items",
                 "{\"url\":\"https://example.com/discard-$cancelledRequest\"}",
             )
-            compose.onNodeWithText("회원 계정").performScrollTo().performClick()
+            compose.onNodeWithTag("root-account").performClick()
             awaitText("로그아웃")
             compose.onNodeWithText("로그아웃").performScrollTo().performClick()
             awaitText("로그아웃할까요?")
@@ -215,7 +222,7 @@ class OfflineLibraryIntegrationTest {
 
     private fun awaitOfflineSaveForm() {
         try {
-            awaitText("서버에 보관")
+            awaitText("저장")
         } catch (error: Throwable) {
             val screenshot = captureFixtureScreenshot()
             throw AssertionError(

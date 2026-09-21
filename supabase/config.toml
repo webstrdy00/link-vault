@@ -418,9 +418,9 @@ enabled = true
 verify_jwt = false
 static_files = ["./functions/library-api/webp_dec.wasm"]
 
-# Enable only after configuring an actual Google OAuth client.
+# Requires the local, gitignored Google OAuth environment values.
 [auth.external.google]
-enabled = false
+enabled = true
 client_id = "env(GOOGLE_WEB_CLIENT_ID)"
 secret = "env(GOOGLE_CLIENT_SECRET)"
 skip_nonce_check = false

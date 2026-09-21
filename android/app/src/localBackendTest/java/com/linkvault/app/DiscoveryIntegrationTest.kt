@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.ParcelFileDescriptor
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.hasAnyDescendant
@@ -75,11 +76,45 @@ class DiscoveryIntegrationTest {
         }
     }
 
-    private fun clickTag(tag: String) {
+    private fun clickTag(tag: String, scrollTo: Boolean = true) {
         awaitTag(tag)
-        compose.onNodeWithTag(tag, useUnmergedTree = true)
-            .performScrollTo()
-            .performClick()
+        val node = compose.onNodeWithTag(tag, useUnmergedTree = true)
+        if (scrollTo) node.performScrollTo()
+        node.performClick()
+    }
+
+    private fun clickRoot(tag: String) {
+        awaitTag(tag)
+        compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
+    }
+
+    private fun expandProcessingDetails() {
+        awaitText("처리 정보 보기")
+        compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
+        awaitText("처리 정보")
+        awaitText("링크 정보 ·", substring = true)
+    }
+
+    private fun openCategoryManagement() {
+        compose.onNodeWithText("분류 관리").performScrollTo().performClick()
+        awaitTag("category-name-field")
+    }
+
+    private fun closeCategoryManagement() {
+        compose.onNodeWithText("닫기").performClick()
+        awaitNoText("새 분류 이름")
+    }
+
+    private fun applyNeedsCuesFilter() {
+        compose.onNodeWithText("필터").performScrollTo().performClick()
+        awaitText("검색 필터")
+        awaitText("단서 보완이 필요한 항목만")
+        val uncheckedToggle = SemanticsMatcher("unchecked filter toggle") { node ->
+            node.config.getOrNull(SemanticsProperties.ToggleableState) == ToggleableState.Off
+        }
+        awaitMatcher(uncheckedToggle)
+        compose.onNode(uncheckedToggle, useUnmergedTree = true).performClick()
+        clickTag("search-filter-apply", scrollTo = false)
     }
 
     private fun categoryId(name: String): String {
@@ -147,12 +182,10 @@ class DiscoveryIntegrationTest {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
             ActivityScenario.launch<MainActivity>(intent).use { scenario ->
-                compose.onNodeWithText("회원 계정").performScrollTo().performClick()
+                clickRoot("root-account")
                 awaitText("로그인했어요")
-                compose.onNodeWithText("뒤로").performClick()
-                compose.onNodeWithText("보관함").performScrollTo().performClick()
-                awaitText("검색·분류")
-                compose.onNodeWithText("검색·분류").performClick()
+                clickRoot("root-library")
+                clickRoot("root-discovery")
 
                 awaitTag("search-query")
                 compose.onNodeWithTag("search-query").performTextReplacement("카톡 프사")
@@ -162,7 +195,9 @@ class DiscoveryIntegrationTest {
                 assertLiteralBeforeAlias(literalItemId, aliasItemId)
                 awaitText("별칭으로 찾음")
 
+                openCategoryManagement()
                 val workCategoryId = categoryId("업무·학습")
+                closeCategoryManagement()
                 compose.onNodeWithText("일치 표현 확인").performScrollTo().performClick()
                 awaitText("사용자 제목: 카카오톡")
                 awaitText("사용자 제목: 프로필 사진")
@@ -175,14 +210,15 @@ class DiscoveryIntegrationTest {
                 compose.onNodeWithText("신뢰도", substring = true).assertDoesNotExist()
                 compose.onNodeWithText("점수", substring = true).assertDoesNotExist()
 
-                compose.onNodeWithText("검색·분류").performScrollTo().performClick()
-                awaitTag("category-name-field")
+                clickRoot("root-discovery")
+                openCategoryManagement()
                 compose.onNodeWithTag("category-name-field")
                     .performScrollTo()
                     .performTextReplacement(CUSTOM_CATEGORY_NAME)
                 clickTag("category-create")
                 awaitText("분류 변경이 서버에 반영됐어요.")
                 val customCategoryId = categoryId(CUSTOM_CATEGORY_NAME)
+                closeCategoryManagement()
 
                 clickTag("search-item-$aliasItemId")
                 awaitText("직접 선택 (1 / 5)")
@@ -237,10 +273,10 @@ class DiscoveryIntegrationTest {
                 clickTag("current-category-$workCategoryId")
                 awaitText("표현: 엑셀 · 필드: user_title")
 
-                compose.onNodeWithText("검색·분류").performScrollTo().performClick()
+                clickRoot("root-discovery")
                 awaitTag("search-query")
                 compose.onNodeWithTag("search-query").performTextReplacement("")
-                compose.onNodeWithText("단서 보완").performScrollTo().performClick()
+                applyNeedsCuesFilter()
                 clickTag("search-item-$cueItemId")
                 awaitText(CUE_PROMPT)
                 compose.onNodeWithText("나중에").performScrollTo().performClick()
@@ -249,10 +285,11 @@ class DiscoveryIntegrationTest {
 
                 scenario.recreate()
                 compose.waitForIdle()
-                awaitText("서버 처리 상태")
-                awaitText("제목·메모 수정")
+                expandProcessingDetails()
                 compose.onNodeWithText(CUE_PROMPT).assertDoesNotExist()
 
+                compose.onNodeWithText("더보기").performScrollTo().performClick()
+                awaitText("제목·메모 수정")
                 compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
                 awaitText("수정 요청 보관")
                 compose.onNodeWithText("나중에 찾을 메모")

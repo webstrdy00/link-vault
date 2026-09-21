@@ -156,12 +156,17 @@ class DeletionIntegrationTest {
     }
 
     private fun openLibrary() {
-        clickText("보관함")
+        clickTag("root-library")
     }
 
     private fun openDetail(itemId: String) {
         clickTag("detail-$itemId")
-        awaitText("서버 처리 상태")
+        awaitText("처리 정보 보기")
+    }
+
+    private fun beginDelete() {
+        clickText("더보기")
+        clickTag("delete-item")
     }
 
     private fun backToList() {
@@ -271,28 +276,28 @@ class DeletionIntegrationTest {
                 openDetail(conflictItemId)
                 backToList()
                 openDetail(acceptedItemId)
-                clickTag("delete-item")
-                awaitText("링크 삭제 확인")
+                beginDelete()
+                awaitText("링크를 삭제할까요?")
                 clickText("취소")
                 assertTrue(
                     "cancelling creates no delete request",
                     app.outboxRepository.observeOutbox(ownerId).first()
                         .none { it.method == "DELETE" && it.path == "/items/$acceptedItemId" },
                 )
-                clickTag("delete-item")
+                beginDelete()
                 setNetwork(enabled = false)
                 clickTag("confirm-item-delete")
-                awaitText("삭제 요청을 이 기기에 보관했어요. 서버가 수락하기 전까지 링크는 계속 표시됩니다.")
+                awaitText("삭제를 준비했어요. 연결되면 동기화합니다.")
                 assertFalse(app.outboxRepository.isItemDeleted(ownerId, acceptedItemId))
                 assertTrue(app.outboxRepository.readCachedDetail(ownerId, acceptedItemId) != null)
                 backToList()
                 awaitTag("detail-$acceptedItemId")
-                awaitText("서버가 아직 삭제를 수락하지 않아 링크는 보관함에 그대로 표시됩니다.")
+                awaitText("삭제가 동기화될 때까지 이 링크가 보일 수 있어요.")
 
                 openDetail(conflictItemId)
-                clickTag("delete-item")
+                beginDelete()
                 clickTag("confirm-item-delete")
-                awaitText("삭제 요청을 이 기기에 보관했어요. 서버가 수락하기 전까지 링크는 계속 표시됩니다.")
+                awaitText("삭제를 준비했어요. 연결되면 동기화합니다.")
                 backToList()
                 awaitTag("detail-$conflictItemId")
                 awaitTag("detail-$unaffectedItemId")
@@ -365,9 +370,9 @@ class DeletionIntegrationTest {
 
             awaitConflict(ownerId, originalConflict.requestId)
             openDetail(conflictItemId)
-            awaitText("다른 변경으로 링크 버전이 달라졌습니다. 자동으로 삭제하지 않습니다.")
+            awaitText("다른 변경이 먼저 저장됐어요. 최신 내용을 확인한 뒤 다시 삭제해 주세요.")
             clickTag("review-item-delete")
-            awaitText("최신 버전 삭제 확인", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            awaitText("최신 내용 삭제 확인", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             setNetwork(enabled = false)
             clickTag("confirm-item-delete")
             val newEntry = withTimeout(QUEUE_TIMEOUT_MILLIS) {
@@ -408,7 +413,7 @@ class DeletionIntegrationTest {
                 ),
             )
 
-            clickText("검색·분류")
+            clickTag("root-discovery")
             awaitTag("search-query")
             compose.onNodeWithTag("search-query").performTextReplacement(argument("deletedSearchTerm"))
             clickTag("search-submit")
@@ -437,7 +442,7 @@ class DeletionIntegrationTest {
         val beforeOutbox = app.outboxRepository.retainedCount()
 
         launchFixture {
-            clickText("회원 계정")
+            clickTag("root-account")
             awaitText("계정과 서버 자료 삭제")
             clickText("계정과 서버 자료 삭제")
             awaitText("계정과 서버 자료를 삭제할까요?")
@@ -456,7 +461,19 @@ class DeletionIntegrationTest {
             if (providerOutcomes.none { text ->
                 compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
             }) {
-                shell("input keyevent KEYCODE_BACK")
+                // Only cancel a visible provider window. A delayed unavailable
+                // response can leave our own account screen in the foreground;
+                // BACK there would navigate away instead of cancelling Google.
+                val foregroundPackage = InstrumentationRegistry.getInstrumentation()
+                    .uiAutomation.rootInActiveWindow?.packageName?.toString()
+                if (foregroundPackage in setOf(
+                        "com.google.android.gms",
+                        "com.google.android.permissioncontroller",
+                        "com.android.permissioncontroller",
+                    )
+                ) {
+                    shell("input keyevent KEYCODE_BACK")
+                }
             }
             awaitAnyText(
                 providerOutcomes,
@@ -522,7 +539,7 @@ class DeletionIntegrationTest {
         val unaffectedItemId = uuidArgument("unaffectedItemId")
         val generationBefore = argument("accountCleanupGenerationBefore").toLong()
         launchFixture {
-            clickText("회원 계정")
+            clickTag("root-account")
             awaitText("계정 삭제가 접수됐어요", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             awaitText("이 기기의 계정 자료와 로그인 정보도 정리했어요.")
             assertNull(app.accountClient.sessionUserId())
@@ -558,7 +575,7 @@ class DeletionIntegrationTest {
     fun missingGoogleConfigurationDefersDeletion(): Unit = runBlocking {
         check(BuildConfig.DEBUG && BuildConfig.GOOGLE_WEB_CLIENT_ID.isBlank())
         launchFixture {
-            clickText("회원 계정")
+            clickTag("root-account")
             awaitText("로그인 설정이 필요해요")
             awaitText("Google 웹 클라이언트 ID 설정이 필요해요.")
             assertNull(app.accountClient.sessionUserId())

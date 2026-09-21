@@ -1,41 +1,78 @@
 package com.linkvault.app.discovery
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.library.LibraryItemSummary
@@ -44,6 +81,7 @@ import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
 import java.text.DateFormat
+import java.time.ZoneId
 import java.util.Date
 import kotlinx.coroutines.CancellationException
 
@@ -105,6 +143,8 @@ fun DiscoveryScreen(
             discoveryViewModel.setVisible(false)
         }
     }
+    var showCategoryManagement by rememberSaveable { mutableStateOf(false) }
+    BackHandler(onBack = onBack)
 
     Column(
         modifier = Modifier
@@ -112,25 +152,23 @@ fun DiscoveryScreen(
             .safeDrawingPadding()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TextButton(onClick = onBack) { Text("뒤로") }
             Text(
-                text = "검색과 분류",
-                style = MaterialTheme.typography.headlineSmall,
+                text = "검색",
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
             )
             TextButton(
-                onClick = discoveryViewModel::refreshCategories,
-                enabled = state.availability is DiscoveryAvailability.Ready &&
-                    !state.isCategoriesLoading,
+                onClick = { showCategoryManagement = true },
+                enabled = state.availability is DiscoveryAvailability.Ready,
             ) {
-                Text("분류 새로고침")
+                Text("분류 관리")
             }
         }
         HorizontalDivider()
@@ -160,7 +198,6 @@ fun DiscoveryScreen(
                     onAliasesChange = discoveryViewModel::setAliases,
                     onNeedsCuesChange = discoveryViewModel::setNeedsCues,
                     onClearFilters = discoveryViewModel::clearFiltersKeepingQuery,
-                    onShowNeedsCues = discoveryViewModel::showItemsNeedingCues,
                 )
                 HorizontalDivider()
                 SearchResults(
@@ -169,26 +206,26 @@ fun DiscoveryScreen(
                     onOpenAliasDisclosure = discoveryViewModel::openAliasDisclosure,
                     onRetry = discoveryViewModel::retrySearch,
                     onLoadMore = discoveryViewModel::loadMore,
-                    onClearFilters = discoveryViewModel::clearFiltersKeepingQuery,
-                    onShowNeedsCues = discoveryViewModel::showItemsNeedingCues,
-                )
-                HorizontalDivider()
-                CategoryManagement(
-                    state = state,
-                    onCreateNameChange = discoveryViewModel::updateCreateCategoryName,
-                    onCreate = discoveryViewModel::createCategory,
-                    onRename = discoveryViewModel::beginRenameCategory,
-                    onDelete = discoveryViewModel::requestDeleteCategory,
-                    onRefresh = discoveryViewModel::refreshCategories,
-                    onRetryRequest = discoveryViewModel::retryCategoryRequest,
-                    onDiscardRequest = discoveryViewModel::discardCategoryRequest,
-                    onDiscardAndEditRequest = discoveryViewModel::discardAndEditCategoryRequest,
-                    onReviewRequest = discoveryViewModel::reviewCategoryRequest,
                 )
             }
         }
     }
 
+    if (showCategoryManagement && state.availability is DiscoveryAvailability.Ready) {
+        CategoryManagementSheet(
+            state = state,
+            onDismiss = { showCategoryManagement = false },
+            onCreateNameChange = discoveryViewModel::updateCreateCategoryName,
+            onCreate = discoveryViewModel::createCategory,
+            onRename = discoveryViewModel::beginRenameCategory,
+            onDelete = discoveryViewModel::requestDeleteCategory,
+            onRefresh = discoveryViewModel::refreshCategories,
+            onRetryRequest = discoveryViewModel::retryCategoryRequest,
+            onDiscardRequest = discoveryViewModel::discardCategoryRequest,
+            onDiscardAndEditRequest = discoveryViewModel::discardAndEditCategoryRequest,
+            onReviewRequest = discoveryViewModel::reviewCategoryRequest,
+        )
+    }
     RenameCategoryDialog(
         state = state,
         onNameChange = discoveryViewModel::updateRenameCategoryName,
@@ -225,147 +262,476 @@ private fun SearchControls(
     onAliasesChange: (Boolean) -> Unit,
     onNeedsCuesChange: (Boolean) -> Unit,
     onClearFilters: () -> Unit,
-    onShowNeedsCues: () -> Unit,
 ) {
     val filters = state.filters
     val queryIssues = state.filterIssues.filter { it.field == DiscoveryFilterField.QUERY }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            text = "서버에서 찾기",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
-        )
-        Text("검색과 필터는 서버에서 함께 적용하며 서버가 보낸 순서 그대로 표시합니다.")
-        OutlinedTextField(
-            value = filters.query,
-            onValueChange = onQueryChange,
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var showFilters by rememberSaveable { mutableStateOf(false) }
+    val searchShape = RoundedCornerShape(9.dp)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .testTag("search-query"),
-            label = { Text("검색어") },
-            supportingText = {
-                Text("${filters.query.codePointLength()} / $DISCOVERY_QUERY_MAX_CODE_POINTS · 최대 ${DISCOVERY_QUERY_MAX_WORDS}개 단어")
-            },
-            isError = queryIssues.isNotEmpty(),
-            singleLine = true,
-        )
-
-        Text("분류", fontWeight = FontWeight.SemiBold)
-        RadioChoice(
-            selected = filters.categoryId == null && !filters.unclassified,
-            label = "전체 분류",
-            onClick = { onCategorySelected(null) },
-        )
-        RadioChoice(
-            selected = filters.unclassified,
-            label = "미분류 (${state.unclassifiedCount})",
-            onClick = { onUnclassifiedChange(true) },
-        )
-        state.categories.forEach { category ->
-            RadioChoice(
-                selected = filters.categoryId == category.id,
-                label = "${category.name} (${category.itemCount})",
-                onClick = { onCategorySelected(category.id) },
-            )
-        }
-
-        Text("출처", fontWeight = FontWeight.SemiBold)
-        DiscoverySource.entries.forEach { source ->
-            RadioChoice(
-                selected = filters.source == source,
-                label = source.displayName,
-                onClick = { onSourceSelected(source) },
-            )
-        }
-
-        Text("저장 날짜", fontWeight = FontWeight.SemiBold)
-        Text(
-            text = "기기 시간대: ${state.displayZoneId} · 입력 날짜의 시작부터 마지막 날짜 전체를 검색합니다.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        OutlinedTextField(
-            value = filters.dateFrom,
-            onValueChange = onDateFromChange,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("search-date-from"),
-            label = { Text("시작 날짜 YYYY-MM-DD") },
-            isError = state.filterIssues.any {
-                it.field == DiscoveryFilterField.DATE_FROM || it.field == DiscoveryFilterField.DATE_RANGE
-            },
-            singleLine = true,
-        )
-        OutlinedTextField(
-            value = filters.dateTo,
-            onValueChange = onDateToChange,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("search-date-to"),
-            label = { Text("마지막 날짜 YYYY-MM-DD") },
-            isError = state.filterIssues.any {
-                it.field == DiscoveryFilterField.DATE_TO || it.field == DiscoveryFilterField.DATE_RANGE
-            },
-            singleLine = true,
-        )
-
-        ToggleRow(
-            label = "검토된 별칭도 검색",
-            checked = filters.aliases,
-            onCheckedChange = onAliasesChange,
-        )
-        ToggleRow(
-            label = "단서 보완이 필요한 항목만",
-            checked = filters.needsCues,
-            onCheckedChange = onNeedsCuesChange,
-        )
-
-        state.filterIssues.forEach { issue ->
-            Text(issue.message, color = MaterialTheme.colorScheme.error)
-        }
-        Button(
-            onClick = onSubmit,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("search-submit"),
+                .heightIn(min = 48.dp)
+                .border(
+                    width = 1.dp,
+                    color = if (queryIssues.isEmpty()) {
+                        MaterialTheme.colorScheme.outlineVariant
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    },
+                    shape = searchShape,
+                ),
+            shape = searchShape,
+            color = MaterialTheme.colorScheme.surfaceVariant,
         ) {
-            Text(if (filters.query.isBlank()) "최신 항목 보기" else "검색")
+            Row(
+                modifier = Modifier.heightIn(min = 48.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                BasicTextField(
+                    value = filters.query,
+                    onValueChange = onQueryChange,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 14.dp, end = 4.dp)
+                        .testTag("search-query")
+                        .semantics {
+                            contentDescription = "검색어"
+                            if (queryIssues.isNotEmpty()) {
+                                error(queryIssues.joinToString { it.message })
+                            }
+                        },
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontSize = 16.sp,
+                    ),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(
+                        onSearch = {
+                            onSubmit()
+                            keyboardController?.hide()
+                        },
+                    ),
+                    singleLine = true,
+                    decorationBox = { innerTextField ->
+                        Box(contentAlignment = Alignment.CenterStart) {
+                            if (filters.query.isBlank()) {
+                                Text(
+                                    text = "제목, URL, 메모",
+                                    fontSize = 16.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            innerTextField()
+                        }
+                    },
+                )
+                IconButton(
+                    onClick = {
+                        onSubmit()
+                        keyboardController?.hide()
+                    },
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("search-submit"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Search,
+                        contentDescription = if (filters.query.isBlank()) {
+                            "최신 항목 보기"
+                        } else {
+                            "검색"
+                        },
+                    )
+                }
+            }
+        }
+        queryIssues.forEach { issue ->
+            Text(
+                text = issue.message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        if (
+            queryIssues.isEmpty() &&
+            filters.query.codePointLength() > DISCOVERY_QUERY_MAX_CODE_POINTS * 3 / 4
+        ) {
+            Text(
+                text = "${filters.query.codePointLength()} / $DISCOVERY_QUERY_MAX_CODE_POINTS",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             OutlinedButton(
-                onClick = onClearFilters,
-                modifier = Modifier.weight(1f),
+                onClick = { showFilters = true },
+                modifier = Modifier.heightIn(min = 48.dp),
+                shape = RoundedCornerShape(8.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp),
             ) {
+                val count = filters.activeFilterCount()
+                Text(
+                    text = if (count == 0) "필터" else "필터 $count",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+        }
+        SelectedFilters(
+            state = state,
+            onCategorySelected = onCategorySelected,
+            onUnclassifiedChange = onUnclassifiedChange,
+            onSourceSelected = onSourceSelected,
+            onDateFromChange = onDateFromChange,
+            onDateToChange = onDateToChange,
+            onAliasesChange = onAliasesChange,
+            onNeedsCuesChange = onNeedsCuesChange,
+        )
+        if (filters.activeFilterCount() > 0) {
+            TextButton(onClick = onClearFilters) {
                 Text("필터 지우기 · 검색어 유지")
             }
-            OutlinedButton(
-                onClick = onShowNeedsCues,
-                modifier = Modifier.weight(1f),
+        }
+    }
+
+    if (showFilters) {
+        SearchFilterSheet(
+            state = state,
+            onDismiss = { showFilters = false },
+            onSubmit = onSubmit,
+            onCategorySelected = onCategorySelected,
+            onUnclassifiedChange = onUnclassifiedChange,
+            onSourceSelected = onSourceSelected,
+            onDateFromChange = onDateFromChange,
+            onDateToChange = onDateToChange,
+            onAliasesChange = onAliasesChange,
+            onNeedsCuesChange = onNeedsCuesChange,
+            onClearFilters = {
+                onClearFilters()
+                showFilters = false
+            },
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
+@Composable
+internal fun SearchFilterSheet(
+    state: DiscoveryUiState,
+    onDismiss: () -> Unit,
+    onSubmit: () -> Unit,
+    onCategorySelected: (String?) -> Unit,
+    onUnclassifiedChange: (Boolean) -> Unit,
+    onSourceSelected: (DiscoverySource) -> Unit,
+    onDateFromChange: (String) -> Unit,
+    onDateToChange: (String) -> Unit,
+    onAliasesChange: (Boolean) -> Unit,
+    onNeedsCuesChange: (Boolean) -> Unit,
+    onClearFilters: () -> Unit,
+) {
+    val filters = state.filters
+    val dateIssues = state.filterIssues.filter { issue ->
+        issue.field == DiscoveryFilterField.DATE_FROM ||
+            issue.field == DiscoveryFilterField.DATE_TO ||
+            issue.field == DiscoveryFilterField.DATE_RANGE
+    }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+                .testTag("search-filter-sheet"),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 12.dp, bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("단서 보완")
+                Text(
+                    text = "검색 필터",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                TextButton(onClick = onDismiss) { Text("닫기") }
+            }
+            HorizontalDivider()
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    text = "선택한 조건은 ‘필터 적용’을 누른 뒤 결과에 반영됩니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                Text("분류", fontWeight = FontWeight.SemiBold)
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    FilterChoice(
+                        selected = filters.categoryId == null && !filters.unclassified,
+                        label = "전체 분류",
+                        onClick = { onCategorySelected(null) },
+                    )
+                    FilterChoice(
+                        selected = filters.unclassified,
+                        label = "미분류 (${state.unclassifiedCount})",
+                        onClick = { onUnclassifiedChange(true) },
+                    )
+                    state.categories.forEach { category ->
+                        FilterChoice(
+                            selected = filters.categoryId == category.id,
+                            label = "${category.name} (${category.itemCount})",
+                            onClick = { onCategorySelected(category.id) },
+                        )
+                    }
+                }
+
+                HorizontalDivider()
+                Text("출처", fontWeight = FontWeight.SemiBold)
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    DiscoverySource.entries.forEach { source ->
+                        FilterChoice(
+                            selected = filters.source == source,
+                            label = source.displayName,
+                            onClick = { onSourceSelected(source) },
+                        )
+                    }
+                }
+
+                HorizontalDivider()
+                Text("저장 날짜", fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = "기기 시간대: ${state.displayZoneId} · 마지막 날짜 전체를 포함합니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = filters.dateFrom,
+                        onValueChange = onDateFromChange,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("search-date-from"),
+                        label = { Text("시작") },
+                        placeholder = { Text("YYYY-MM-DD") },
+                        isError = state.filterIssues.any {
+                            it.field == DiscoveryFilterField.DATE_FROM ||
+                                it.field == DiscoveryFilterField.DATE_RANGE
+                        },
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = filters.dateTo,
+                        onValueChange = onDateToChange,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("search-date-to"),
+                        label = { Text("마지막") },
+                        placeholder = { Text("YYYY-MM-DD") },
+                        isError = state.filterIssues.any {
+                            it.field == DiscoveryFilterField.DATE_TO ||
+                                it.field == DiscoveryFilterField.DATE_RANGE
+                        },
+                        singleLine = true,
+                    )
+                }
+                dateIssues.forEach { issue ->
+                    Text(
+                        text = issue.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                HorizontalDivider()
+                ToggleRow(
+                    label = "검토된 별칭도 검색",
+                    checked = filters.aliases,
+                    onCheckedChange = onAliasesChange,
+                )
+                ToggleRow(
+                    label = "단서 보완이 필요한 항목만",
+                    checked = filters.needsCues,
+                    onCheckedChange = onNeedsCuesChange,
+                )
+
+                state.filterIssues.filterNot(dateIssues::contains).forEach { issue ->
+                    Text(
+                        text = issue.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+            HorizontalDivider()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onClearFilters,
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text("필터 지우기")
+                }
+                Button(
+                    onClick = {
+                        onSubmit()
+                        if (state.filtersAreValid()) onDismiss()
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("search-filter-apply"),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text("필터 적용")
+                }
             }
         }
     }
 }
 
 @Composable
-private fun RadioChoice(
+private fun SelectedFilters(
+    state: DiscoveryUiState,
+    onCategorySelected: (String?) -> Unit,
+    onUnclassifiedChange: (Boolean) -> Unit,
+    onSourceSelected: (DiscoverySource) -> Unit,
+    onDateFromChange: (String) -> Unit,
+    onDateToChange: (String) -> Unit,
+    onAliasesChange: (Boolean) -> Unit,
+    onNeedsCuesChange: (Boolean) -> Unit,
+) {
+    val filters = state.filters
+    if (filters.activeFilterCount() == 0) return
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "선택한 필터",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            when {
+                filters.unclassified -> RemovableFilterChip(
+                    label = "분류 · 미분류",
+                    onRemove = { onUnclassifiedChange(false) },
+                )
+                filters.categoryId != null -> RemovableFilterChip(
+                    label = "분류 · ${
+                        state.categories.firstOrNull { it.id == filters.categoryId }?.name
+                            ?: "선택한 분류"
+                    }",
+                    onRemove = { onCategorySelected(null) },
+                )
+            }
+            if (filters.source != DiscoverySource.ALL) {
+                RemovableFilterChip(
+                    label = "출처 · ${filters.source.displayName}",
+                    onRemove = { onSourceSelected(DiscoverySource.ALL) },
+                )
+            }
+            if (filters.dateFrom.isNotBlank()) {
+                RemovableFilterChip(
+                    label = "시작 · ${filters.dateFrom}",
+                    onRemove = { onDateFromChange("") },
+                )
+            }
+            if (filters.dateTo.isNotBlank()) {
+                RemovableFilterChip(
+                    label = "마지막 · ${filters.dateTo}",
+                    onRemove = { onDateToChange("") },
+                )
+            }
+            if (!filters.aliases) {
+                RemovableFilterChip(
+                    label = "별칭 제외",
+                    onRemove = { onAliasesChange(true) },
+                )
+            }
+            if (filters.needsCues) {
+                RemovableFilterChip(
+                    label = "단서 보완 필요",
+                    onRemove = { onNeedsCuesChange(false) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemovableFilterChip(
+    label: String,
+    onRemove: () -> Unit,
+) {
+    AssistChip(
+        onClick = onRemove,
+        label = { Text(label) },
+        modifier = Modifier.semantics {
+            contentDescription = "$label 지우기"
+        },
+        shape = RoundedCornerShape(7.dp),
+    )
+}
+
+@Composable
+private fun FilterChoice(
     selected: Boolean,
     label: String,
     onClick: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        RadioButton(selected = selected, onClick = onClick)
-        Text(label)
-    }
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label) },
+        modifier = Modifier.heightIn(min = 48.dp),
+        shape = RoundedCornerShape(7.dp),
+        colors = FilterChipDefaults.filterChipColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            selectedContainerColor = MaterialTheme.colorScheme.onSurface,
+            selectedLabelColor = MaterialTheme.colorScheme.surface,
+        ),
+        border = BorderStroke(
+            1.dp,
+            if (selected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outlineVariant,
+        ),
+    )
 }
 
 @Composable
@@ -375,12 +741,23 @@ private fun ToggleRow(
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .toggleable(
+                value = checked,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            ),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, modifier = Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(
+            checked = checked,
+            onCheckedChange = null,
+            modifier = Modifier.clearAndSetSemantics {},
+        )
     }
 }
 
@@ -391,38 +768,52 @@ private fun SearchResults(
     onOpenAliasDisclosure: (String) -> Unit,
     onRetry: () -> Unit,
     onLoadMore: () -> Unit,
-    onClearFilters: () -> Unit,
-    onShowNeedsCues: () -> Unit,
 ) {
     Column(
         modifier = Modifier.testTag("search-results"),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text(
-            text = if (state.appliedQuery?.query == null) "최신 저장 항목" else "서버 검색 결과",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
+            text = if (state.appliedQuery.isLatestItemsQuery()) "최신 저장 항목" else "검색 결과",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (state.hasUnappliedSearchChanges()) {
+            Text(
+                text = "지금 보이는 결과에는 위 변경사항이 아직 적용되지 않았어요.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
 
         when {
-            state.isSearchLoading && state.items.isEmpty() -> DiscoveryLoading("서버에서 항목을 찾고 있어요.")
+            state.isSearchLoading && state.items.isEmpty() -> DiscoveryLoading("항목을 찾고 있어요.")
             state.searchError != null && state.items.isEmpty() -> SearchFailure(state.searchError, onRetry)
             state.items.isEmpty() -> {
                 Text("조건에 맞는 항목이 없어요.")
-                OutlinedButton(onClick = onClearFilters, modifier = Modifier.fillMaxWidth()) {
-                    Text("필터 지우기 · 검색어 유지")
-                }
-                OutlinedButton(onClick = onShowNeedsCues, modifier = Modifier.fillMaxWidth()) {
-                    Text("단서 보완이 필요한 항목 보기")
-                }
+                Text(
+                    text = if (state.appliedQuery.isLatestItemsQuery()) {
+                        "링크를 보관하면 제목과 메모로 다시 찾을 수 있어요."
+                    } else {
+                        "검색어를 바꾸거나 선택한 필터를 확인해 보세요."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             else -> {
-                state.items.forEach { item ->
-                    SearchResultCard(
-                        item = item,
-                        onOpen = { onOpenItem(item.id) },
-                        onOpenAliasDisclosure = { onOpenAliasDisclosure(item.id) },
-                    )
+                Column {
+                    state.items.forEachIndexed { index, item ->
+                        SearchResultCard(
+                            item = item,
+                            onOpen = { onOpenItem(item.id) },
+                            onOpenAliasDisclosure = { onOpenAliasDisclosure(item.id) },
+                        )
+                        if (index < state.items.lastIndex) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                        }
+                    }
                 }
                 state.searchError?.let { SearchFailure(it, onRetry) }
                 if (state.isSearchLoading) {
@@ -443,70 +834,73 @@ private fun SearchResultCard(
     onOpen: () -> Unit,
     onOpenAliasDisclosure: () -> Unit,
 ) {
-    Card(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("search-item-${item.id}")
-            .clickable(onClick = onOpen),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-        ),
+            .clickable(onClick = onOpen)
+            .padding(vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            SelectionContainer {
-                Text(
-                    text = item.displayTitle?.takeUnless(String::isBlank) ?: item.url,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
-            if (item.matchType == "alias") {
-                Text(
-                    text = "별칭으로 찾음",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                )
-            }
-            item.noteExcerpt?.takeUnless(String::isBlank)?.let { excerpt ->
-                Text("나중에 찾을 메모: $excerpt")
-            }
+        Text(
+            text = "출처 · ${sourceDisplayName(item.source)}",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = item.displayTitle?.takeUnless(String::isBlank) ?: item.url,
+            fontSize = 17.sp,
+            lineHeight = 24.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        item.noteExcerpt?.takeUnless(String::isBlank)?.let { excerpt ->
             Text(
-                text = "출처: ${sourceDisplayName(item.source)}",
-                style = MaterialTheme.typography.bodySmall,
+                text = excerpt,
+                fontSize = 13.sp,
+                lineHeight = 20.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            if (item.categoryRefs.isEmpty()) {
-                Text("분류: 미분류", style = MaterialTheme.typography.bodySmall)
-            } else {
+        }
+        if (item.categoryRefs.isEmpty()) {
+            Text(
+                text = "미분류",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = item.categoryRefs.mapNotNull { it.name }.joinToString(),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        item.cueLabel()?.let { label ->
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                color = if (item.cueState == "limited" || item.cueState == "missing") {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        if (item.matchType == "alias") {
+            Text(
+                text = "별칭으로 찾음",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            TextButton(
+                onClick = onOpenAliasDisclosure,
+                modifier = Modifier.align(Alignment.End),
+                contentPadding = PaddingValues(horizontal = 8.dp),
+            ) {
                 Text(
-                    text = "분류: ${item.categoryRefs.mapNotNull { it.name }.joinToString()}",
-                    style = MaterialTheme.typography.bodySmall,
+                    text = "일치 표현 확인",
+                    style = MaterialTheme.typography.labelLarge,
                 )
-            }
-            item.cueLabel()?.let { label ->
-                Text(
-                    text = label,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (item.cueState == "limited" || item.cueState == "missing") {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
-            }
-            Button(onClick = onOpen, modifier = Modifier.fillMaxWidth()) {
-                Text("항목 열기")
-            }
-            if (item.matchType == "alias") {
-                OutlinedButton(
-                    onClick = onOpenAliasDisclosure,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("일치 표현 확인")
-                }
             }
         }
     }
@@ -516,9 +910,76 @@ private fun SearchResultCard(
 private fun SearchFailure(message: String, onRetry: () -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(message, color = MaterialTheme.colorScheme.error)
-        Text("검색 결과 대신 기기의 전체 보관 캐시를 표시하지 않았어요.")
+        Text(
+            text = "오류가 난 결과를 기기에 보관된 전체 항목으로 바꾸어 표시하지 않았어요.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Button(onClick = onRetry, modifier = Modifier.fillMaxWidth()) {
             Text("검색 다시 시도")
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CategoryManagementSheet(
+    state: DiscoveryUiState,
+    onDismiss: () -> Unit,
+    onCreateNameChange: (String) -> Unit,
+    onCreate: () -> Unit,
+    onRename: (String) -> Unit,
+    onDelete: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onRetryRequest: (String) -> Unit,
+    onDiscardRequest: (String) -> Unit,
+    onDiscardAndEditRequest: (String) -> Unit,
+    onReviewRequest: (String) -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 12.dp, bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "분류 관리",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                TextButton(onClick = onDismiss) { Text("닫기") }
+            }
+            HorizontalDivider()
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, top = 12.dp, end = 20.dp, bottom = 32.dp),
+            ) {
+                CategoryManagement(
+                    state = state,
+                    onCreateNameChange = onCreateNameChange,
+                    onCreate = onCreate,
+                    onRename = onRename,
+                    onDelete = onDelete,
+                    onRefresh = onRefresh,
+                    onRetryRequest = onRetryRequest,
+                    onDiscardRequest = onDiscardRequest,
+                    onDiscardAndEditRequest = onDiscardAndEditRequest,
+                    onReviewRequest = onReviewRequest,
+                )
+            }
         }
     }
 }
@@ -537,12 +998,14 @@ private fun CategoryManagement(
     onReviewRequest: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text(
-            text = "분류 관리",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
-        )
         Text("직접 만든 분류는 최대 ${DISCOVERY_CUSTOM_CATEGORY_LIMIT}개까지 사용할 수 있어요.")
+        OutlinedButton(
+            onClick = onRefresh,
+            enabled = !state.isCategoriesLoading,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (state.isCategoriesLoading) "분류 불러오는 중" else "분류 새로고침")
+        }
         if (state.isShowingCachedCategories) {
             Text(
                 text = "최신이 아닐 수 있는 마지막 확인 분류 목록 · ${state.categoriesFetchedAt?.let(::formatCachedAt) ?: "동기화 시각 확인 불가"}",
@@ -682,7 +1145,7 @@ private fun CategoryOutboxCard(
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
         Column(
             modifier = Modifier.padding(14.dp),
@@ -968,3 +1431,38 @@ private fun categoryQueueMessage(state: OutboxState): String = when (state) {
 
 private fun formatCachedAt(timestamp: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))
+
+private fun DiscoveryFilterInput.activeFilterCount(): Int =
+    listOf(
+        categoryId != null || unclassified,
+        source != DiscoverySource.ALL,
+        dateFrom.isNotBlank(),
+        dateTo.isNotBlank(),
+        !aliases,
+        needsCues,
+    ).count { it }
+
+private fun DiscoveryUiState.filtersAreValid(): Boolean = runCatching {
+    prepareDiscoveryQuery(filters, ZoneId.of(displayZoneId)) is DiscoveryQueryPreparation.Valid
+}.getOrDefault(false)
+
+private fun DiscoveryUiState.hasUnappliedSearchChanges(): Boolean {
+    val applied = appliedQuery ?: return false
+    val prepared = runCatching {
+        prepareDiscoveryQuery(filters, ZoneId.of(displayZoneId))
+    }.getOrNull()
+    return prepared !is DiscoveryQueryPreparation.Valid ||
+        prepared.snapshot.queryKey != applied.queryKey
+}
+
+private fun DiscoveryQuerySnapshot?.isLatestItemsQuery(): Boolean = this == null ||
+    (
+        query == null &&
+            categoryId == null &&
+            !unclassified &&
+            source == DiscoverySource.ALL &&
+            dateFromUtc == null &&
+            dateToExclusiveUtc == null &&
+            aliases &&
+            !needsCues
+        )

@@ -3,9 +3,15 @@ package com.linkvault.app
 import android.app.Activity
 import android.app.Instrumentation.ActivityResult
 import android.content.Intent
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -52,18 +58,60 @@ class CaptureFlowTest {
         compose.waitForIdle()
     }
 
+    private fun openCapture() {
+        compose.onNodeWithTag("root-capture").performClick()
+    }
+
     @Test
-    fun visitingAccountPreservesSharedInput() {
-        share("https://example.com/remember")
-        compose.onNodeWithText("회원 계정").performScrollTo().performClick()
+    fun normalLaunchStartsAtLibraryAndOffersCaptureEntry() {
+        compose.onAllNodes(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Tab))
+            .assertCountEquals(3)
+        compose.onNodeWithTag("root-library").assertIsSelected()
+        compose.onNodeWithText("내 보관함").assertExists()
+        compose.onNodeWithText("뒤로").assertDoesNotExist()
+        compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertDoesNotExist()
+        openCapture()
+        compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertExists()
+    }
+
+    @Test
+    fun librarySearchEntryAndSettingsTabSurviveRecreation() {
+        compose.onNodeWithTag("library-search").performClick()
+        compose.onNodeWithTag("root-discovery").assertIsSelected()
+        compose.activityRule.scenario.recreate()
+        compose.onNodeWithTag("root-discovery").assertIsSelected()
+        compose.onNodeWithTag("root-account").performClick()
         compose.onNodeWithText("계정").assertExists()
-        compose.onNodeWithText("뒤로").performClick()
+        compose.activityRule.scenario.recreate()
+        compose.onNodeWithTag("root-account").assertIsSelected()
+        compose.onNodeWithTag("root-library").performClick()
+        compose.onNodeWithText("내 보관함").assertExists()
+    }
+
+    @Test
+    fun settingsFontLicenseIsLocalAndDismissible() {
+        compose.onNodeWithTag("root-account").performClick()
+        compose.onNodeWithTag("font-license").performScrollTo().performClick()
+        compose.onNodeWithTag("font-license-dialog").assertExists()
+        compose.onNodeWithText("SIL OPEN FONT LICENSE Version 1.1", substring = true).assertExists()
+        compose.onNodeWithText("닫기").performClick()
+        compose.onNodeWithTag("font-license-dialog").assertDoesNotExist()
+        compose.onNodeWithTag("root-account").assertIsSelected()
+    }
+
+    @Test
+    fun visitingSettingsPreservesSharedInput() {
+        share("https://example.com/remember")
+        compose.onNodeWithTag("root-account").performClick()
+        compose.onNodeWithText("계정").assertExists()
+        openCapture()
         compose.onNodeWithText("URL 후보 1개").assertExists()
         compose.onNodeWithText("원문 열기").performScrollTo().assertIsEnabled()
     }
 
     @Test
     fun oversizedReplacementCannotOpenPreviousValidUrl() {
+        openCapture()
         compose.onNodeWithText("공유 텍스트 또는 원문 URL")
             .performTextReplacement("https://example.com/previous")
         compose.onNodeWithText("공유 텍스트 또는 원문 URL")
@@ -85,6 +133,7 @@ class CaptureFlowTest {
 
     @Test
     fun manuallyEnteredUrlSurvivesActivityRecreation() {
+        openCapture()
         compose.onNodeWithText("공유 텍스트 또는 원문 URL")
             .performTextReplacement("https://example.com/한국어")
         compose.activityRule.scenario.recreate()

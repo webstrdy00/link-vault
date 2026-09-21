@@ -1,5 +1,6 @@
 package com.linkvault.app.library
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,7 +21,10 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -88,6 +92,7 @@ fun ClassificationControls(
         factory = factory,
     )
     val state by controlsViewModel.uiState.collectAsState()
+    var showCategoryManagement by rememberSaveable(item.id) { mutableStateOf(false) }
 
     LaunchedEffect(controlsViewModel, item) {
         controlsViewModel.updateItem(item)
@@ -104,7 +109,7 @@ fun ClassificationControls(
     if (!state.sessionValid) {
         Text(
             text = "로그인이 필요해요.",
-            color = MaterialTheme.colorScheme.error,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(vertical = 12.dp),
         )
         return
@@ -116,23 +121,20 @@ fun ClassificationControls(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "분류",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
+                text = "카테고리",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
             )
-            if (state.item.manualOverride == true) {
-                Surface(
-                    color = MaterialTheme.colorScheme.secondaryContainer,
-                    shape = MaterialTheme.shapes.small,
-                ) {
-                    Text(
-                        text = "직접 선택한 분류",
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
+            TextButton(onClick = { showCategoryManagement = !showCategoryManagement }) {
+                Text(if (showCategoryManagement) "관리 닫기" else "카테고리 관리")
             }
+        }
+        if (state.item.manualOverride == true) {
+            Text(
+                text = "직접 선택",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
         }
 
         CurrentCategoryReasons(
@@ -141,107 +143,28 @@ fun ClassificationControls(
             onCategoryClick = controlsViewModel::toggleReason,
         )
 
-        if (state.categoriesLoading && !state.hasCategorySnapshot) {
-            Text("서버에서 분류 목록을 불러오고 있어요.")
-        }
-        if (state.categoriesFromCache) {
-            val fetchedAt = state.categoriesFetchedAt?.let(::formatClassificationCacheTime)
-                ?: "동기화 시각 확인 불가"
-            Text(
-                text = "이 기기의 마지막 분류 목록 · $fetchedAt",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
         state.categoriesError?.let { message ->
             Text(message, color = MaterialTheme.colorScheme.error)
             OutlinedButton(
                 onClick = controlsViewModel::reloadCategories,
                 enabled = !state.categoriesLoading,
                 modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.small,
             ) {
-                Text("분류 목록 다시 시도")
+                Text("카테고리 다시 불러오기")
             }
         }
-
-        if (state.hasCategorySnapshot) {
+        if (state.missingSelectedCategoryIds.isNotEmpty() && !showCategoryManagement) {
             Text(
-                text = "직접 선택 (${state.selectedCategoryIds.size} / $LIBRARY_CATEGORY_MAX_SELECTION)",
-                fontWeight = FontWeight.SemiBold,
+                text = "더 이상 사용할 수 없는 카테고리가 선택되어 있어요.",
+                color = MaterialTheme.colorScheme.error,
             )
-            state.categories.forEach { category ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Checkbox(
-                        checked = category.id in state.selectedCategoryIds,
-                        onCheckedChange = { controlsViewModel.toggleCategory(category.id) },
-                        enabled = !state.categorySelectionLocked,
-                        modifier = Modifier.testTag("classification-choice-${category.id}"),
-                    )
-                    Column {
-                        Text(category.name)
-                        category.kind?.takeUnless(String::isBlank)?.let { kind ->
-                            Text(
-                                text = kind,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
-            state.missingSelectedCategoryIds.forEach { categoryId ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Checkbox(
-                        checked = true,
-                        onCheckedChange = { controlsViewModel.toggleCategory(categoryId) },
-                        enabled = !state.categorySelectionLocked,
-                    )
-                    Text(
-                        text = "삭제되었거나 사용할 수 없는 분류 · $categoryId",
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            }
-            if (state.missingSelectedCategoryIds.isNotEmpty()) {
-                Text(
-                    text = "사용할 수 없는 분류 선택을 해제한 뒤 다시 확인해 주세요.",
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            state.selectionError?.let { message ->
-                Text(message, color = MaterialTheme.colorScheme.error)
-            }
-
-            if (state.readyToReconfirmRequestId == null) {
-                Button(
-                    onClick = controlsViewModel::submitCategories,
-                    enabled = state.categoryIntent.submitVersion != null &&
-                        !state.hasUnresolvedControlRequest &&
-                        state.missingSelectedCategoryIds.isEmpty(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("선택한 분류 저장")
-                }
-            } else {
-                Text("최신 링크와 분류 목록을 확인했어요. 아래 버튼을 눌러야 새 요청 ID와 최신 버전으로 저장합니다.")
-                Button(
-                    onClick = controlsViewModel::confirmCategoriesAgain,
-                    enabled = !state.categoryQueuing &&
-                        state.categoryIntent.reviewedVersion != null &&
-                        state.entries.none {
-                            it.requestId != state.readyToReconfirmRequestId
-                        } &&
-                        state.missingSelectedCategoryIds.isEmpty(),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("새 요청으로 분류 저장")
-                }
+            OutlinedButton(
+                onClick = { showCategoryManagement = true },
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.small,
+            ) {
+                Text("카테고리 확인")
             }
         }
 
@@ -264,70 +187,27 @@ fun ClassificationControls(
             Text(message, color = MaterialTheme.colorScheme.error)
         }
 
-        if (state.showReclassifyConfirmation) {
-            Surface(
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                shape = MaterialTheme.shapes.medium,
-            ) {
-                Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text(
-                        text = "자동 분류 다시 적용",
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text("직접 만든 분류는 유지하고, 기본 분류를 다시 적용합니다.")
-                    Button(
-                        onClick = controlsViewModel::confirmReclassify,
-                        enabled = state.item.version != null &&
-                            !state.hasUnresolvedControlRequest &&
-                            !state.commandQueuing,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("확인")
-                    }
-                    OutlinedButton(
-                        onClick = controlsViewModel::cancelReclassify,
-                        enabled = !state.commandQueuing,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("취소")
-                    }
-                }
-            }
-        } else {
-            OutlinedButton(
-                onClick = controlsViewModel::requestReclassify,
-                enabled = state.item.version != null &&
-                    !state.hasUnresolvedControlRequest &&
-                    !state.commandQueuing,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("자동 분류 다시 적용")
-            }
-        }
-
         if (state.item.needsCuePrompt()) {
             Surface(
-                color = MaterialTheme.colorScheme.tertiaryContainer,
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
                 shape = MaterialTheme.shapes.medium,
             ) {
                 Column(
-                    modifier = Modifier.padding(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     Text(
-                        text = "나중에 어떤 말로 찾을까요?",
+                        text = "검색을 위한 메모",
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onTertiaryContainer,
                     )
+                    Text("나중에 떠올릴 만한 말을 메모에 남기면 더 쉽게 찾을 수 있어요.")
                     Button(
                         onClick = onEditNote,
                         enabled = !state.hasUnresolvedControlRequest,
                         modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
                     ) {
-                        Text("메모 수정")
+                        Text("메모 쓰기")
                     }
                     TextButton(
                         onClick = controlsViewModel::dismissCue,
@@ -342,6 +222,149 @@ fun ClassificationControls(
                 }
             }
         }
+
+        if (showCategoryManagement) {
+            HorizontalDivider()
+            Text(
+                text = "카테고리 관리",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            if (state.categoriesLoading && !state.hasCategorySnapshot) {
+                Text("카테고리를 불러오고 있어요.")
+            }
+            if (state.categoriesFromCache) {
+                val fetchedAt = state.categoriesFetchedAt?.let(::formatClassificationCacheTime)
+                    ?: "동기화 시각 확인 불가"
+                Text(
+                    text = "마지막 동기화 · $fetchedAt",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (state.hasCategorySnapshot) {
+                Text(
+                    text = "직접 선택 (${state.selectedCategoryIds.size} / $LIBRARY_CATEGORY_MAX_SELECTION)",
+                    fontWeight = FontWeight.SemiBold,
+                )
+                state.categories.forEach { category ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = category.id in state.selectedCategoryIds,
+                            onCheckedChange = { controlsViewModel.toggleCategory(category.id) },
+                            enabled = !state.categorySelectionLocked,
+                            modifier = Modifier.testTag("classification-choice-${category.id}"),
+                        )
+                        Text(category.name)
+                    }
+                }
+                state.missingSelectedCategoryIds.forEach { categoryId ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = true,
+                            onCheckedChange = { controlsViewModel.toggleCategory(categoryId) },
+                            enabled = !state.categorySelectionLocked,
+                        )
+                        Text(
+                            text = "사용할 수 없는 카테고리 · $categoryId",
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+                if (state.missingSelectedCategoryIds.isNotEmpty()) {
+                    Text(
+                        text = "사용할 수 없는 카테고리를 해제한 뒤 다시 확인해 주세요.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                state.selectionError?.let { message ->
+                    Text(message, color = MaterialTheme.colorScheme.error)
+                }
+
+                if (state.readyToReconfirmRequestId == null) {
+                    Button(
+                        onClick = controlsViewModel::submitCategories,
+                        enabled = state.categoryIntent.submitVersion != null &&
+                            !state.hasUnresolvedControlRequest &&
+                            state.missingSelectedCategoryIds.isEmpty(),
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text("선택 저장")
+                    }
+                } else {
+                    Text("최신 내용과 카테고리를 확인했어요. 선택을 검토한 뒤 다시 저장해 주세요.")
+                    Button(
+                        onClick = controlsViewModel::confirmCategoriesAgain,
+                        enabled = !state.categoryQueuing &&
+                            state.categoryIntent.reviewedVersion != null &&
+                            state.entries.none {
+                                it.requestId != state.readyToReconfirmRequestId
+                            } &&
+                            state.missingSelectedCategoryIds.isEmpty(),
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.small,
+                    ) {
+                        Text("다시 저장")
+                    }
+                }
+            }
+
+            if (state.showReclassifyConfirmation) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    shape = MaterialTheme.shapes.medium,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text = "자동 분류 다시 적용",
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text("직접 만든 카테고리는 유지하고 기본 카테고리를 다시 정리해요.")
+                        Button(
+                            onClick = controlsViewModel::confirmReclassify,
+                            enabled = state.item.version != null &&
+                                !state.hasUnresolvedControlRequest &&
+                                !state.commandQueuing,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
+                        ) {
+                            Text("다시 적용")
+                        }
+                        TextButton(
+                            onClick = controlsViewModel::cancelReclassify,
+                            enabled = !state.commandQueuing,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("취소")
+                        }
+                    }
+                }
+            } else {
+                OutlinedButton(
+                    onClick = controlsViewModel::requestReclassify,
+                    enabled = state.item.version != null &&
+                        !state.hasUnresolvedControlRequest &&
+                        !state.commandQueuing,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text("자동 분류 다시 적용")
+                }
+            }
+        }
     }
 }
 
@@ -352,31 +375,52 @@ private fun CurrentCategoryReasons(
     onCategoryClick: (String) -> Unit,
 ) {
     if (item.categoryRefs.isEmpty()) {
-        Text("현재 적용된 분류가 없어요.")
+        Text(
+            text = "아직 카테고리가 없어요.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         return
     }
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("현재 적용된 분류", fontWeight = FontWeight.SemiBold)
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "현재 카테고리",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelMedium,
+        )
         item.categoryRefs.forEachIndexed { index, category ->
             val key = category.id ?: "category-$index"
-            TextButton(
-                onClick = { onCategoryClick(key) },
-                modifier = Modifier.testTag("current-category-$key"),
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onCategoryClick(key) }
+                    .testTag("current-category-$key")
+                    .padding(vertical = 7.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(category.name?.takeUnless(String::isBlank) ?: "이름 없는 분류")
+                Text(
+                    text = category.name?.takeUnless(String::isBlank) ?: "이름 없는 카테고리",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    text = if (expandedCategoryId == key) "설명 접기" else "설명 보기",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
             if (expandedCategoryId == key) {
                 val explanations = item.currentClassificationExplanations(category)
                 if (explanations.isEmpty()) {
                     Text(
-                        text = "현재 자료에서 확인된 자동 분류 근거가 없어요.",
+                        text = "표시할 분류 설명이 없어요.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
                     explanations.forEach { explanation ->
                         Text(
-                            text = "표현: ${explanation.expression} · 필드: ${explanation.field}",
+                            text = "분류에 반영된 표현 · ${explanation.expression}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -397,12 +441,12 @@ private fun ControlOutboxContent(
 ) {
     if (state.entries.isEmpty()) return
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("이 링크의 분류 요청", fontWeight = FontWeight.Bold)
+        Text("카테고리 동기화", fontWeight = FontWeight.Bold)
         state.entries.forEach { entry ->
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
                 ),
             ) {
                 Column(
@@ -418,6 +462,7 @@ private fun ControlOutboxContent(
                         Button(
                             onClick = { onRetry(entry.requestId) },
                             modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
                         ) {
                             Text("다시 시도")
                         }
@@ -433,6 +478,7 @@ private fun ControlOutboxContent(
                             },
                             enabled = !state.loadingLatest,
                             modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
                         ) {
                             Text("최신 내용 확인")
                         }
@@ -445,8 +491,9 @@ private fun ControlOutboxContent(
                         OutlinedButton(
                             onClick = { onDiscard(entry.requestId) },
                             modifier = Modifier.fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
                         ) {
-                            Text("요청 버리기")
+                            Text("변경 취소")
                         }
                     }
                 }
@@ -1322,21 +1369,21 @@ private fun OutboxEntry.controlKind(): ControlKind? = when {
 }
 
 private fun OutboxEntry.controlLabel(): String = when (controlKind()) {
-    ControlKind.CATEGORIES -> "직접 분류 저장"
+    ControlKind.CATEGORIES -> "카테고리 변경"
     ControlKind.CUE_DISMISS -> "찾기 질문 나중에 보기"
     ControlKind.RECLASSIFY -> "자동 분류 다시 적용"
-    null -> "분류 요청"
+    null -> "카테고리 변경"
 }
 
 private fun OutboxState.controlQueueMessage(): String = when (this) {
-    OutboxState.PENDING -> "전송 대기 중"
-    OutboxState.RUNNING -> "서버에 전송 중"
-    OutboxState.RETRY -> "연결되면 다시 전송"
-    OutboxState.WAITING_LOGIN -> "로그인 후 전송"
-    OutboxState.FAILED -> "서버 요청 실패"
-    OutboxState.CONFLICT -> "최신 버전과 충돌"
-    OutboxState.EXPIRED -> "요청 만료 · 최신 내용 확인 필요"
-    OutboxState.SAVED -> "서버 응답 적용 중"
+    OutboxState.PENDING -> "동기화 대기 중"
+    OutboxState.RUNNING -> "동기화 중"
+    OutboxState.RETRY -> "연결되면 다시 동기화"
+    OutboxState.WAITING_LOGIN -> "로그인 후 동기화"
+    OutboxState.FAILED -> "동기화 실패"
+    OutboxState.CONFLICT -> "다른 변경과 충돌"
+    OutboxState.EXPIRED -> "최신 내용 확인 필요"
+    OutboxState.SAVED -> "변경 사항 적용 중"
 }
 
 private fun LibraryItemDetail.needsCuePrompt(): Boolean =

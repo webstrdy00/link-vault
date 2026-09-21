@@ -3,7 +3,9 @@ package com.linkvault.app
 import android.content.Intent
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -24,6 +26,7 @@ class ColdShareFlowTest {
             putExtra(Intent.EXTRA_TEXT, "https://example.com/first https://example.com/second")
         }
         ActivityScenario.launch<MainActivity>(intent).use { scenario ->
+            compose.onNodeWithTag("capture-screen").assertIsDisplayed()
             compose.onNodeWithText("원문 열기").performScrollTo().assertIsNotEnabled()
             compose.onNodeWithText("https://example.com/second").performScrollTo().performClick()
             scenario.recreate()
@@ -39,6 +42,7 @@ class ColdShareFlowTest {
             type = "image/jpeg"
         }
         ActivityScenario.launch<MainActivity>(intent).use {
+            compose.onNodeWithTag("capture-screen").assertIsDisplayed()
             compose.onNodeWithText("이미지 공유 요청을 받았습니다.", substring = true).assertExists()
             compose.onNodeWithText("원문 열기").performScrollTo().assertIsNotEnabled()
         }

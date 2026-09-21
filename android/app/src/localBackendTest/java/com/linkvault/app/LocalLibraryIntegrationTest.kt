@@ -1,9 +1,15 @@
 package com.linkvault.app
 
 import android.content.Intent
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -31,6 +37,27 @@ class LocalLibraryIntegrationTest {
         }
     }
 
+    private fun clickRoot(tag: String) {
+        compose.waitUntil(timeoutMillis = 20_000) {
+            compose.onAllNodes(hasTestTag(tag), useUnmergedTree = true)
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
+    }
+
+    private fun openItemWithText(text: String) {
+        val itemCard = androidx.compose.ui.test.SemanticsMatcher("library item card") { node ->
+            node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("detail-") == true
+        } and hasAnyDescendant(hasText(text))
+        compose.waitUntil(timeoutMillis = 20_000) {
+            compose.onAllNodes(itemCard, useUnmergedTree = true)
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNode(itemCard, useUnmergedTree = true)
+            .performScrollTo()
+            .performClick()
+    }
+
     @Test
     fun realAuthenticatedSessionSavesAndReloadsOriginal(): Unit = runBlocking {
         check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:18021")
@@ -56,11 +83,11 @@ class LocalLibraryIntegrationTest {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
             ActivityScenario.launch<MainActivity>(intent).use {
-                compose.onNodeWithText("회원 계정").performScrollTo().performClick()
+                clickRoot("root-account")
                 awaitText("베타 이용 승인 대기 중이에요")
                 compose.onNodeWithText("승인 상태 다시 확인").performScrollTo().performClick()
                 awaitText("로그인했어요")
-                compose.onNodeWithText("뒤로").performClick()
+                clickRoot("root-capture")
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo()
                     .performTextReplacement(fixtureUrl)
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
@@ -70,9 +97,12 @@ class LocalLibraryIntegrationTest {
                 compose.onNodeWithText("서버에 보관").performScrollTo().assertIsEnabled().performClick()
                 awaitText("서버에 보관했어요.")
                 compose.onNodeWithText("새로고침").performScrollTo().performClick()
-                awaitText("상세")
-                compose.onNodeWithText("상세").performScrollTo().performClick()
-                awaitText("서버 처리 상태")
+                awaitText("에뮬레이터 실제 서버 저장 검증")
+                openItemWithText("에뮬레이터 실제 서버 저장 검증")
+                awaitText("처리 정보 보기")
+                compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
+                awaitText("처리 정보")
+                awaitText("링크 정보 ·", substring = true)
                 compose.onNodeWithText("에뮬레이터 실제 서버 저장 검증").assertExists()
             }
         } finally {

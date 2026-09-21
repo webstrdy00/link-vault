@@ -14,8 +14,10 @@ import android.net.Uri
 import android.os.Build
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -57,6 +59,7 @@ class CapturePersistenceTest {
         }
         try {
             ActivityScenario.launch<MainActivity>(intent).use {
+                compose.onNodeWithTag("root-capture").performClick()
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo().performTextReplacement(text)
                 compose.onNodeWithText(selected).performScrollTo().performClick()
                 withTimeout(10_000) {
@@ -66,6 +69,12 @@ class CapturePersistenceTest {
                 }
             }
             ActivityScenario.launch<MainActivity>(intent).use {
+                compose.waitUntil(10_000) {
+                    compose.onAllNodesWithText("이어쓰기").fetchSemanticsNodes().isNotEmpty()
+                }
+                compose.onNodeWithTag("root-library").assertIsSelected()
+                compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertDoesNotExist()
+                compose.onNodeWithText("이어쓰기").performClick()
                 compose.waitUntil(10_000) {
                     compose.onAllNodesWithText("URL 후보 2개").fetchSemanticsNodes().isNotEmpty()
                 }

@@ -7,18 +7,22 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ProvideTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -26,8 +30,11 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -119,15 +126,16 @@ fun AttachmentControls(
     }
 
     HorizontalDivider()
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text(
             text = "이미지 첨부",
-            style = MaterialTheme.typography.titleLarge,
+            style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold,
         )
         if (!state.sessionValid) {
             Text(
                 text = "로그인이 바뀌어 첨부 자료를 화면에서 지웠어요.",
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.error,
             )
             return@Column
@@ -188,29 +196,49 @@ fun AttachmentControls(
         }
 
         state.message?.let {
-            Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         state.actionError?.let {
-            Text(it, color = MaterialTheme.colorScheme.error)
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
 
 @Composable
 private fun AttachmentStatusContent(state: AttachmentUiState) {
-    Card(
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("attachment-queue-status"),
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+    var detailsExpanded by rememberSaveable(state.item.id) { mutableStateOf(false) }
+    val metadataNeedsAttention = when (state.item.metadataState) {
+        "ready", "unsupported" -> false
+        else -> true
+    }
+    val hasDetails = state.item.activeAsset != null ||
+        !metadataNeedsAttention ||
+        state.item.extractionMeta.hasTruncatedText
+
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        AttachmentInfoSection(
+            title = "이미지 상태",
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("attachment-queue-status"),
         ) {
-            Text("첨부 상태", fontWeight = FontWeight.SemiBold)
+            when {
+                state.item.activeAsset != null ->
+                    Text("서버에 저장된 활성 이미지가 있어요.")
+                state.localStage != AttachmentLocalStage.IDLE ||
+                    state.pendingAttachments.isNotEmpty() ->
+                    Text("새 이미지를 준비하거나 전송하고 있어요.")
+                state.attachmentQueueLoaded && state.outboxLoaded ->
+                    Text("첨부 이미지가 없어요.")
+            }
             if (!state.attachmentQueueLoaded || !state.outboxLoaded) {
                 StatusLine("이 기기의 대기 작업을 확인하고 있어요.", busy = true)
             }
@@ -219,10 +247,8 @@ private fun AttachmentStatusContent(state: AttachmentUiState) {
                     message = "선택한 원본은 바꾸지 않고 기기 안에서 업로드 사본을 준비하고 있어요.",
                     busy = true,
                 )
-                AttachmentLocalStage.OCR_RUNNING -> StatusLine(
-                    message = "기기에서 OCR을 실행하고 있어요.",
-                    busy = true,
-                )
+                AttachmentLocalStage.OCR_RUNNING ->
+                    Text("업로드 사본을 기기에 준비했어요.")
                 AttachmentLocalStage.QUEUED -> Text("기기에 보관됨 · 전송 대기 중")
                 AttachmentLocalStage.FAILED -> Text(
                     "기기에서 이미지를 준비하지 못했어요.",
@@ -239,28 +265,127 @@ private fun AttachmentStatusContent(state: AttachmentUiState) {
                     color = MaterialTheme.colorScheme.error,
                 )
             }
-            if (state.item.activeAsset != null) {
-                Text("서버에 저장된 활성 이미지가 있어요.")
-            } else if (
-                state.localStage == AttachmentLocalStage.IDLE &&
-                state.pendingAttachments.isEmpty()
-            ) {
-                Text("첨부 이미지가 없어요.")
-            }
-            if (state.localOcrFailed) {
-                Text(
+        }
+
+        AttachmentInfoSection(title = "텍스트 인식 (OCR)") {
+            when {
+                state.localStage == AttachmentLocalStage.OCR_RUNNING ->
+                    StatusLine("기기에서 OCR을 실행하고 있어요.", busy = true)
+                state.item.activeAsset != null -> Text(
+                    ocrStatusMessage(state.item),
+                    style = if (state.item.ocrState == "failed") {
+                        MaterialTheme.typography.bodyMedium
+                    } else {
+                        MaterialTheme.typography.bodySmall
+                    },
+                    color = if (state.item.ocrState == "failed") {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+                state.localOcrFailed -> Text(
                     "OCR은 실패했지만 이미지 준비나 업로드 실패를 뜻하지 않아요.",
+                    color = MaterialTheme.colorScheme.error,
+                )
+                else -> Text(
+                    "이미지를 첨부하면 글자를 인식해 검색 가능한 텍스트로 저장해요.",
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Text(metadataStatusMessage(state.item))
-            if (state.item.extractionMeta.hasTruncatedText) {
+            if (state.localOcrFailed && state.item.activeAsset != null) {
                 Text(
-                    "수집된 메타데이터 일부는 저장 길이 제한에 맞춰 잘렸어요.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    "OCR은 실패했지만 이미지 준비나 업로드 실패를 뜻하지 않아요.",
+                    color = MaterialTheme.colorScheme.error,
                 )
             }
         }
+
+        if (metadataNeedsAttention) {
+            AttachmentInfoSection(title = "링크 정보") {
+                if (state.item.metadataState == "pending") {
+                    StatusLine(metadataStatusMessage(state.item), busy = true)
+                } else {
+                    Text(
+                        metadataStatusMessage(state.item),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        }
+
+        if (hasDetails) {
+            TextButton(
+                onClick = { detailsExpanded = !detailsExpanded },
+                shape = EditorialShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
+            ) {
+                Text(if (detailsExpanded) "세부 정보 숨기기" else "세부 정보 보기")
+            }
+        }
+
+        if (detailsExpanded && hasDetails) {
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                ),
+                shape = EditorialShape,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = "세부 정보",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
+                        state.item.activeAsset?.let { asset ->
+                            Text(activeAssetDescription(asset))
+                        }
+                        if (!metadataNeedsAttention) {
+                            Text(metadataStatusMessage(state.item))
+                        }
+                        if (state.item.extractionMeta.hasTruncatedText) {
+                            Text(
+                                "수집된 메타데이터 일부는 저장 길이 제한에 맞춰 잘렸어요.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttachmentInfoSection(
+    title: String,
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Column(
+            modifier = Modifier.padding(top = 8.dp, bottom = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
+                content()
+            }
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
@@ -270,38 +395,58 @@ private fun StatusLine(message: String, busy: Boolean) {
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (busy) CircularProgressIndicator()
-        Text(message)
+        if (busy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp,
+            )
+        }
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+        )
     }
 }
 
 @Composable
 private fun ActivePreview(state: AttachmentUiState) {
-    val asset = state.item.activeAsset ?: return
-    Column(
+    state.item.activeAsset ?: return
+    Card(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("attachment-preview"),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        shape = EditorialShape,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        ),
     ) {
-        Text(activeAssetDescription(asset), fontWeight = FontWeight.SemiBold)
-        when {
-            state.preview != null -> Image(
-                bitmap = state.preview.asImageBitmap(),
-                contentDescription = "첨부 이미지 미리보기",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 360.dp)
-                    .clip(RoundedCornerShape(12.dp)),
-                contentScale = ContentScale.Fit,
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(
+                text = "미리보기",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
             )
-            state.previewLoading -> StatusLine("미리보기를 안전하게 여는 중이에요.", busy = true)
-            state.previewError != null -> Text(
-                state.previewError,
-                color = MaterialTheme.colorScheme.error,
-            )
+            when {
+                state.preview != null -> Image(
+                    bitmap = state.preview.asImageBitmap(),
+                    contentDescription = "첨부 이미지 미리보기",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp)
+                        .clip(MaterialTheme.shapes.medium),
+                    contentScale = ContentScale.Fit,
+                )
+                state.previewLoading ->
+                    StatusLine("미리보기를 안전하게 여는 중이에요.", busy = true)
+                state.previewError != null -> Text(
+                    state.previewError,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
         }
-        Text(ocrStatusMessage(state.item), color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -316,65 +461,81 @@ private fun AttachmentButtons(
     onRetryMetadata: () -> Unit,
 ) {
     val hasActiveAsset = state.item.activeAsset != null
-    if (incomingImageUri != null) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (incomingImageUri != null) {
+            Button(
+                onClick = { onImportShared(incomingImageUri) },
+                enabled = state.canChooseImage &&
+                    state.queuedIncomingUri != incomingImageUri.toString(),
+                shape = EditorialShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("attachment-import-shared"),
+            ) {
+                Text("공유 이미지 첨부")
+            }
+        }
         Button(
-            onClick = { onImportShared(incomingImageUri) },
-            enabled = state.canChooseImage &&
-                state.queuedIncomingUri != incomingImageUri.toString(),
+            onClick = onPick,
+            enabled = state.canChooseImage,
+            shape = EditorialShape,
             modifier = Modifier
                 .fillMaxWidth()
-                .testTag("attachment-import-shared"),
+                .heightIn(min = 48.dp)
+                .testTag(if (hasActiveAsset) "attachment-replace" else "attachment-pick"),
         ) {
-            Text("공유 이미지 첨부")
+            Text(if (hasActiveAsset) "교체" else "이미지 첨부")
         }
-    }
-    Button(
-        onClick = onPick,
-        enabled = state.canChooseImage,
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag(if (hasActiveAsset) "attachment-replace" else "attachment-pick"),
-    ) {
-        Text(if (hasActiveAsset) "교체" else "이미지 첨부")
-    }
-    if (hasActiveAsset) {
-        OutlinedButton(
-            onClick = onDelete,
-            enabled = state.canMutateActiveAsset,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("attachment-delete"),
-        ) {
-            Text("삭제")
+        if (hasActiveAsset) {
+            OutlinedButton(
+                onClick = onDelete,
+                enabled = state.canMutateActiveAsset,
+                shape = EditorialShape,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("attachment-delete"),
+            ) {
+                Text("삭제")
+            }
         }
-    }
-    if (state.item.activeAsset != null && state.item.ocrState == "failed") {
-        OutlinedButton(
-            onClick = onRetryOcr,
-            enabled = state.canRetryOcr,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("attachment-ocr-retry"),
-        ) {
-            Text("OCR 다시 시도")
+        if (state.item.activeAsset != null && state.item.ocrState == "failed") {
+            OutlinedButton(
+                onClick = onRetryOcr,
+                enabled = state.canRetryOcr,
+                shape = EditorialShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("attachment-ocr-retry"),
+            ) {
+                Text("OCR 다시 시도")
+            }
         }
-    }
-    if (state.supportsMetadataRetry) {
-        OutlinedButton(
-            onClick = onRetryMetadata,
-            enabled = !state.actionRunning,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("metadata-retry"),
-        ) {
-            Text("메타데이터 다시 조회")
+        if (state.supportsMetadataRetry) {
+            OutlinedButton(
+                onClick = onRetryMetadata,
+                enabled = !state.actionRunning,
+                shape = EditorialShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("metadata-retry"),
+            ) {
+                Text("메타데이터 다시 조회")
+            }
         }
-    }
-    if (state.item.version == null) {
-        Text(
-            "첨부를 바꾸려면 서버 버전이 포함된 최신 상세 정보가 필요해요.",
-            color = MaterialTheme.colorScheme.error,
-        )
+        if (state.item.version == null) {
+            Text(
+                text = "첨부를 바꾸려면 서버 버전이 포함된 최신 상세 정보가 필요해요.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
     }
 }
 
@@ -385,23 +546,31 @@ private fun DeleteConfirmation(
     onCancel: () -> Unit,
 ) {
     Card(
+        shape = EditorialShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.errorContainer,
         ),
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             Text(
-                "이 이미지를 삭제할까요? 확인한 버전으로만 요청하며, 서버 처리가 끝날 때까지 기존 이미지를 보여요.",
+                text = "이 이미지를 삭제할까요? 확인한 버전으로만 요청하며, 서버 처리가 끝날 때까지 기존 이미지를 보여요.",
+                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onErrorContainer,
             )
             Button(
                 onClick = onConfirm,
                 enabled = enabled,
+                shape = EditorialShape,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(min = 48.dp)
                     .testTag("attachment-confirm-delete"),
             ) {
                 Text("삭제 확인")
@@ -409,7 +578,13 @@ private fun DeleteConfirmation(
             TextButton(
                 onClick = onCancel,
                 enabled = enabled,
-                modifier = Modifier.fillMaxWidth(),
+                shape = EditorialShape,
+                colors = ButtonDefaults.textButtonColors(
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
             ) {
                 Text("취소")
             }
@@ -427,60 +602,134 @@ private fun PendingAttachmentContent(
     onConfirmAgain: () -> Unit,
     onDiscard: () -> Unit,
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    val needsAttention = pending.stage in ATTACHMENT_FAILED_STAGES
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = EditorialShape,
+        colors = CardDefaults.cardColors(
+            containerColor = if (needsAttention) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerLow
+            },
+        ),
+    ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text("이미지 첨부 · ${pending.stage.queueMessage()}", fontWeight = FontWeight.SemiBold)
-            if (pending.ocrState == AttachmentOcrState.FAILED) {
-                Text("OCR은 실패했지만 이미지 업로드는 계속할 수 있어요.")
-            }
-            pending.errorCode?.let { errorCode ->
-                Text(
-                    attachmentFailureMessage(errorCode),
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            when (pending.stage) {
-                AttachmentStage.FAILED -> {
-                    OutlinedButton(onClick = onRetry, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("전송 다시 시도")
-                    }
-                    TextButton(onClick = onDiscard, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("기기 사본과 대기 작업 버리기")
-                    }
-                }
-                AttachmentStage.CONFLICT -> {
-                    if (review == null) {
-                        OutlinedButton(
-                            onClick = onReview,
-                            enabled = enabled,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("최신 내용 확인")
-                        }
+            ProvideTextStyle(
+                MaterialTheme.typography.bodyMedium.copy(
+                    color = if (needsAttention) {
+                        MaterialTheme.colorScheme.onErrorContainer
                     } else {
-                        Text("준비한 기기 사본은 보존돼 있어요. 자동으로 버전을 바꾸지 않았어요.")
-                        Button(
-                            onClick = onConfirmAgain,
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                ),
+            ) {
+                Text(
+                    "이미지 첨부 · ${pending.stage.queueMessage()}",
+                    fontWeight = FontWeight.SemiBold,
+                )
+                if (pending.ocrState == AttachmentOcrState.FAILED) {
+                    Text(
+                        "OCR은 실패했지만 이미지 업로드는 계속할 수 있어요.",
+                        color = if (needsAttention) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                    )
+                }
+                pending.errorCode?.let { errorCode ->
+                    Text(
+                        attachmentFailureMessage(errorCode),
+                        style = if (needsAttention) {
+                            MaterialTheme.typography.bodyMedium
+                        } else {
+                            MaterialTheme.typography.bodySmall
+                        },
+                        color = if (needsAttention) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
+                when (pending.stage) {
+                    AttachmentStage.FAILED -> {
+                        OutlinedButton(
+                            onClick = onRetry,
                             enabled = enabled,
-                            modifier = Modifier.fillMaxWidth(),
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
                         ) {
-                            Text("확인한 버전으로 새 첨부 요청")
+                            Text("전송 다시 시도")
+                        }
+                        TextButton(
+                            onClick = onDiscard,
+                            enabled = enabled,
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                        ) {
+                            Text("기기 사본과 대기 작업 버리기")
                         }
                     }
-                    TextButton(onClick = onDiscard, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("기기 사본과 대기 작업 버리기")
+                    AttachmentStage.CONFLICT -> {
+                        if (review == null) {
+                            OutlinedButton(
+                                onClick = onReview,
+                                enabled = enabled,
+                                shape = EditorialShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp),
+                            ) {
+                                Text("최신 내용 확인")
+                            }
+                        } else {
+                            Text("준비한 기기 사본은 보존돼 있어요. 자동으로 버전을 바꾸지 않았어요.")
+                            Button(
+                                onClick = onConfirmAgain,
+                                enabled = enabled,
+                                shape = EditorialShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp),
+                            ) {
+                                Text("확인한 버전으로 새 첨부 요청")
+                            }
+                        }
+                        TextButton(
+                            onClick = onDiscard,
+                            enabled = enabled,
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                        ) {
+                            Text("기기 사본과 대기 작업 버리기")
+                        }
                     }
-                }
-                AttachmentStage.EXPIRED -> {
-                    Text("만료된 기기 사본은 다시 사용할 수 없어요. 버린 뒤 이미지를 새로 선택해 주세요.")
-                    TextButton(onClick = onDiscard, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("만료된 대기 작업 버리기")
+                    AttachmentStage.EXPIRED -> {
+                        Text("만료된 기기 사본은 다시 사용할 수 없어요. 버린 뒤 이미지를 새로 선택해 주세요.")
+                        TextButton(
+                            onClick = onDiscard,
+                            enabled = enabled,
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                        ) {
+                            Text("만료된 대기 작업 버리기")
+                        }
                     }
+                    else -> Unit
                 }
-                else -> Unit
             }
         }
     }
@@ -496,67 +745,126 @@ private fun PendingCommandContent(
     onConfirmAgain: () -> Unit,
     onDiscard: () -> Unit,
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+    val needsAttention = when (entry.state) {
+        OutboxState.FAILED,
+        OutboxState.CONFLICT,
+        OutboxState.EXPIRED,
+        -> true
+        else -> false
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = EditorialShape,
+        colors = CardDefaults.cardColors(
+            containerColor = if (needsAttention) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerLow
+            },
+        ),
+    ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            Text(
-                "${entry.attachmentCommandLabel()} · ${entry.state.commandQueueMessage()}",
-                fontWeight = FontWeight.SemiBold,
-            )
-            entry.errorCode?.let { errorCode ->
-                Text(
-                    commandFailureMessage(errorCode),
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            when (entry.state) {
-                OutboxState.FAILED -> {
-                    if (entry.errorCode?.let(RETRYABLE_COMMAND_ERRORS::contains) == true) {
-                        OutlinedButton(
-                            onClick = onRetry,
-                            enabled = enabled,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("요청 다시 시도")
-                        }
-                    }
-                    TextButton(onClick = onDiscard, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("요청 버리기")
-                    }
-                }
-                OutboxState.CONFLICT,
-                OutboxState.EXPIRED,
-                -> {
-                    if (review == null) {
-                        OutlinedButton(
-                            onClick = onReview,
-                            enabled = enabled,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("최신 내용 확인")
-                        }
-                    } else if (review.targetStillCurrent) {
-                        Text("자동으로 최신 버전에 다시 적용하지 않았어요.")
-                        Button(
-                            onClick = onConfirmAgain,
-                            enabled = enabled,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text("확인한 버전으로 새 요청")
-                        }
+            ProvideTextStyle(
+                MaterialTheme.typography.bodyMedium.copy(
+                    color = if (needsAttention) {
+                        MaterialTheme.colorScheme.onErrorContainer
                     } else {
-                        Text(
-                            "대상 이미지가 이미 바뀌어 이 요청을 현재 이미지에 적용할 수 없어요.",
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
-                    TextButton(onClick = onDiscard, enabled = enabled, modifier = Modifier.fillMaxWidth()) {
-                        Text("요청 버리기")
-                    }
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                ),
+            ) {
+                Text(
+                    "${entry.attachmentCommandLabel()} · ${entry.state.commandQueueMessage()}",
+                    fontWeight = FontWeight.SemiBold,
+                )
+                entry.errorCode?.let { errorCode ->
+                    Text(
+                        commandFailureMessage(errorCode),
+                        style = if (needsAttention) {
+                            MaterialTheme.typography.bodyMedium
+                        } else {
+                            MaterialTheme.typography.bodySmall
+                        },
+                        color = if (needsAttention) {
+                            MaterialTheme.colorScheme.onErrorContainer
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
                 }
-                else -> Unit
+                when (entry.state) {
+                    OutboxState.FAILED -> {
+                        if (entry.errorCode?.let(RETRYABLE_COMMAND_ERRORS::contains) == true) {
+                            OutlinedButton(
+                                onClick = onRetry,
+                                enabled = enabled,
+                                shape = EditorialShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp),
+                            ) {
+                                Text("요청 다시 시도")
+                            }
+                        }
+                        TextButton(
+                            onClick = onDiscard,
+                            enabled = enabled,
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                        ) {
+                            Text("요청 버리기")
+                        }
+                    }
+                    OutboxState.CONFLICT,
+                    OutboxState.EXPIRED,
+                    -> {
+                        if (review == null) {
+                            OutlinedButton(
+                                onClick = onReview,
+                                enabled = enabled,
+                                shape = EditorialShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp),
+                            ) {
+                                Text("최신 내용 확인")
+                            }
+                        } else if (review.targetStillCurrent) {
+                            Text("자동으로 최신 버전에 다시 적용하지 않았어요.")
+                            Button(
+                                onClick = onConfirmAgain,
+                                enabled = enabled,
+                                shape = EditorialShape,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp),
+                            ) {
+                                Text("확인한 버전으로 새 요청")
+                            }
+                        } else {
+                            Text(
+                                "대상 이미지가 이미 바뀌어 이 요청을 현재 이미지에 적용할 수 없어요.",
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                        TextButton(
+                            onClick = onDiscard,
+                            enabled = enabled,
+                            shape = EditorialShape,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                        ) {
+                            Text("요청 버리기")
+                        }
+                    }
+                    else -> Unit
+                }
             }
         }
     }
@@ -647,3 +955,5 @@ private val ATTACHMENT_FAILED_STAGES = setOf(
     AttachmentStage.CONFLICT,
     AttachmentStage.EXPIRED,
 )
+
+private val EditorialShape = RoundedCornerShape(8.dp)

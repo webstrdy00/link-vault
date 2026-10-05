@@ -18,6 +18,12 @@ GOALS.md
 docs/*
 !docs/DEPLOYMENT.md
 !docs/IMPLEMENTATION_STATUS.md
+# 공개 README에서 사용하는 기록과 검토된 합성 화면만 공유한다.
+!docs/development-record.md
+!docs/assets/
+docs/assets/*
+!docs/assets/library.png
+!docs/assets/filters.png
 
 # Android build outputs and machine-local settings
 .gradle/

@@ -26,6 +26,11 @@ const MAX_ASSET_BYTES = 2_000_000;
 const MAX_OWNER_BYTES = 20_000_000;
 const PAGE_SIZE = 1000;
 const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+const LOCAL_PROCESS_TIMEOUT_MS = 30_000;
+const DATABASE_DUMP_TIMEOUT_MS = 120_000;
+const DATABASE_DUMP_SERVER_TIMEOUT_SECONDS = 110;
+const DATABASE_LOCK_TIMEOUT_MS = 10_000;
+const SNAPSHOT_IDLE_TIMEOUT_MS = 300_000;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -76,24 +81,26 @@ async function safeOutputPath(outputPath) {
 async function runCaptured(
   command,
   args,
-  { maxBytes = MAX_CAPTURE_BYTES } = {},
+  { maxBytes = MAX_CAPTURE_BYTES, spawnProcess = spawn } = {},
 ) {
   return await new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, {
+    const child = spawnProcess(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      timeout: LOCAL_PROCESS_TIMEOUT_MS,
+      killSignal: "SIGKILL",
     });
     const stdout = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     child.stdout.on("data", (chunk) => {
       stdoutBytes += chunk.length;
-      if (stdoutBytes > maxBytes) child.kill();
+      if (stdoutBytes > maxBytes) child.kill("SIGKILL");
       else stdout.push(chunk);
     });
     child.stderr.on("data", (chunk) => {
       stderrBytes += chunk.length;
-      if (stderrBytes > maxBytes) child.kill();
+      if (stderrBytes > maxBytes) child.kill("SIGKILL");
     });
     child.once(
       "error",
@@ -121,7 +128,7 @@ async function runCaptured(
   });
 }
 
-async function verifyLocalSource(config) {
+async function verifyLocalSource(config, spawnProcess = spawn) {
   let databaseUrl;
   try {
     databaseUrl = new URL(config.DB_URL);
@@ -139,20 +146,20 @@ async function verifyLocalSource(config) {
     "--format",
     "{{.State.Running}}",
     SOURCE_CONTAINER,
-  ]);
+  ], { spawnProcess });
   if (running !== "true") fail("LOCAL_DATABASE_NOT_RUNNING");
   const name = await runCaptured(docker, [
     "inspect",
     "--format",
     "{{.Name}}",
     SOURCE_CONTAINER,
-  ]);
+  ], { spawnProcess });
   if (name !== `/${SOURCE_CONTAINER}`) fail("LOCAL_DATABASE_CONTAINER_INVALID");
   const port = await runCaptured(docker, [
     "port",
     SOURCE_CONTAINER,
     "5432/tcp",
-  ]);
+  ], { spawnProcess });
   if (
     !port.split(/\r?\n/).some((line) =>
       /^(127\.0\.0\.1|0\.0\.0\.0):18022$/.test(line)
@@ -190,15 +197,18 @@ async function requestJson(config, path, { body = undefined } = {}) {
   }
 }
 
-async function sourceDatabaseMetadata() {
+async function openSourceSnapshot(spawnProcess) {
+  // Transaction start conservatively bounds deletion-ledger coverage before
+  // snapshot acquisition; jsonb emits one compact row for the stdout protocol.
   const sql = String.raw`
-select pg_catalog.json_build_object(
+select pg_catalog.jsonb_build_object(
+  'snapshot_id', pg_catalog.pg_export_snapshot(),
   'database_id', (
     select identity.database_id
     from private.deletion_ledger_identity as identity
     where identity.singleton
   ),
-  'snapshot_time', pg_catalog.to_char(pg_catalog.clock_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+  'snapshot_time', pg_catalog.to_char(pg_catalog.transaction_timestamp() at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
   'extensions', coalesce((
     select pg_catalog.json_agg(
       pg_catalog.json_build_object(
@@ -230,20 +240,106 @@ select pg_catalog.json_build_object(
       and class.relkind in ('r', 'p') and class.relrowsecurity
   ), '[]'::json)
 )::text;`;
-  const output = await runCaptured(executable("docker"), [
+  const child = spawnProcess(executable("docker"), [
     "exec",
+    "-i",
     SOURCE_CONTAINER,
     "psql",
-    "-XAt",
+    "-XqAt",
     "-v",
     "ON_ERROR_STOP=1",
     "-U",
     "postgres",
     "-d",
     "postgres",
-    "-c",
-    sql,
-  ]);
+  ], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  let closing = false;
+  let closed = false;
+  let failed = false;
+  let stdout = "";
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let delivered = false;
+  let resolveOutput;
+  let rejectOutput;
+  const outputPromise = new Promise((resolvePromise, reject) => {
+    resolveOutput = resolvePromise;
+    rejectOutput = reject;
+  });
+  const snapshotError = () =>
+    Object.assign(new Error("DATABASE_SNAPSHOT_FAILED"), {
+      code: "DATABASE_SNAPSHOT_FAILED",
+    });
+  const rejectSession = () => {
+    failed = true;
+    rejectOutput(snapshotError());
+    child.kill("SIGKILL");
+  };
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdoutBytes += Buffer.byteLength(chunk, "utf8");
+    if (stdoutBytes > MAX_CAPTURE_BYTES || (delivered && chunk.trim())) {
+      rejectSession();
+      return;
+    }
+    stdout += chunk;
+    if (stdout.includes("\n")) {
+      delivered = true;
+      resolveOutput(stdout.trim());
+    }
+  });
+  child.stderr.on("data", (chunk) => {
+    stderrBytes += chunk.length;
+    if (stderrBytes > MAX_CAPTURE_BYTES) rejectSession();
+  });
+  child.stdin.on("error", rejectSession);
+  child.once("error", rejectSession);
+  const completed = new Promise((resolvePromise) => {
+    child.once("close", (status, signal) => {
+      closed = true;
+      if (!closing || status !== 0 || signal) failed = true;
+      rejectOutput(snapshotError());
+      resolvePromise();
+    });
+  });
+  let closingPromise;
+  const close = () => {
+    closingPromise ??= (async () => {
+      closing = true;
+      const timeout = setTimeout(rejectSession, LOCAL_PROCESS_TIMEOUT_MS);
+      try {
+        if (!closed) child.stdin.end("ROLLBACK;\n\\q\n");
+        await completed;
+        if (failed) throw snapshotError();
+      } finally {
+        clearTimeout(timeout);
+      }
+    })();
+    return closingPromise;
+  };
+  const timeout = setTimeout(rejectSession, LOCAL_PROCESS_TIMEOUT_MS);
+  try {
+    child.stdin.write(
+      `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SET LOCAL idle_in_transaction_session_timeout = '${SNAPSHOT_IDLE_TIMEOUT_MS}ms';
+SET LOCAL lock_timeout = '${DATABASE_LOCK_TIMEOUT_MS}ms';
+SET LOCAL statement_timeout = '${LOCAL_PROCESS_TIMEOUT_MS}ms';
+${sql}\n`,
+    );
+    const metadata = sourceDatabaseMetadata(await outputPromise);
+    return { ...metadata, close };
+  } catch (error) {
+    await close();
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sourceDatabaseMetadata(output) {
   let value;
   try {
     value = JSON.parse(output);
@@ -252,12 +348,15 @@ select pg_catalog.json_build_object(
   }
   if (
     !exactKeys(value, [
+      "snapshot_id",
       "database_id",
       "snapshot_time",
       "extensions",
       "function_counts",
       "rls_tables",
     ]) ||
+    typeof value.snapshot_id !== "string" ||
+    !/^[0-9A-F]{8}-[0-9A-F]{8}-[1-9][0-9]*$/i.test(value.snapshot_id) ||
     !isUuid(value.database_id) ||
     !value.function_counts || typeof value.function_counts !== "object" ||
     Array.isArray(value.function_counts) ||
@@ -277,6 +376,7 @@ select pg_catalog.json_build_object(
   ) fail("DATABASE_METADATA_INVALID");
   const snapshotTime = isoUtc(value.snapshot_time, "DATABASE_METADATA_INVALID");
   return {
+    snapshotId: value.snapshot_id,
     databaseId: value.database_id,
     snapshotTime,
     extensions: value.extensions,
@@ -285,39 +385,46 @@ select pg_catalog.json_build_object(
   };
 }
 
-async function dumpDatabase(destination) {
+async function dumpDatabase(destination, snapshotId, spawnProcess) {
   const schemas = snapshotSchemas();
   const args = [
     "exec",
     SOURCE_CONTAINER,
+    // Killing docker.exe alone need not stop pg_dump inside the container.
+    "timeout",
+    "-s",
+    "KILL",
+    String(DATABASE_DUMP_SERVER_TIMEOUT_SECONDS),
     "pg_dump",
     "-Fc",
+    `--snapshot=${snapshotId}`,
+    // Queued DDL can wait on the exporter while pg_dump queues behind that DDL.
+    `--lock-wait-timeout=${DATABASE_LOCK_TIMEOUT_MS}ms`,
     ...schemas.flatMap((schema) => ["--schema", schema]),
     "-U",
     "postgres",
     "-d",
     "postgres",
   ];
-  const child = spawn(executable("docker"), args, {
+  const child = spawnProcess(executable("docker"), args, {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    timeout: DATABASE_DUMP_TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   const output = createWriteStream(destination, { flags: "wx", mode: 0o600 });
   const completed = new Promise((resolvePromise, reject) => {
+    let failed = false;
     let stderrBytes = 0;
     child.stderr.on("data", (chunk) => {
       stderrBytes += chunk.length;
-      if (stderrBytes > MAX_CAPTURE_BYTES) child.kill();
+      if (stderrBytes > MAX_CAPTURE_BYTES) child.kill("SIGKILL");
     });
     child.once("error", () => {
-      reject(
-        Object.assign(new Error("DATABASE_DUMP_FAILED"), {
-          code: "DATABASE_DUMP_FAILED",
-        }),
-      );
+      failed = true;
     });
     child.once("close", (status, signal) => {
-      if (status !== 0 || signal || stderrBytes > MAX_CAPTURE_BYTES) {
+      if (failed || status !== 0 || signal || stderrBytes > MAX_CAPTURE_BYTES) {
         reject(
           Object.assign(new Error("DATABASE_DUMP_FAILED"), {
             code: "DATABASE_DUMP_FAILED",
@@ -328,10 +435,12 @@ async function dumpDatabase(destination) {
       }
     });
   });
+  const copied = pipeline(child.stdout, output);
   try {
-    await Promise.all([pipeline(child.stdout, output), completed]);
+    await Promise.all([copied, completed]);
   } catch {
-    child.kill();
+    child.kill("SIGKILL");
+    await Promise.allSettled([copied, completed]);
     fail("DATABASE_DUMP_FAILED");
   }
 }
@@ -362,18 +471,46 @@ function validateAssetRow(row) {
   };
 }
 
-async function listActiveAssets(config) {
+async function listActiveAssets(snapshotId, spawnProcess) {
   const assets = [];
   for (let offset = 0;; offset += PAGE_SIZE) {
-    const query = new URLSearchParams({
-      select: "id,owner_id,item_id,object_path,actual_bytes",
-      state: "eq.active",
-      order: "owner_id.asc,item_id.asc,id.asc",
-      limit: String(PAGE_SIZE),
-      offset: String(offset),
-    });
-    const page = await requestJson(config, `/rest/v1/assets?${query}`);
-    if (!Array.isArray(page)) fail("ASSET_METADATA_INVALID");
+    const sql = String.raw`
+begin isolation level repeatable read read only;
+set transaction snapshot '${snapshotId}';
+set local lock_timeout = '${DATABASE_LOCK_TIMEOUT_MS}ms';
+set local statement_timeout = '${LOCAL_PROCESS_TIMEOUT_MS}ms';
+select coalesce(pg_catalog.json_agg(page order by page.owner_id, page.item_id, page.id), '[]'::json)::text
+from (
+  select id, owner_id, item_id, object_path, actual_bytes
+  from public.assets
+  where state = 'active'
+  order by owner_id, item_id, id
+  limit ${PAGE_SIZE} offset ${offset}
+) as page;
+rollback;`;
+    const output = await runCaptured(executable("docker"), [
+      "exec",
+      SOURCE_CONTAINER,
+      "psql",
+      "-XqAt",
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-U",
+      "postgres",
+      "-d",
+      "postgres",
+      "-c",
+      sql,
+    ], { spawnProcess });
+    let page;
+    try {
+      page = JSON.parse(output);
+    } catch {
+      fail("ASSET_METADATA_INVALID");
+    }
+    if (!Array.isArray(page) || page.length > PAGE_SIZE) {
+      fail("ASSET_METADATA_INVALID");
+    }
     for (const row of page) assets.push(validateAssetRow(row));
     if (page.length < PAGE_SIZE) break;
   }
@@ -395,8 +532,8 @@ function encodedStoragePath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-async function assetResponse(config, asset) {
-  const response = await fetch(
+async function assetResponse(config, asset, fetchAsset) {
+  const response = await fetchAsset(
     `${config.API_URL}/storage/v1/object/authenticated/${STORAGE_BUCKET}/${
       encodedStoragePath(asset.storagePath)
     }`,
@@ -414,9 +551,13 @@ async function assetResponse(config, asset) {
   ).catch(() => fail("ASSET_DOWNLOAD_FAILED"));
   if (
     !response.ok || !response.body || response.headers.get("content-encoding")
-  ) fail("ASSET_DOWNLOAD_FAILED");
+  ) {
+    await response.body?.cancel().catch(() => undefined);
+    fail("ASSET_DOWNLOAD_FAILED");
+  }
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null && Number(contentLength) !== asset.actual_bytes) {
+    await response.body.cancel().catch(() => undefined);
     fail("ASSET_SIZE_MISMATCH");
   }
   return response.body;
@@ -438,26 +579,40 @@ async function verifyWrittenArtifact(
 
 export async function createLibraryBackup(
   { outputPath, environment = process.env } = {},
+  {
+    spawnProcess = spawn,
+    backendConfig = localBackendConfig,
+    fetchAsset = fetch,
+  } = {},
 ) {
   const destination = await safeOutputPath(outputPath);
   const credential = backupCredentialFromEnv(environment);
-  const config = localBackendConfig();
-  await verifyLocalSource(config);
+  const config = backendConfig();
+  await verifyLocalSource(config, spawnProcess);
   const temporaryDirectory = await mkdtemp(
     join(tmpdir(), "link-vault-backup-"),
   );
   const packagePath = join(temporaryDirectory, "snapshot.pack");
   const dumpPath = join(temporaryDirectory, "database.dump");
   let writer;
+  let sourceSnapshot;
   try {
-    const databaseMetadata = await sourceDatabaseMetadata();
-    await dumpDatabase(dumpPath);
-    const assets = await listActiveAssets(config);
+    sourceSnapshot = await openSourceSnapshot(spawnProcess);
+    const databaseMetadata = sourceSnapshot;
+    await dumpDatabase(dumpPath, sourceSnapshot.snapshotId, spawnProcess);
+    const assets = await listActiveAssets(
+      sourceSnapshot.snapshotId,
+      spawnProcess,
+    );
+    // Imported snapshots remain valid only while their exporter is alive.
+    // Release the read-only transaction before downloading immutable UUID paths.
+    await sourceSnapshot.close();
+    sourceSnapshot = null;
     writer = await BackupPackageWriter.create(packagePath);
     const database = await writer.addFile("database.dump", dumpPath);
     const manifestAssets = [];
     for (const asset of assets) {
-      const body = await assetResponse(config, asset);
+      const body = await assetResponse(config, asset, fetchAsset);
       const entry = await writer.addStream(
         asset.packagePath,
         asset.actual_bytes,
@@ -535,8 +690,15 @@ export async function createLibraryBackup(
       databaseBytes: verified.database.size,
     };
   } finally {
-    if (writer) await writer.abort();
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    try {
+      if (sourceSnapshot) await sourceSnapshot.close();
+    } finally {
+      try {
+        if (writer) await writer.abort();
+      } finally {
+        await rm(temporaryDirectory, { recursive: true, force: true });
+      }
+    }
   }
 }
 

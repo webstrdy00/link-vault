@@ -21,6 +21,7 @@ class AccountViewModel internal constructor(
 
     private var operationJob: Job? = null
     private var retryTarget = RetryTarget.RESTORE_SESSION
+    private var displayedAccessSession: AccountSessionState? = null
 
     init {
         if (client.isConfigured) {
@@ -99,8 +100,13 @@ class AccountViewModel internal constructor(
         ) {
             return
         }
-        val previous = mutableUiState.value
-        val expectedSessionOwner = client.sessionUserId()
+        val session = client.sessionState.value
+        val previous = logoutRequestPreviousState(
+            previous = mutableUiState.value,
+            displayedSession = displayedAccessSession,
+            session = session,
+        )
+        if (previous != mutableUiState.value) retryTarget = RetryTarget.RESTORE_SESSION
         mutableUiState.value = AccountUiState.Loading("정리할 기기 자료를 확인하고 있어요.")
         launchOperation {
             try {
@@ -108,14 +114,16 @@ class AccountViewModel internal constructor(
                 mutableUiState.value = AccountUiState.ConfirmLogout(
                     previous = previous,
                     pendingCount = pendingCount,
-                    expectedSessionOwner = expectedSessionOwner,
+                    expectedSessionOwner = session.ownerId,
+                    expectedSessionGeneration = session.generation,
                 )
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 mutableUiState.value = AccountUiState.ConfirmLogout(
                     previous = previous,
                     pendingCount = 0,
-                    expectedSessionOwner = expectedSessionOwner,
+                    expectedSessionOwner = session.ownerId,
+                    expectedSessionGeneration = session.generation,
                     message = "기기에 남은 대기 자료 수를 확인하지 못했어요. 다시 확인하거나 취소해 주세요.",
                     canConfirm = false,
                 )
@@ -127,7 +135,7 @@ class AccountViewModel internal constructor(
         if (operationJob?.isActive == true) return
         val confirmation = mutableUiState.value as? AccountUiState.ConfirmLogout ?: return
         if (!confirmation.canConfirm) return
-        if (client.sessionUserId() != confirmation.expectedSessionOwner) {
+        if (!confirmation.matchesSession(client.sessionState.value)) {
             mutableUiState.value = confirmation.copy(
                 message = "로그인 계정 상태가 변경됐어요. 기기 자료를 다시 확인해 주세요.",
                 canConfirm = false,
@@ -142,33 +150,32 @@ class AccountViewModel internal constructor(
             },
         )
         launchOperation {
-            try {
+            val error = try {
                 client.signOut()
-                mutableUiState.value = AccountUiState.Login()
+                null
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                val message = (error as? AccountClientException)?.message
-                    ?: if (confirmation.expectedSessionOwner == null) {
-                        "기기 대기 자료를 정리하지 못했어요. 다시 시도해 주세요."
-                    } else {
-                        "로그아웃하지 못했어요. 다시 시도해 주세요."
-                    }
-                mutableUiState.value = confirmation.copy(message = message)
+                error
             }
+            val state = logoutResultState(confirmation, client.sessionState.value, error)
+            if (state is AccountUiState.Error) retryTarget = RetryTarget.RESTORE_SESSION
+            mutableUiState.value = state
         }
     }
 
     fun cancelLogout() {
         if (operationJob?.isActive == true) return
         val confirmation = mutableUiState.value as? AccountUiState.ConfirmLogout ?: return
-        mutableUiState.value = confirmation.previous
+        val session = client.sessionState.value
+        if (!confirmation.matchesSession(session)) retryTarget = RetryTarget.RESTORE_SESSION
+        mutableUiState.value = logoutPreviousState(confirmation, session)
     }
 
     fun retryLogoutConfirmation() {
         if (operationJob?.isActive == true) return
         val confirmation = mutableUiState.value as? AccountUiState.ConfirmLogout ?: return
         if (confirmation.canConfirm) return
-        mutableUiState.value = confirmation.previous
+        cancelLogout()
         requestLogout()
     }
 
@@ -407,13 +414,27 @@ class AccountViewModel internal constructor(
             showDeletingAccess(access)
             return
         }
-        val ownerId = client.sessionUserId() ?: throw AccountAuthenticationRequiredException()
+        val session = client.sessionState.value
+        val ownerId = session.ownerId ?: throw AccountAuthenticationRequiredException()
         when (access) {
             is AccountAccess.Active -> {
                 outbox.resumeOwner(ownerId)
+                val currentSession = client.sessionState.value
+                if (
+                    currentSession.ownerId != session.ownerId ||
+                    currentSession.generation != session.generation
+                ) {
+                    throw AccountClientException(
+                        message = ACCOUNT_SESSION_CHANGED_MESSAGE,
+                        retryable = true,
+                        code = "SESSION_CHANGED",
+                    )
+                }
+                displayedAccessSession = session
                 mutableUiState.value = AccountUiState.Active(access.summary)
             }
             AccountAccess.PendingApproval -> {
+                displayedAccessSession = session
                 mutableUiState.value = AccountUiState.PendingApproval
             }
             is AccountAccess.Deleting -> error("Handled before requiring a live session")
@@ -512,6 +533,7 @@ sealed interface AccountUiState {
         val previous: AccountUiState,
         val pendingCount: Int,
         val expectedSessionOwner: String?,
+        val expectedSessionGeneration: Long,
         val message: String? = null,
         val canConfirm: Boolean = true,
     ) : AccountUiState
@@ -537,6 +559,75 @@ sealed interface AccountUiState {
         val message: String? = null,
     ) : AccountUiState
 }
+
+internal fun AccountUiState.ConfirmLogout.matchesSession(session: AccountSessionState): Boolean =
+    expectedSessionOwner == session.ownerId && expectedSessionGeneration == session.generation
+
+internal fun logoutRequestPreviousState(
+    previous: AccountUiState,
+    displayedSession: AccountSessionState?,
+    session: AccountSessionState,
+): AccountUiState {
+    if (previous !is AccountUiState.Active && previous !is AccountUiState.PendingApproval) {
+        return previous
+    }
+    if (
+        displayedSession != null && displayedSession.ownerId != null &&
+        displayedSession.ownerId == session.ownerId &&
+        displayedSession.generation == session.generation
+    ) {
+        return previous
+    }
+    return if (session.ownerId == null) {
+        AccountUiState.Login()
+    } else {
+        AccountUiState.Error(ACCOUNT_SESSION_CHANGED_MESSAGE, canRetry = true)
+    }
+}
+
+internal fun logoutPreviousState(
+    confirmation: AccountUiState.ConfirmLogout,
+    session: AccountSessionState,
+): AccountUiState = when {
+    confirmation.matchesSession(session) -> confirmation.previous
+    session.ownerId == null -> AccountUiState.Login(confirmation.message)
+    else -> AccountUiState.Error(
+        message = confirmation.message ?: ACCOUNT_SESSION_CHANGED_MESSAGE,
+        canRetry = true,
+    )
+}
+
+internal fun logoutResultState(
+    confirmation: AccountUiState.ConfirmLogout,
+    session: AccountSessionState,
+    error: Exception?,
+): AccountUiState {
+    val clientError = error as? AccountClientException
+    val message = error?.let {
+        clientError?.message ?: if (confirmation.expectedSessionOwner == null) {
+            "기기 대기 자료를 정리하지 못했어요. 다시 시도해 주세요."
+        } else {
+            "로그아웃하지 못했어요. 다시 시도해 주세요."
+        }
+    }
+    return when {
+        error != null && confirmation.matchesSession(session) -> {
+            if (clientError?.retryable == false) {
+                AccountUiState.Error(message = requireNotNull(message), canRetry = false)
+            } else {
+                confirmation.copy(message = message)
+            }
+        }
+        session.ownerId == null -> AccountUiState.Login(message)
+        else -> AccountUiState.Error(
+            message = message ?: ACCOUNT_SESSION_CHANGED_MESSAGE,
+            canRetry = true,
+        )
+    }
+}
+
+private const val ACCOUNT_SESSION_CHANGED_MESSAGE =
+    "로그인 계정 상태가 변경됐어요. 계정 상태를 다시 확인해 주세요."
 
 internal fun preserveUnknownDeletionStatus(
     unknown: AccountUiState.DeletionStatusUnknown,

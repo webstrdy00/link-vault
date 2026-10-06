@@ -47,15 +47,35 @@ test("paused or unprovisioned maintenance and missing ledger remain visible", ()
   ]);
 });
 
-test("stale dispatch boundary is fifteen minutes and preserves pending work", () => {
+test("stale dispatch boundary is fifteen minutes and pending work stays healthy", () => {
   const value = healthy();
   value.checked_at = "2026-09-16T00:20:00Z";
+  value.account_deletions_pending = 1;
   value.item_deletions_pending = 1;
+  value.asset_cleanups_pending = 1;
   assert.deepEqual(evaluateOperationStatus(value).warnings, []);
   value.checked_at = "2026-09-16T00:20:00.001Z";
   assert.deepEqual(evaluateOperationStatus(value).warnings, [
     "MAINTENANCE_DISPATCH_STALE",
   ]);
+});
+
+test("each overdue counter independently emits the deletion warning", () => {
+  for (
+    const field of [
+      "account_deletions_overdue",
+      "item_deletions_overdue",
+      "asset_cleanups_overdue",
+    ]
+  ) {
+    const value = healthy();
+    value[field] = 1;
+    assert.deepEqual(
+      evaluateOperationStatus(value).warnings,
+      ["DELETION_TARGET_EXCEEDED"],
+      field,
+    );
+  }
 });
 
 test("worker cleanup retries remain visible after successful HTTP dispatch", () => {

@@ -1,7 +1,6 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Parser } from "htmlparser2";
-import { buildConnector, Client } from "undici";
 import { genericTitle, norm } from "./item-preparation.ts";
 
 const ALLOWED_HOSTS = new Set(["blog.naver.com", "m.blog.naver.com"]);
@@ -129,6 +128,8 @@ export const productionMetadataTransport: MetadataTransport = {
       throw new TypeError("Metadata transport requires validated addresses.");
     }
 
+    // Ordinary API requests must not initialize the metadata-only HTTP client.
+    const { buildConnector, Client } = await import("undici");
     const tlsConnector = buildConnector({
       rejectUnauthorized: true,
       timeout: REQUEST_TIMEOUT_MS,

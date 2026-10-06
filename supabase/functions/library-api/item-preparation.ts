@@ -400,17 +400,24 @@ export function hasTerm(text: string, term: string): boolean {
 }
 
 function boundary(text: string, start: number, end: number): boolean {
-  if (start !== 0 && isWordCharacter(text[start - 1])) {
+  // indexOf offsets are UTF-16; the preceding character may be a surrogate pair.
+  const precedingCodePoint = text.codePointAt(start - 2);
+  const precedingCharacter =
+    precedingCodePoint !== undefined && precedingCodePoint > 0xffff
+      ? String.fromCodePoint(precedingCodePoint)
+      : text[start - 1];
+  if (isWordCharacter(precedingCharacter)) {
     return false;
   }
-  if (!isWordCharacter(text[end])) {
-    return true;
-  }
   let suffixEnd = end;
-  while (suffixEnd < text.length && isWordCharacter(text[suffixEnd])) {
-    suffixEnd++;
+  while (suffixEnd < text.length) {
+    const character = String.fromCodePoint(text.codePointAt(suffixEnd)!);
+    if (!isWordCharacter(character)) {
+      break;
+    }
+    suffixEnd += character.length;
   }
-  return suffixes.has(text.slice(end, suffixEnd));
+  return suffixEnd === end || suffixes.has(text.slice(end, suffixEnd));
 }
 
 function isWordCharacter(character: string | undefined): boolean {

@@ -13,7 +13,7 @@
     "operations:run": "node scripts/library-operations.mjs --run",
     "backup:local": "node scripts/backup-library.mjs",
     "restore:verify": "node scripts/restore-library.mjs",
-    "test:operations": "node --test scripts/library-operations.test.mjs scripts/backup-format.test.mjs",
+    "test:operations": "node --test scripts/library-operations.test.mjs scripts/backup-format.test.mjs scripts/backup-library.test.mjs scripts/restore-library.test.mjs",
     "test:backup-integration": "node scripts/backup-integration.mjs",
     "test:db": "supabase test db",
     "test:api": "deno test --allow-read=supabase/functions/library-api/webp_dec.wasm --allow-env=NODE_V8_COVERAGE,UNDICI_NO_FG,JEST_WORKER_ID --config supabase/functions/library-api/deno.json supabase/functions/library-api",

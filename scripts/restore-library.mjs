@@ -573,48 +573,13 @@ function expectedRlsValues(tables) {
   return `values\n${tables.map((table) => `('${table}')`).join(",\n")}`;
 }
 
-function auditSql(snapshot, ledger, assets) {
+export function itemDeletionAuditSql() {
   return `
-\\set ON_ERROR_STOP on
--- Only temporary expectation tables are written; the entire audit rolls back.
-begin;
-${createDeletionTableSql(ledger.events)}
-create temporary table expected_assets (
-  owner_id uuid not null,
-  item_id uuid not null,
-  asset_id uuid not null,
-  object_path text not null,
-  actual_bytes bigint not null
-) on commit drop;
-insert into expected_assets (owner_id, item_id, asset_id, object_path, actual_bytes)
-${expectedAssetValues(assets)};
-create temporary table expected_functions (schema_name text not null, function_count bigint not null) on commit drop;
-insert into expected_functions (schema_name, function_count) values
-${expectedFunctionsValues(snapshot.schemaFunctionCounts)};
-create temporary table expected_rls (qualified_name text) on commit drop;
-insert into expected_rls (qualified_name)
-${expectedRlsValues(snapshot.rlsTables)};
-
-select pg_catalog.json_build_object(
-  'deleted_rows', (
-    select pg_catalog.count(*) from restore_deletions as deletion
-    where (deletion.kind = 'item' and (
       not exists (
         select 1 from private.item_deletion_tombstones as tombstone
         where tombstone.owner_id = deletion.owner_id
           and tombstone.item_id = deletion.item_id
           and tombstone.deleted_at <= deletion.requested_at
-      )
-      or (
-        not exists (
-          select 1 from restore_deletions as account_deletion
-          where account_deletion.kind = 'account'
-            and account_deletion.owner_id = deletion.owner_id
-        )
-        and not exists (
-          select 1 from public.items as item
-          where item.owner_id = deletion.owner_id and item.id = deletion.item_id
-        )
       )
       or exists (
         select 1 from public.items as item
@@ -668,6 +633,36 @@ select pg_catalog.json_build_object(
       or exists (select 1 from public.assets as asset where asset.owner_id = deletion.owner_id and asset.item_id = deletion.item_id)
       or exists (select 1 from storage.objects as object where object.bucket_id = 'library-images'
         and object.name like deletion.owner_id::text || '/' || deletion.item_id::text || '/%')
+`;
+}
+
+function auditSql(snapshot, ledger, assets) {
+  return `
+\\set ON_ERROR_STOP on
+-- Only temporary expectation tables are written; the entire audit rolls back.
+begin;
+${createDeletionTableSql(ledger.events)}
+create temporary table expected_assets (
+  owner_id uuid not null,
+  item_id uuid not null,
+  asset_id uuid not null,
+  object_path text not null,
+  actual_bytes bigint not null
+) on commit drop;
+insert into expected_assets (owner_id, item_id, asset_id, object_path, actual_bytes)
+${expectedAssetValues(assets)};
+create temporary table expected_functions (schema_name text not null, function_count bigint not null) on commit drop;
+insert into expected_functions (schema_name, function_count) values
+${expectedFunctionsValues(snapshot.schemaFunctionCounts)};
+create temporary table expected_rls (qualified_name text) on commit drop;
+insert into expected_rls (qualified_name)
+${expectedRlsValues(snapshot.rlsTables)};
+
+select pg_catalog.json_build_object(
+  'deleted_rows', (
+    select pg_catalog.count(*) from restore_deletions as deletion
+    where (deletion.kind = 'item' and (
+${itemDeletionAuditSql()}
     )) or (deletion.kind = 'account' and (
       exists (select 1 from public.profiles as profile where profile.id = deletion.owner_id)
       or exists (select 1 from public.beta_members as member where member.owner_id = deletion.owner_id)
@@ -853,14 +848,30 @@ async function cleanupOwnedContainer(containerName, token, execute) {
     `{{index .Config.Labels "${RESTORE_LABEL}"}}`,
     containerName,
   ], { allowFailure: true });
-  if (inspected.status !== 0) fail("RESTORE_CONTAINER_CLEANUP_UNCONFIRMED");
+  if (inspected.status !== 0 || inspected.signal) {
+    // Failed creation and an unreachable daemon both make inspect fail. Only a
+    // successful exact-name listing can confirm that no container holds files.
+    const listed = await execute(executable("docker"), [
+      "container",
+      "ls",
+      "--all",
+      "--filter",
+      `name=^/${containerName}$`,
+      "--format",
+      "{{.Names}}",
+    ], { allowFailure: true });
+    if (listed.status === 0 && !listed.signal && listed.stdout === "") return;
+    fail("RESTORE_CONTAINER_CLEANUP_UNCONFIRMED");
+  }
   if (inspected.stdout !== token) fail("RESTORE_CONTAINER_OWNERSHIP_LOST");
   const removed = await execute(executable("docker"), [
     "rm",
     "--force",
     containerName,
   ], { allowFailure: true });
-  if (removed.status !== 0) fail("RESTORE_CONTAINER_CLEANUP_FAILED");
+  if (removed.status !== 0 || removed.signal) {
+    fail("RESTORE_CONTAINER_CLEANUP_FAILED");
+  }
 }
 
 export async function cleanupRestoreResources(
@@ -1120,6 +1131,7 @@ export async function restoreLibrary({
       entry: snapshot.entries.get("database.dump"),
       destinationRoot: restoreDirectory,
     });
+    // A failed run can still create a container; cleanup must confirm its absence.
     containerStarted = true;
     await startIsolatedContainer({
       image,

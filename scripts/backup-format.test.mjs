@@ -63,7 +63,7 @@ test("uncertain container inspection preserves mounted files and rejects verific
       }, { execute });
     }
   }, { code: "RESTORE_CONTAINER_CLEANUP_UNCONFIRMED" });
-  assert.deepEqual(calls, ["inspect"]);
+  assert.deepEqual(calls, ["inspect", "container"]);
   assert.equal(await readFile(sentinel, "utf8"), "owned database");
 });
 

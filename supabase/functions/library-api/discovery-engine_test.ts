@@ -278,8 +278,41 @@ Deno.test("contract 06: Latin substrings do not cross boundaries", () => {
   assertEquals(hasTerm("nosql", "sql"), false);
 });
 
+Deno.test("word boundaries reject supplementary letters, marks, and numbers", () => {
+  for (const character of ["𐐀", "𠀀", "𝅥", "𐒠"]) {
+    for (
+      const text of [
+        `${character}sql`,
+        `sql${character}`,
+        `${character}sql를`,
+        `sql를${character}`,
+      ]
+    ) {
+      assertEquals(hasTerm(text, "sql"), false, text);
+    }
+  }
+});
+
+Deno.test("emoji and punctuation remain word boundaries", () => {
+  for (const separator of ["😀", "🚀", ".", "—"]) {
+    for (
+      const text of [
+        `${separator}sql`,
+        `sql${separator}`,
+        `${separator}sql를${separator}`,
+      ]
+    ) {
+      assertEquals(hasTerm(text, "sql"), true, text);
+    }
+  }
+  assertEquals(hasTerm("𐐀sql sql𐒠 😀sql!", "sql"), true);
+});
+
 Deno.test("contract 07: registered Korean particles are supported", () => {
   assertEquals(hasTerm("레시피를", "레시피"), true);
+  assertEquals(hasTerm("레시피에서는", "레시피"), true);
+  assertEquals(hasTerm("😀레시피를!", "레시피"), true);
+  assertEquals(hasTerm("레시피쯤", "레시피"), false);
 });
 
 Deno.test("contract 08: Korean compounds are not generally segmented", () => {
@@ -634,6 +667,26 @@ Deno.test("classification ignores URL and category payload fields", () => {
   assertEquals(result.categories, []);
 });
 
+Deno.test("classification and explanations use code point word boundaries", () => {
+  for (const text of ["𐐀sql", "sql𐐀", "𐒠sql", "sql𐒠", "sql를𐐀"]) {
+    assertEquals(classifyItem({ user_title: text }).categories, [], text);
+  }
+
+  const snapshot = { user_title: "𐐀sql sql𐒠", note: "😀sql를!" };
+  const result = classifyItem(snapshot);
+  assertEquals(result.categories, [{
+    code: "work",
+    score: 3,
+    rules: [{ id: "work:strong:5", fields: ["note"] }],
+  }]);
+  assertEquals(explainClassification(snapshot, result), [{
+    category_code: "work",
+    rule_id: "work:strong:5",
+    field: "note",
+    expression: "sql",
+  }]);
+});
+
 Deno.test("clearing an M2 note immediately removes its classification cue", () => {
   assertEquals(
     classifySnapshot({ note: "맛집", text_revision: 3 }).categories[0].code,
@@ -677,6 +730,37 @@ Deno.test("literal direct score does not add user and fetched title weights", ()
     fetched_title: "제주",
   }, prepareSearch("제주"));
   assertEquals(match?.score, 10);
+});
+
+Deno.test("alias indexing, search, and explanations use code point boundaries", () => {
+  const plan = prepareSearch("엑셀");
+  for (
+    const text of [
+      "𐐀excel",
+      "excel𐐀",
+      "𐒠excel",
+      "excel𐒠",
+      "excel를𐐀",
+    ]
+  ) {
+    const snapshot = { user_title: text };
+    assertEquals(buildIndex(snapshot).concepts.user_title, [], text);
+    assertEquals(scoreReferenceSearch(snapshot, plan), null, text);
+    assertEquals(explainAliases(snapshot, plan), [], text);
+  }
+
+  const snapshot = { user_title: "😀excel를!" };
+  assertEquals(buildIndex(snapshot).concepts.user_title, ["excel"]);
+  assertEquals(scoreReferenceSearch(snapshot, plan), {
+    mode: "alias",
+    bucket: 1,
+    score: 10,
+  });
+  assertEquals(explainAliases(snapshot, plan), [{
+    concept_id: "excel",
+    field: "user_title",
+    expression: "excel",
+  }]);
 });
 
 Deno.test("alias explanations contain only registered forms found in the document", () => {

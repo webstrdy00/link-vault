@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "beta:check": "node scripts/beta-acceptance.mjs",
-    "test:beta": "node --test scripts/beta-acceptance.test.mjs",
+    "beta:templates": "node scripts/beta-templates.mjs",
+    "test:beta": "node --test scripts/beta-acceptance.test.mjs scripts/beta-templates.test.mjs",
     "backend:start": "node scripts/start-local-backend.mjs",
     "test:backend-start": "node --test scripts/start-local-backend.test.mjs",
     "backend:migrate": "supabase migration up --local && node scripts/normalize-existing-categories.mjs",

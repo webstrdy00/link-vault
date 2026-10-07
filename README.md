@@ -234,6 +234,36 @@ npm run test:db
 실제 회원 자료가 있는 로컬 DB를 시험을 위해 비우지 마세요.
 [통합 시험 순서와 안전 조건](docs/development-record.md#m1m4-로컬-서버와-검증)을 먼저 확인하세요.
 
+### 실제 인수 기록용 CSV
+
+새 checkout에서 `npm ci`를 실행한 뒤, 아래 명령으로 **빈 양식 두 개**를 생성합니다.
+출력 디렉터리는 미리 만든 저장소 밖의 전용 폴더여야 하며, 기존 파일은 덮어쓰지 않습니다.
+
+```powershell
+$evidence = Join-Path $HOME ("link-vault-evidence-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $evidence | Out-Null
+npm run beta:templates -- --output-dir "$evidence"
+```
+
+- `device_capture_template.csv`: 실제 공유·저장 기록. Threads 8건, Instagram 8건,
+  네이버 블로그 8건, 기타 공개 웹 6건을 기록합니다.
+- `retrieval_tasks_template.csv`: 실제 기억 단서로 다시 찾는 과제 10개를 기록합니다.
+- 헤더는 검사기의 `CAPTURE_HEADERS`·`RETRIEVAL_TASK_HEADERS`에서 생성합니다.
+  URL·메모·검색어·계정 정보를 포함한 실제 기록은 계속 저장소 밖에 두고 커밋하지 마세요.
+
+작성 후 같은 PowerShell 창에서 검사합니다.
+
+```powershell
+npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks "$evidence/retrieval_tasks_template.csv"
+```
+
+헤더만 있는 빈 양식은 인수 자료가 아니므로 검사 **종료 코드 1이 정상**입니다.
+생성 명령의 성공은 양식 생성만 뜻합니다. 작성된 CSV의 검사 통과도 실제 사용자 증거의
+진위를 검증하거나 외부 베타·Google 인증 전체를 승인하는 결과가 아닙니다.
+실행 날짜·기기/환경·앱 버전·`git rev-parse HEAD`·명령·결과·미실행 범위는
+같은 외부 폴더에 기록하세요. 실제 Google 최초 로그인·재시작 복원·별도 빈 회원 탈퇴의
+로컬 확인 기록과, 토큰 만료 갱신·자료가 있는 회원 탈퇴·운영 인증 인수는 구분합니다.
+
 ## 상세 문서
 
 | 목적 | 문서 |

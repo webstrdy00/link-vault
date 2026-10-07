@@ -647,6 +647,9 @@ def activate_functions(release, functions, import_map, stack, health):
     cleanup = True
     try:
         shutil.copytree(str(release.joinpath(*APP.split("/"))), str(work / "next"))
+        # The release remains immutable. The live directory needs owner write
+        # permission for its parent-link update during a cross-directory rename.
+        (work / "next").chmod(0o755)
         (work / "next-deno.jsonc").write_bytes(import_map)
         (work / "next-deno.jsonc").chmod(0o644)
         try:

@@ -3,6 +3,7 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "test:ci": "node --test scripts/ci-contract.test.mjs",
     "beta:check": "node scripts/beta-acceptance.mjs",
     "beta:templates": "node scripts/beta-templates.mjs",
     "test:beta": "node --test scripts/beta-acceptance.test.mjs scripts/beta-templates.test.mjs",

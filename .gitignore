@@ -24,6 +24,7 @@ docs/*
 docs/assets/*
 !docs/assets/library.png
 !docs/assets/filters.png
+secrets/
 
 # Android build outputs and machine-local settings
 .gradle/
@@ -34,6 +35,10 @@ local.properties
 *.iml
 *.jks
 *.keystore
+*.p12
+*.agekey
+__pycache__/
+*.pyc
 
 # Local backend tooling and credentials
 node_modules/

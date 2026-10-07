@@ -1,3 +1,4 @@
+import java.net.URI
 import java.util.Base64
 
 plugins {
@@ -14,9 +15,11 @@ kapt {
     }
 }
 
+fun buildConfigValue(name: String): String = providers.gradleProperty(name)
+    .orElse(providers.environmentVariable(name)).getOrElse("")
+
 fun buildConfigString(name: String): String {
-    val value = providers.gradleProperty(name)
-        .orElse(providers.environmentVariable(name)).getOrElse("")
+    val value = buildConfigValue(name)
     if (name == "SUPABASE_PUBLISHABLE_KEY" && value.isNotBlank()) {
         val jwtPayload = runCatching {
             String(Base64.getUrlDecoder().decode(value.split('.').getOrNull(1).orEmpty()))
@@ -28,6 +31,52 @@ fun buildConfigString(name: String): String {
     }
     return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"")
         .replace("\r", "\\r").replace("\n", "\\n") + "\""
+}
+
+val requireReleaseSigning = providers.gradleProperty("requireReleaseSigning").orNull == "true"
+val releaseSigningValues = listOf(
+    "ANDROID_KEYSTORE_PATH",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+    "ANDROID_KEY_PASSWORD",
+).associateWith { providers.environmentVariable(it).orNull }
+val hasReleaseSigning = releaseSigningValues.values.any { it != null }
+val releaseStoreFile = if (hasReleaseSigning) {
+    val missingNames = releaseSigningValues.filterValues { it.isNullOrBlank() }.keys
+    require(missingNames.isEmpty()) {
+        "Release signing requires all four environment variables; missing or blank: ${missingNames.joinToString()}"
+    }
+    val storeFile = runCatching {
+        file(checkNotNull(releaseSigningValues["ANDROID_KEYSTORE_PATH"]))
+            .takeIf { it.isFile }
+    }.getOrNull()
+    requireNotNull(storeFile) { "ANDROID_KEYSTORE_PATH must identify an existing file." }
+} else {
+    null
+}
+
+if (requireReleaseSigning) {
+    require(releaseStoreFile != null) {
+        "requireReleaseSigning=true requires all four Android release signing environment variables."
+    }
+    val supabaseUri = runCatching {
+        URI(buildConfigValue("SUPABASE_URL").trim().trimEnd('/'))
+    }.getOrNull()
+    require(
+        supabaseUri != null &&
+            supabaseUri.scheme.equals("https", ignoreCase = true) &&
+            supabaseUri.host?.isNotBlank() == true &&
+            supabaseUri.userInfo == null &&
+            supabaseUri.rawQuery == null &&
+            supabaseUri.rawFragment == null &&
+            (supabaseUri.rawPath.isNullOrEmpty() || supabaseUri.rawPath == "/") &&
+            (supabaseUri.port == -1 || supabaseUri.port in 1..65535),
+    ) { "SUPABASE_URL must be a valid HTTPS origin when requireReleaseSigning=true." }
+    listOf("SUPABASE_PUBLISHABLE_KEY", "GOOGLE_WEB_CLIENT_ID").forEach { name ->
+        require(buildConfigValue(name).isNotBlank()) {
+            "$name is required when requireReleaseSigning=true."
+        }
+    }
 }
 
 android {
@@ -44,6 +93,18 @@ android {
         buildConfigField("String", "SUPABASE_URL", buildConfigString("SUPABASE_URL"))
         buildConfigField("String", "SUPABASE_PUBLISHABLE_KEY", buildConfigString("SUPABASE_PUBLISHABLE_KEY"))
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", buildConfigString("GOOGLE_WEB_CLIENT_ID"))
+    }
+
+    if (releaseStoreFile != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = releaseSigningValues.getValue("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = releaseSigningValues.getValue("ANDROID_KEY_ALIAS")
+                keyPassword = releaseSigningValues.getValue("ANDROID_KEY_PASSWORD")
+            }
+        }
+        buildTypes.getByName("release").signingConfig = signingConfigs.getByName("release")
     }
 
     buildFeatures {

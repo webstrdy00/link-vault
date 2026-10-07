@@ -264,6 +264,43 @@ npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks
 같은 외부 폴더에 기록하세요. 실제 Google 최초 로그인·재시작 복원·별도 빈 회원 탈퇴의
 로컬 확인 기록과, 토큰 만료 갱신·자료가 있는 회원 탈퇴·운영 인증 인수는 구분합니다.
 
+## 배포 자동화
+
+- PR에서는 [CI](.github/workflows/ci.yml)와 [DB 계약 시험](.github/workflows/database-ci.yml)을 실행합니다.
+  `main`·`feature/goal` push는 같은 검증 후 `production` Environment의 담당자 승인을 기다립니다.
+- [서버 배포](.github/workflows/deploy.yml)는 별도 SSH 키와 강제 명령 계정만 사용합니다.
+  API·마이그레이션만 전달하며, 서버의 Compose·비밀값·배포 수신기는 자동으로 덮어쓰지 않습니다.
+  적용된 마이그레이션 변경은 거부하고, 신규 마이그레이션 전에 암호화 백업을 생성합니다.
+  API 전환 실패 시 이전 API를 복구하지만 **커밋된 DB 변경은 자동으로 되돌리지 않습니다.**
+  비밀값 없는 [비공개 Compose overlay](deployment/compose.private.yml)와
+  [제한 계정 설치기](scripts/install-server-automation.py)는 새 서버 구성을 위한 소스입니다.
+- [Android 배포 빌드](.github/workflows/android-release.yml)는 수동 실행·별도 승인 대상입니다.
+  서명키 네 항목과 HTTPS 서버 주소·공개 API 키·Google 웹 Client ID가 없으면 배포 빌드를 거부합니다.
+  APK/AAB 생성은 스토어 게시나 실제 계정 인수 완료를 뜻하지 않습니다.
+
+### 백업과 서버 이전
+
+[백업 명령](scripts/server-backup.py)은 DB dump·역할·Storage·Vault 키·서버 설정·배포 소스를
+`age` 공개 수신자로 암호화합니다. 일관된 파일·DB 상태를 위해 캡처 중 앱 서비스를 잠시 중지하고
+종료 시 원래 실행 상태로 복구합니다. 운영자는 이 중단 시간을 고려해야 합니다.
+서버에는 공개 수신자만 두고, 복호화용 개인 키는 별도 보관합니다.
+
+- 서버에서는 완료된 암호화 스냅샷 **최근 7개**를 보존합니다.
+- [외부 백업 workflow](.github/workflows/backup.yml)는 암호화 파일만 GitHub artifact에 **30일** 보관합니다.
+  GitHub 예약 실행은 **기본 브랜치에 workflow가 병합된 뒤** 동작합니다.
+  기본 브랜치 반영 전에도 서버 timer와 push로 시작된 백업은 별개로 동작합니다.
+- 백업 실패 또는 서버 만료 14일 이내에는 저장소 담당자에게 할당된 이슈를 생성합니다.
+  이메일·모바일 수신은 담당자의 GitHub 알림 설정에 따릅니다.
+- GitHub artifact는 영구 보관소가 아닙니다. 필요한 복구 지점은 만료 전에 별도 장기 저장소로 옮기고,
+  개인 복호화 키는 백업 파일과 다른 계정·오프라인 매체에 보관하세요.
+
+이전 시에는 새 서버에서 아카이브의 manifest에 기록된 이미지 digest를 준비하고, 외부에서 복호화한
+Vault 키·DB 역할·DB dump·Storage·Compose 설정·소스를 복원합니다.
+아카이브의 복구 순서를 따르고, 신규 환경에서 Vault 복호화·API·Storage·예약 작업을 검증한 뒤
+DNS와 앱 연결을 전환하세요. 기존 서버는 복구 검증과 최종 데이터 동기화 전에 폐기하지 않습니다.
+Android 서명키는 앱 업데이트의 동일성을 결정하므로 서버 이전과 무관하게 계속 보존해야 합니다.
+`secrets/`, `.env*`, 서명 저장소, 복호화 키는 Git에 추가하지 마세요.
+
 ## 상세 문서
 
 | 목적 | 문서 |

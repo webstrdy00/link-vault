@@ -1,0 +1,20 @@
+# Layer over Supabase self-hosted/v0.8.2 (564eab8ad7840b13324f68b1bfac074ef8d51c21).
+# Keep the upstream .env and Vault master key outside Git.
+services:
+  api-gw:
+    ports: !override
+      - 127.0.0.1:8000:8000/tcp
+  realtime:
+    profiles: [optional]
+  supavisor:
+    profiles: [optional]
+    ports: !reset []
+  db:
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=warning
+      - -c
+      - shared_preload_libraries=pg_cron,pg_net,pg_stat_statements,pgsodium,supabase_vault

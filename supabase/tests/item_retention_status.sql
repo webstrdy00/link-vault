@@ -1,6 +1,8 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local search_path = pg_catalog, extensions, public;
+-- Rollback-only metadata fixtures; actual object deletion uses the Storage API.
+set local storage.allow_delete_query = 'true';
 select no_plan();
 
 select ok(
@@ -158,6 +160,20 @@ values
     now() - interval '30 days 1 second',
     now() - interval '30 days 1 second',
     now() - interval '30 days 1 second'
+  ),
+  (
+    '02120000-0000-0000-0000-000000000007',
+    '02110000-0000-0000-0000-000000000001',
+    now() - interval '2 days',
+    now() - interval '2 days',
+    now() - interval '2 days'
+  ),
+  (
+    '02120000-0000-0000-0000-000000000008',
+    '02110000-0000-0000-0000-000000000001',
+    now() - interval '4 days',
+    now() - interval '4 days',
+    now() - interval '4 days'
   );
 
 insert into private.item_deletion_tombstones (owner_id, item_id, deleted_at)
@@ -185,19 +201,21 @@ select is(
       and item.extraction_meta = '{}'::jsonb
       and item.metadata_state is null
   ),
-  5::bigint,
-  'all five retention fixtures are content-free retained rows'
+  7::bigint,
+  'all seven retention fixtures are content-free retained rows'
 );
 
+-- Pending includes content-free rows throughout retention, not missed deadlines.
 select is(
   (public.library_operation_status()->>'item_deletions_pending')::bigint,
   (
-    select (value->>'item_deletions_pending')::bigint + 5
+    select (value->>'item_deletions_pending')::bigint + 7
     from item_retention_status_baseline
   ),
-  '72 hours through 30 days plus one second all remain pending'
+  '2 days, 72 hours, 4 days, 29 days and both 30-day boundary rows remain pending'
 );
 
+-- The item alert is strictly >30 days; account and file alerts stay at >72 hours.
 select is(
   (public.library_operation_status()->>'item_deletions_overdue')::bigint,
   (
@@ -246,6 +264,14 @@ select ok(
     select 1 from public.items
     where id = '02120000-0000-0000-0000-000000000003'
   )
+  and exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000007'
+  )
+  and exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000008'
+  )
   and not exists (
     select 1 from public.items
     where id = '02120000-0000-0000-0000-000000000004'
@@ -254,7 +280,7 @@ select ok(
     select 1 from public.items
     where id = '02120000-0000-0000-0000-000000000005'
   ),
-  'purge retains sub-30-day rows and removes both eligible boundary rows'
+  'purge retains 2-day, 72-hour, 4-day and 29-day rows and removes both eligible boundary rows'
 );
 
 select is(
@@ -263,8 +289,239 @@ select is(
     from private.item_deletion_tombstones as tombstone
     where tombstone.owner_id = '02110000-0000-0000-0000-000000000001'
   ),
-  5::bigint,
+  7::bigint,
   'physical purge preserves all content-free deletion tombstones'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_pending')::bigint,
+  (
+    select (value->>'item_deletions_pending')::bigint + 5
+    from item_retention_status_baseline
+  ),
+  'completed purge removes eligible rows from pending while sub-30-day retention remains'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_overdue')::bigint,
+  (
+    select (value->>'item_deletions_overdue')::bigint
+    from item_retention_status_baseline
+  ),
+  'completed purge clears the item overdue alert'
+);
+
+insert into public.items (id, owner_id, created_at, updated_at, deleted_at)
+values
+  (
+    '02120000-0000-0000-0000-000000000009',
+    '02110000-0000-0000-0000-000000000001',
+    now() - interval '31 days',
+    now() - interval '31 days',
+    now() - interval '31 days'
+  ),
+  (
+    '02120000-0000-0000-0000-000000000010',
+    '02110000-0000-0000-0000-000000000001',
+    now() - interval '31 days',
+    now() - interval '31 days',
+    now() - interval '31 days'
+  ),
+  (
+    '02120000-0000-0000-0000-000000000011',
+    '02110000-0000-0000-0000-000000000001',
+    now() - interval '31 days',
+    now() - interval '31 days',
+    now() - interval '31 days'
+  );
+
+insert into private.item_deletion_tombstones (owner_id, item_id, deleted_at)
+select item.owner_id, item.id, item.deleted_at
+from public.items as item
+where item.id in (
+  '02120000-0000-0000-0000-000000000009',
+  '02120000-0000-0000-0000-000000000010',
+  '02120000-0000-0000-0000-000000000011'
+);
+
+insert into public.api_requests (
+  owner_id, request_id, method_path, request_hash, response_code, response_body
+)
+values (
+  '02110000-0000-0000-0000-000000000001',
+  '02140000-0000-0000-0000-000000000002',
+  'DELETE /items/02120000-0000-0000-0000-000000000009',
+  'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+  202,
+  '{"http_status":202,"item_id":"02120000-0000-0000-0000-000000000009","state":"deleting"}'::jsonb
+);
+
+insert into storage.objects (id, bucket_id, name, metadata)
+values (
+  '02150000-0000-0000-0000-000000000001',
+  'library-images',
+  '02110000-0000-0000-0000-000000000001/02120000-0000-0000-0000-000000000010/orphaned-object',
+  '{"size":1000,"mimetype":"image/jpeg"}'::jsonb
+);
+
+insert into public.assets (
+  id, owner_id, item_id, object_path, state, reserved_mime_type,
+  reservation_expires_at, cleanup_reason, cleanup_next_run_at,
+  created_at, updated_at, deleted_at
+)
+values (
+  '02130000-0000-0000-0000-000000000002',
+  '02110000-0000-0000-0000-000000000001',
+  '02120000-0000-0000-0000-000000000011',
+  '02110000-0000-0000-0000-000000000001/02120000-0000-0000-0000-000000000011/02130000-0000-0000-0000-000000000002',
+  'deleting',
+  'image/jpeg',
+  now() - interval '31 days',
+  'item_delete',
+  now(),
+  now() - interval '31 days',
+  now(),
+  now() - interval '31 days'
+);
+
+update public.library_usage
+set reserved_image_bytes = 2000000
+where owner_id = '02110000-0000-0000-0000-000000000001';
+
+select is(
+  (public.library_purge_deleted_items(10)->>'purged_items')::integer,
+  0,
+  'each independent receipt, Storage object or asset dependency blocks its 31-day row'
+);
+
+select is(
+  (
+    select count(*) from public.items
+    where id in (
+      '02120000-0000-0000-0000-000000000009',
+      '02120000-0000-0000-0000-000000000010',
+      '02120000-0000-0000-0000-000000000011'
+    )
+  ),
+  3::bigint,
+  'all three dependency-blocked rows remain physically present after attempted purge'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_pending')::bigint,
+  (
+    select (value->>'item_deletions_pending')::bigint + 8
+    from item_retention_status_baseline
+  ),
+  'blocked purge retains five within-retention rows and three overdue rows in pending'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_overdue')::bigint,
+  (
+    select (value->>'item_deletions_overdue')::bigint + 3
+    from item_retention_status_baseline
+  ),
+  'dependency-blocked 31-day rows remain overdue after attempted purge'
+);
+
+delete from public.api_requests
+where owner_id = '02110000-0000-0000-0000-000000000001'
+  and request_id = '02140000-0000-0000-0000-000000000002';
+
+select is(
+  (public.library_purge_deleted_items(10)->>'purged_items')::integer,
+  1,
+  'removing the receipt dependency allows only its overdue row to be purged'
+);
+
+select ok(
+  not exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000009'
+  )
+  and exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000010'
+  )
+  and exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000011'
+  ),
+  'receipt-free purge leaves both independently blocked Storage and asset rows'
+);
+
+delete from storage.objects
+where id = '02150000-0000-0000-0000-000000000001';
+
+select is(
+  (public.library_purge_deleted_items(10)->>'purged_items')::integer,
+  1,
+  'removing the Storage object allows only its overdue row to be purged'
+);
+
+select ok(
+  not exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000010'
+  )
+  and exists (
+    select 1 from public.items
+    where id = '02120000-0000-0000-0000-000000000011'
+  ),
+  'object-free purge still retains the asset-blocked row'
+);
+
+delete from public.assets
+where id = '02130000-0000-0000-0000-000000000002';
+
+update public.library_usage
+set reserved_image_bytes = 0
+where owner_id = '02110000-0000-0000-0000-000000000001';
+
+select is(
+  (public.library_purge_deleted_items(10)->>'purged_items')::integer,
+  1,
+  'completed asset cleanup allows the final overdue row to be purged'
+);
+
+select ok(
+  not exists (
+    select 1 from public.items
+    where id in (
+      '02120000-0000-0000-0000-000000000009',
+      '02120000-0000-0000-0000-000000000010',
+      '02120000-0000-0000-0000-000000000011'
+    )
+  ),
+  'all formerly blocked rows are physically removed after their dependencies clear'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_pending')::bigint,
+  (
+    select (value->>'item_deletions_pending')::bigint + 5
+    from item_retention_status_baseline
+  ),
+  'completed dependency cleanup leaves only the five within-retention rows pending'
+);
+
+select is(
+  (public.library_operation_status()->>'item_deletions_overdue')::bigint,
+  (
+    select (value->>'item_deletions_overdue')::bigint
+    from item_retention_status_baseline
+  ),
+  'completed dependency cleanup and physical purge clear all added item overdue alerts'
+);
+
+select is(
+  (
+    select count(*) from private.item_deletion_tombstones
+    where owner_id = '02110000-0000-0000-0000-000000000001'
+  ),
+  10::bigint,
+  'both completed purge paths preserve every content-free deletion tombstone'
 );
 
 insert into public.profiles (id, state, deletion_requested_at)

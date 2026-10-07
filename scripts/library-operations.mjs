@@ -1,6 +1,8 @@
 import { pathToFileURL } from "node:url";
 import { localBackendConfig } from "./local-backend-fixture.mjs";
 
+// Pending includes unfinished work, including content-free retained item rows.
+// Item overdue means strictly older than 30 days; account/file targets are 72 hours.
 const COUNT_FIELDS = [
   "account_deletions_pending",
   "account_deletions_retry",
@@ -85,46 +87,57 @@ export function evaluateOperationStatus(value) {
   return { ...output, warnings };
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  if (args.length > 1 || (args.length === 1 && args[0] !== "--run")) {
-    throw new Error("INVALID_OPERATION_ARGUMENTS");
+export async function runLibraryOperations({
+  args = [],
+  request,
+  output = console.log,
+  error = console.error,
+} = {}) {
+  try {
+    if (args.length > 1 || (args.length === 1 && args[0] !== "--run")) {
+      throw new Error("INVALID_OPERATION_ARGUMENTS");
+    }
+    if (request === undefined) {
+      // Resolve credentials only for CLI execution, never during import.
+      const config = localBackendConfig();
+      request = async (path, body) => {
+        const response = await fetch(`${config.API_URL}${path}`, {
+          method: "POST",
+          headers: {
+            apikey: config.ANON_KEY,
+            Authorization: `Bearer ${config.SERVICE_ROLE_KEY}`,
+            "Content-Type": "application/json",
+            Connection: "close",
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(120_000),
+        });
+        if (!response.ok) throw new Error("LOCAL_OPERATION_REQUEST_FAILED");
+        return await response.json();
+      };
+    }
+    if (args[0] === "--run") {
+      await request("/functions/v1/library-api/v1/internal/maintenance", {
+        limit: 10,
+      });
+    }
+    const status = evaluateOperationStatus(
+      await request("/rest/v1/rpc/library_operation_status", {}),
+    );
+    output(JSON.stringify(status, null, 2));
+    // A queued cron HTTP request is not proof of worker completion; pending alone
+    // is healthy while deadlines, retries, leases and accounting warn separately.
+    return status.warnings.length > 0 ? 1 : 0;
+  } catch {
+    error("LOCAL_OPERATIONS_FAILED");
+    return 1;
   }
-  const config = localBackendConfig();
-  async function request(path, body) {
-    const response = await fetch(`${config.API_URL}${path}`, {
-      method: "POST",
-      headers: {
-        apikey: config.ANON_KEY,
-        Authorization: `Bearer ${config.SERVICE_ROLE_KEY}`,
-        "Content-Type": "application/json",
-        Connection: "close",
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
-    });
-    if (!response.ok) throw new Error("LOCAL_OPERATION_REQUEST_FAILED");
-    return await response.json();
-  }
-  if (args[0] === "--run") {
-    await request("/functions/v1/library-api/v1/internal/maintenance", {
-      limit: 10,
-    });
-  }
-  const status = evaluateOperationStatus(
-    await request("/rest/v1/rpc/library_operation_status", {}),
-  );
-  console.log(JSON.stringify(status, null, 2));
-  // A successfully queued cron HTTP request is not proof that its worker succeeded.
-  // Pending leases, deadlines and accounting are checked separately above.
-  if (status.warnings.length > 0) process.exitCode = 1;
 }
 
 if (
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
-  main().catch(() => {
-    console.error("LOCAL_OPERATIONS_FAILED");
-    process.exitCode = 1;
+  process.exitCode = await runLibraryOperations({
+    args: process.argv.slice(2),
   });
 }

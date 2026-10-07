@@ -58,6 +58,11 @@ def main():
     source = Path(__file__).resolve().parent
     if not ROOT.is_dir() or not Path('/etc/link-vault/backup-recipient.txt').is_file():
         raise RuntimeError('PRIVATE_STACK_AND_BACKUP_RECIPIENT_REQUIRED')
+    capsules = ROOT / 'recovery-capsules'
+    capsules.mkdir(mode=0o700, exist_ok=True)
+    if capsules.is_symlink() or capsules.stat().st_uid != 0:
+        raise RuntimeError('UNSAFE_RECOVERY_CAPSULE_DIRECTORY')
+    capsules.chmod(0o700)
     for name in ('deploy', 'backup'):
         data = (source / ('server-' + name + '.py')).read_bytes()
         compile(data, 'server-' + name + '.py', 'exec')

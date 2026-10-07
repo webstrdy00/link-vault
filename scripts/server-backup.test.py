@@ -338,6 +338,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("-h", command)
         self.assertIn("supabase/docker", command)
         self.assertIn("releases", command)
+        self.assertIn("recovery-capsules", command)
         self.assertIn("database", command)
         self.assertIn("deploy-receipt.json", command)
         self.assertIn("link-vault-backup", command)

@@ -255,7 +255,7 @@ def archive_command(config, temporary, receipts):
             "--transform=flags=r;s,^link-vault-deploy$,recovery/bin/link-vault-deploy,",
             "--transform=flags=r;s,^link-vault-backup$,recovery/bin/link-vault-backup,",
             "--directory", temporary, "database", "manifest.json",
-            "--directory", config.root, "supabase/docker", "releases"] + receipts + [
+            "--directory", config.root, "supabase/docker", "releases", "recovery-capsules"] + receipts + [
             "--directory", "/usr/local/sbin", "link-vault-deploy", "link-vault-backup"]
 
 

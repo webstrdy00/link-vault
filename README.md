@@ -284,6 +284,8 @@ npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks
 `age` 공개 수신자로 암호화합니다. 일관된 파일·DB 상태를 위해 캡처 중 앱 서비스를 잠시 중지하고
 종료 시 원래 실행 상태로 복구합니다. 운영자는 이 중단 시간을 고려해야 합니다.
 서버에는 공개 수신자만 두고, 복호화용 개인 키는 별도 보관합니다.
+Git 저장소와 앱 서명·접속키 복구 묶음은 먼저 별도로 암호화한 `recovery-capsules/` 형태로
+서버 스냅샷에 포함할 수 있습니다. 이 묶음에도 백업 복호화용 개인 키는 포함하지 않습니다.
 
 - 서버에서는 완료된 암호화 스냅샷 **최근 7개**를 보존합니다.
 - [외부 백업 workflow](.github/workflows/backup.yml)는 암호화 파일만 GitHub artifact에 **30일** 보관합니다.

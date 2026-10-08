@@ -1,0 +1,66 @@
+name: Verified server deployment
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-deployment
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  verify-database:
+    uses: ./.github/workflows/database-ci.yml
+
+  deploy:
+    needs: [verify, verify-database]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Deliver verified source to restricted receiver
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$work/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$work/known_hosts"
+          git archive --format=tar.gz "$GITHUB_SHA" supabase/functions/library-api supabase/migrations > "$work/release.tar.gz"
+          {
+            printf '{"commit":"%s"}\n' "$GITHUB_SHA"
+            cat "$work/release.tar.gz"
+          } | ssh -T -i "$work/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$work/known_hosts" -o ConnectTimeout=20 \
+            "$DEPLOY_USER@$DEPLOY_HOST"
+
+  failure-notice:
+    needs: [verify, verify-database, deploy]
+    if: always() && (needs.verify.result == 'failure' || needs.verify-database.result == 'failure' || needs.deploy.result == 'failure')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo '::error::Validation or deployment failed. Review this Actions run; no automatic database rollback is performed.'
+          echo 'Deployment failed. GitHub Actions notifications must be enabled by the repository owner.' >> "$GITHUB_STEP_SUMMARY"

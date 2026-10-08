@@ -1,0 +1,655 @@
+{
+  "frozen_at": "2026-09-11T00:22:12.628Z",
+  "thresholds": {
+    "scope": "Author-written fixed synthetic suite, expectations frozen before first execution; not blind or real-user accuracy.",
+    "classification": {
+      "exact_set_cases": 42,
+      "required_pass": 42
+    },
+    "search": {
+      "cases": 31,
+      "required_pass": 31
+    },
+    "public": {
+      "same_fetch_compare": true,
+      "no_claimed_quality_threshold": true
+    }
+  },
+  "classification": [
+    {
+      "id": "C01",
+      "item": {
+        "title": "제주 여행용 카메라",
+        "note": "제품 비교 자료"
+      },
+      "expected": [
+        "travel",
+        "shopping"
+      ]
+    },
+    {
+      "id": "C02",
+      "item": {
+        "description": "성수 카페 추천"
+      },
+      "expected": [
+        "food"
+      ]
+    },
+    {
+      "id": "C03",
+      "item": {
+        "description": "엑셀에서 XLOOKUP 쓰기"
+      },
+      "expected": [
+        "work"
+      ]
+    },
+    {
+      "id": "C04",
+      "item": {
+        "title": "구매 후기: 새 가방"
+      },
+      "expected": [
+        "shopping"
+      ]
+    },
+    {
+      "id": "C05",
+      "item": {
+        "description": "Fediverse uses ActivityPub"
+      },
+      "expected": [
+        "tools"
+      ]
+    },
+    {
+      "id": "C06",
+      "item": {
+        "title": "취침 전 스트레칭"
+      },
+      "expected": [
+        "life"
+      ]
+    },
+    {
+      "id": "C07",
+      "item": {
+        "title": "백자 전시와 달항아리"
+      },
+      "expected": [
+        "culture"
+      ]
+    },
+    {
+      "id": "C08",
+      "item": {
+        "title": "산책 기록"
+      },
+      "expected": []
+    },
+    {
+      "id": "C09",
+      "item": {
+        "title": "택시 기사 모집"
+      },
+      "expected": []
+    },
+    {
+      "id": "C10",
+      "item": {
+        "title": "호텔 채용 소식"
+      },
+      "expected": []
+    },
+    {
+      "id": "C11",
+      "item": {
+        "title": "카메라 사진"
+      },
+      "expected": []
+    },
+    {
+      "id": "C12",
+      "item": {
+        "title": "가격 구매",
+        "description": "가격 구매"
+      },
+      "expected": []
+    },
+    {
+      "id": "C13",
+      "item": {
+        "title": "호텔",
+        "description": "제주",
+        "ocr": "공항"
+      },
+      "expected": []
+    },
+    {
+      "id": "C14",
+      "item": {
+        "title": "제주 호텔 공항 안내"
+      },
+      "expected": [
+        "travel"
+      ]
+    },
+    {
+      "id": "C15",
+      "item": {
+        "title": "Home",
+        "url": "https://travel.example/여행"
+      },
+      "expected": []
+    },
+    {
+      "id": "C16",
+      "item": {
+        "title": "이예령 (@yrro0) on Threads",
+        "description": "카톡프사 ✨"
+      },
+      "expected": []
+    },
+    {
+      "id": "C17",
+      "item": {
+        "title": "Instagram",
+        "description": "앱 기능 업데이트 안내"
+      },
+      "expected": [
+        "tools"
+      ]
+    },
+    {
+      "id": "C18",
+      "item": {
+        "title": "약관 정책 문서"
+      },
+      "expected": []
+    },
+    {
+      "id": "C19",
+      "item": {
+        "title": "좋아요와 저장",
+        "categories": "여행"
+      },
+      "expected": []
+    },
+    {
+      "id": "C20",
+      "item": {
+        "note": "레시피를 나중에 따라 할 것"
+      },
+      "expected": [
+        "food"
+      ]
+    },
+    {
+      "id": "C21",
+      "item": {
+        "title": "#여행 #맛집 #엑셀 #스트레칭"
+      },
+      "expected": [
+        "travel",
+        "food",
+        "work"
+      ]
+    },
+    {
+      "id": "C22",
+      "item": {
+        "title": "파이썬 자동화 공부"
+      },
+      "expected": [
+        "work",
+        "tools"
+      ]
+    },
+    {
+      "id": "C23",
+      "item": {
+        "title": "행사 선물 안내"
+      },
+      "expected": []
+    },
+    {
+      "id": "C24",
+      "item": {
+        "title": "SQLish implementation"
+      },
+      "expected": []
+    },
+    {
+      "id": "C25",
+      "item": {
+        "title": "회의를 시작합니다"
+      },
+      "expected": []
+    },
+    {
+      "id": "C26",
+      "item": {
+        "title": "ＸＬＯＯＫＵＰ 함수"
+      },
+      "expected": [
+        "work"
+      ]
+    },
+    {
+      "id": "C27",
+      "item": {
+        "title": "영화는 주말에 보기"
+      },
+      "expected": [
+        "culture"
+      ]
+    },
+    {
+      "id": "C28",
+      "item": {
+        "title": "공연장비 가격"
+      },
+      "expected": []
+    },
+    {
+      "id": "C29",
+      "item": {
+        "title": "청소를 도와주는 앱 추천"
+      },
+      "expected": [
+        "tools",
+        "life"
+      ]
+    },
+    {
+      "id": "C30",
+      "item": {
+        "title": "여행",
+        "manual_override": true,
+        "manual_categories": [
+          "my_private"
+        ]
+      },
+      "expected": [
+        "my_private"
+      ]
+    },
+    {
+      "id": "C31",
+      "item": {
+        "title": "여행",
+        "manual_override": true,
+        "manual_categories": []
+      },
+      "expected": []
+    },
+    {
+      "id": "C32",
+      "item": {
+        "title": "평범한 자료",
+        "ocr": "운동 루틴"
+      },
+      "expected": [
+        "life"
+      ]
+    },
+    {
+      "id": "C33",
+      "item": {
+        "title": "평범한 자료",
+        "ocr": "운동 루틴",
+        "ocr_active": false
+      },
+      "expected": []
+    },
+    {
+      "id": "C34",
+      "item": {
+        "title": "책 기사 문화 소식"
+      },
+      "expected": [
+        "culture"
+      ]
+    },
+    {
+      "id": "C35",
+      "item": {
+        "title": "가격",
+        "description": "구매",
+        "note": "할인"
+      },
+      "expected": []
+    },
+    {
+      "id": "C36",
+      "item": {
+        "title": "여행기록모음"
+      },
+      "expected": []
+    },
+    {
+      "id": "C37",
+      "item": {
+        "title": "전시회를 다녀옴"
+      },
+      "expected": [
+        "culture"
+      ]
+    },
+    {
+      "id": "C38",
+      "item": {
+        "title": "맛집",
+        "description": "맛집 맛집 맛집"
+      },
+      "expected": [
+        "food"
+      ]
+    },
+    {
+      "id": "C39",
+      "item": {
+        "title": "https://example.com/레시피"
+      },
+      "expected": []
+    },
+    {
+      "id": "C40",
+      "item": {
+        "title": "좋아요 100, 댓글 20 - 박물관: 전시"
+      },
+      "expected": [
+        "culture"
+      ]
+    },
+    {
+      "id": "C41",
+      "item": {
+        "title": "수면도 생활 습관"
+      },
+      "expected": [
+        "life"
+      ]
+    },
+    {
+      "id": "C42",
+      "item": {
+        "title": "#맛집지도"
+      },
+      "expected": []
+    }
+  ],
+  "search": [
+    {
+      "id": "Q01",
+      "q": "카카오톡 프로필 사진",
+      "item": {
+        "title": "카톡프사"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q02",
+      "q": "카톡 프사",
+      "item": {
+        "title": "카카오톡 프로필 사진"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q03",
+      "q": "카톡프사",
+      "item": {
+        "title": "카카오톡",
+        "note": "프로필 사진 참고"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q04",
+      "q": "엑셀 함수",
+      "item": {
+        "title": "Excel 함수"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q05",
+      "q": "안드로이드",
+      "item": {
+        "title": "Android sharing"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q06",
+      "q": "유튜브",
+      "item": {
+        "title": "YouTube 참고"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q07",
+      "q": "카톡",
+      "item": {
+        "title": "카토크 행사"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q09",
+      "q": "카카오톡",
+      "item": {
+        "title": "카톡방 기록"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q10",
+      "q": "프로필 사진",
+      "item": {
+        "title": "프사기꾼 소식"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q11",
+      "q": "스레드",
+      "item": {
+        "title": "spreadsheet 설명"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q12",
+      "q": "프로필 사진",
+      "item": {
+        "title": "프로필 작성법"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q13",
+      "q": "텔레비전 릴스",
+      "item": {
+        "title": "Instagram TV reels"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q14",
+      "q": "강아지 호텔",
+      "item": {
+        "title": "반려견 동반 숙소"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q15",
+      "q": "아동 행사 선물",
+      "item": {
+        "title": "어린이날 당첨자"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q16",
+      "q": "카톡 여행",
+      "item": {
+        "title": "카카오톡 프로필 사진"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q17",
+      "q": "카카오톡 프로필 사진",
+      "item": {
+        "title": "카톡프사를 바꿨다"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q18",
+      "q": "카카오톡 프로필 사진",
+      "item": {
+        "title": "카톡 프사"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q19",
+      "q": "카카오톡 프로필 사진",
+      "item": {
+        "title": "카카오톡 프로필 사진"
+      },
+      "expected": true,
+      "mode": "literal"
+    },
+    {
+      "id": "Q20",
+      "q": "프로필 사진",
+      "item": {
+        "note": "프사는 여기 참고"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q21",
+      "q": "산책",
+      "item": {
+        "title": "산책 기록"
+      },
+      "expected": true,
+      "mode": "literal"
+    },
+    {
+      "id": "Q22",
+      "q": "10% A_B",
+      "item": {
+        "title": "할인 10% A_B"
+      },
+      "expected": true,
+      "mode": "literal"
+    },
+    {
+      "id": "Q23",
+      "q": "10% A_B",
+      "item": {
+        "title": "할인 10 ACB"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q24",
+      "q": "쓰레드",
+      "item": {
+        "title": "Threads link"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q25",
+      "q": "인스타 릴스",
+      "item": {
+        "title": "Instagram reels"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q26",
+      "q": "제주 숙소",
+      "item": {
+        "title": "제주",
+        "note": "숙소"
+      },
+      "expected": true,
+      "mode": "literal"
+    },
+    {
+      "id": "Q27",
+      "q": "카카오톡",
+      "item": {
+        "url": "https://example.com/카톡"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q28",
+      "q": "카카오톡",
+      "item": {
+        "ocr": "카톡",
+        "ocr_active": false
+      },
+      "expected": false
+    },
+    {
+      "id": "Q29",
+      "q": "카카오톡",
+      "item": {
+        "ocr": "카톡"
+      },
+      "expected": true,
+      "mode": "alias"
+    },
+    {
+      "id": "Q30",
+      "q": "카톡",
+      "item": {
+        "title": "카톡방 기록"
+      },
+      "expected": true,
+      "mode": "literal"
+    },
+    {
+      "id": "Q31",
+      "q": "엑셀",
+      "item": {
+        "title": "excelsior 문서"
+      },
+      "expected": false
+    },
+    {
+      "id": "Q32",
+      "q": "카카오톡 프로필 사진",
+      "item": {
+        "title": "카톡",
+        "note": "프사"
+      },
+      "expected": true,
+      "mode": "alias"
+    }
+  ]
+}

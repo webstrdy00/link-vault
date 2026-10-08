@@ -2,7 +2,7 @@ name: Verified server deployment
 
 on:
   push:
-    branches: [main, feature/goal]
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
 
   deploy:
     needs: [verify, verify-database]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/goal'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: production

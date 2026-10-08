@@ -267,7 +267,9 @@ npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks
 ## 배포 자동화
 
 - PR에서는 [CI](.github/workflows/ci.yml)와 [DB 계약 시험](.github/workflows/database-ci.yml)을 실행합니다.
-  `main`·`feature/goal` push는 같은 검증 후 `production` Environment의 담당자 승인을 기다립니다.
+  병합 순서는 **feature 브랜치 → develop → 검증 → main**입니다.
+  `develop` push는 통합 검증만 수행하고, `main` push는 검증 후
+  `production` Environment의 담당자 승인을 기다립니다. 운영 배포와 서명 릴리스는 `main`만 허용합니다.
 - [서버 배포](.github/workflows/deploy.yml)는 별도 SSH 키와 강제 명령 계정만 사용합니다.
   API·마이그레이션만 전달하며, 서버의 Compose·비밀값·배포 수신기는 자동으로 덮어쓰지 않습니다.
   적용된 마이그레이션 변경은 거부하고, 신규 마이그레이션 전에 암호화 백업을 생성합니다.

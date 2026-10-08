@@ -1,0 +1,107 @@
+name: Encrypted migration backup
+
+on:
+  schedule:
+    - cron: '25 18 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, feature/goal]
+    paths:
+      - .github/workflows/backup.yml
+      - scripts/server-backup.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encrypted-server-backup
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Receive encrypted recovery archive
+        shell: bash
+        env:
+          BACKUP_SSH_KEY: ${{ secrets.BACKUP_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.BACKUP_SSH_KNOWN_HOSTS }}
+          BACKUP_HOST: ${{ vars.BACKUP_HOST }}
+          BACKUP_USER: ${{ vars.BACKUP_USER }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$BACKUP_SSH_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$BACKUP_HOST"
+          test -n "$BACKUP_USER"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$BACKUP_SSH_KEY" > "$work/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$work/known_hosts"
+          mkdir -p recovery
+          ssh -T -i "$work/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$work/known_hosts" -o ConnectTimeout=20 \
+            "$BACKUP_USER@$BACKUP_HOST" > recovery/server.tar.age
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('recovery/server.tar.age')
+          with p.open('rb') as stream:
+              assert stream.read(22) == b'age-encryption.org/v1\n', 'Invalid age archive'
+          assert p.stat().st_size > 100
+          PY
+          sha256sum recovery/server.tar.age > recovery/server.tar.age.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: encrypted-server-backup-${{ github.run_id }}
+          path: recovery/
+          retention-days: 30
+          compression-level: 0
+          if-no-files-found: error
+      - name: State recovery boundaries
+        run: |
+          echo 'Encrypted archive only. The private age identity is not stored in GitHub or on the server.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Artifacts expire after 30 days; move required recovery points to durable storage before expiry.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Scheduled workflows run only from the default branch. Snapshot capture briefly stops application services.' >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    needs: export
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Report failed backups or approaching resource expiry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BACKUP_RESULT: ${{ needs.export.result }}
+          SERVER_EXPIRES_ON: ${{ vars.SERVER_EXPIRES_ON }}
+          ASSIGNEE: ${{ github.repository_owner }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          days=$(python3 - <<'PY'
+          import datetime, os
+          expiry = datetime.date.fromisoformat(os.environ["SERVER_EXPIRES_ON"])
+          print((expiry - datetime.datetime.now(datetime.timezone.utc).date()).days)
+          PY
+          )
+          title=''
+          if [ "$BACKUP_RESULT" != success ]; then
+            title='[운영] 암호화 서버 백업 실행 실패'
+          elif [ "$days" -le 14 ]; then
+            title='[운영] 서버 이용 종료 전 연장 또는 이전 필요'
+          fi
+          if [ -n "$title" ]; then
+            existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+            if [ -z "$existing" ]; then
+              gh issue create --title "$title" --assignee "$ASSIGNEE" \
+                --body "백업 결과: $BACKUP_RESULT. 서버 만료 예정: $SERVER_EXPIRES_ON. 실행 기록: $RUN_URL . 암호화 백업과 별도 복호화 키를 확인하고, 서비스 종료 전에 연장 또는 새 서버 복원 검증을 완료하세요."
+            fi
+          fi

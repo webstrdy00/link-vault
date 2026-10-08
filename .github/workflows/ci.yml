@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: "2.9.6"
+          cache: true
+      - name: Install locked Node dependencies
+        run: npm ci
+      - name: CI safety contract
+        run: npm run test:ci
+      - name: Restricted deployment and recovery tests
+        run: |
+          python3 scripts/server-deploy.test.py
+          python3 scripts/server-backup.test.py
+      - name: Operations and migration backup tests
+        run: npm run test:operations
+      - name: Beta acceptance tests
+        run: npm run test:beta
+      - name: Local backend launcher tests
+        run: npm run test:backend-start
+      - name: Type-check API
+        run: deno check --config supabase/functions/library-api/deno.json supabase/functions/library-api/index.ts
+      - name: Lint API
+        run: deno lint --config supabase/functions/library-api/deno.json supabase/functions/library-api
+      - name: API unit tests
+        run: npm run test:api
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: "platform-tools platforms;android-35 build-tools;34.0.0"
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4.4.3
+        with:
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: JVM tests, Android lint, and debug APK
+        run: >-
+          bash android/gradlew -p android
+          :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+          --no-daemon --no-parallel --max-workers=2 --console=plain --stacktrace
+          -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+          -Pkotlin.daemon.jvmargs=-Xmx1g

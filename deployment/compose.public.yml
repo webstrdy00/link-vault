@@ -1,0 +1,22 @@
+# Add after the private overlay; credentials stay in the server .env.
+services:
+  public-gateway:
+    image: caddy@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./volumes/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,Z
+      - ./volumes/caddy/data:/data:Z
+      - ./volumes/caddy/config:/config:Z
+    depends_on:
+      api-gw:
+        condition: service_healthy
+  auth:
+    environment:
+      GOTRUE_EXTERNAL_GOOGLE_ENABLED: "true"
+      GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID: ${GOOGLE_WEB_CLIENT_ID:?Google web client ID required}
+      GOTRUE_EXTERNAL_GOOGLE_SECRET: ${GOOGLE_CLIENT_SECRET:?Google client secret required}
+      GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI: https://api.linkfilebox.com/auth/v1/callback
+      GOTRUE_EXTERNAL_GOOGLE_SKIP_NONCE_CHECK: "false"

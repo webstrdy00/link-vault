@@ -280,6 +280,25 @@ npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks
   서명키 네 항목과 HTTPS 서버 주소·공개 API 키·Google 웹 Client ID가 없으면 배포 빌드를 거부합니다.
   APK/AAB 생성은 스토어 게시나 실제 계정 인수 완료를 뜻하지 않습니다.
 
+### 운영 도메인
+
+앱 API 주소는 `https://api.linkfilebox.com`입니다. Cloudflare의 프록시 A 레코드는
+현재 서버를 가리키며 SSL/TLS는 Full (strict)를 사용합니다.
+[공개 gateway overlay](deployment/compose.public.yml)는 비공개 overlay 다음에 적용하고,
+[Caddyfile](deployment/Caddyfile)은 스택의 `volumes/caddy/Caddyfile`에 설치합니다.
+80/443만 추가로 열며, Supabase gateway 8000은 계속 loopback에 바인딩합니다.
+인증·앱 API·Storage object 경로만 전달하고 Studio, REST, 내부 작업 경로는 404로 차단합니다.
+Caddy 인증서 자동 갱신 상태와 공개 접근 경계를 이전 후에도 확인해야 합니다.
+
+서버 `.env`의 `SUPABASE_PUBLIC_URL=https://api.linkfilebox.com`,
+`API_EXTERNAL_URL=https://api.linkfilebox.com/auth/v1`,
+`SITE_URL=https://linkfilebox.com`과 Google 웹 client ID/secret을 설정합니다.
+Google Console redirect는 `https://api.linkfilebox.com/auth/v1/callback`입니다.
+인증 컨테이너 재생성 후 gateway upstream이 503이면 Envoy를 재시작하고 외부 health를 검증합니다.
+신규 가입은 Google 프로젝트·Android 서명 인증서·실제 계정 인수가 끝날 때까지 비활성화합니다.
+루트 도메인의 소개 페이지·개인정보 안내는 별도이며 API 연결만으로 제공되지 않습니다.
+`volumes/caddy`의 인증서·설정은 기존 전체 스택 암호화 백업에 포함됩니다.
+
 ### 백업과 서버 이전
 
 [백업 명령](scripts/server-backup.py)은 DB dump·역할·Storage·Vault 키·서버 설정·배포 소스를

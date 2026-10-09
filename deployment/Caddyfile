@@ -1,0 +1,17 @@
+{
+	admin off
+}
+
+api.linkfilebox.com {
+	@internal path /functions/v1/library-api/v1/internal /functions/v1/library-api/v1/internal/*
+	handle @internal {
+		respond 404
+	}
+	@allowed path /auth/v1/* /functions/v1/library-api/* /storage/v1/object/*
+	handle @allowed {
+		reverse_proxy api-gw:8000
+	}
+	handle {
+		respond 404
+	}
+}

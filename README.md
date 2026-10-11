@@ -12,19 +12,37 @@ Android 공유 메뉴로 링크를 저장하고, 제목·메모·분류와 첨�
 
 ## 화면 미리보기
 
-| 내 보관함 | 검색 필터 |
-| :---: | :---: |
-| <img src="docs/assets/library.png" width="280" alt="합성 링크의 제목, 출처, 메모, 분류를 보여주는 내 보관함"> | <img src="docs/assets/filters.png" width="280" alt="여러 테스트 분류와 하단 필터 적용 버튼을 보여주는 검색 필터"> |
-| 제목·출처·메모를 읽고 저장한 링크를 다시 찾습니다. | 조건을 고른 뒤 필터 적용으로 결과에 반영합니다. |
-
-| 검색 · 결과가 없는 상태 | 다크 테마 · 큰 글꼴 |
-| :---: | :---: |
-| <img src="docs/assets/search.png" width="280" alt="검색 입력창과 필터 버튼, 조건에 맞는 항목이 없다는 안내를 보여주는 검색 화면"> | <img src="docs/assets/library-dark.png" width="280" alt="다크 테마와 큰 글꼴로 합성 링크 세 건을 보여주는 내 보관함"> |
-| 제목·URL·메모로 검색하며, 결과가 없으면 안내를 표시합니다. | 어두운 배경과 큰 글꼴로 링크의 제목과 메모를 읽습니다. |
+<table width="100%">
+  <tr>
+    <th width="50%" align="center">내 보관함</th>
+    <th width="50%" align="center">검색 필터</th>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><img src="docs/assets/library.png" width="280" alt="합성 링크의 제목, 출처, 메모, 분류를 보여주는 내 보관함"></td>
+    <td align="center" valign="top"><img src="docs/assets/filters.png" width="280" alt="여러 테스트 분류와 하단 필터 적용 버튼을 보여주는 검색 필터"></td>
+  </tr>
+  <tr>
+    <td align="center">제목·출처·메모를 읽고<br>저장한 링크를 다시 찾습니다.</td>
+    <td align="center">조건을 고른 뒤 필터 적용으로<br>결과에 반영합니다.</td>
+  </tr>
+  <tr>
+    <th align="center">검색 · 결과가 없는 상태</th>
+    <th align="center">다크 테마 · 큰 글꼴</th>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><img src="docs/assets/search.png" width="280" alt="검색 입력창과 필터 버튼, 조건에 맞는 항목이 없다는 안내를 보여주는 검색 화면"></td>
+    <td align="center" valign="top"><img src="docs/assets/library-dark.png" width="280" alt="다크 테마와 큰 글꼴로 합성 링크 세 건을 보여주는 내 보관함"></td>
+  </tr>
+  <tr>
+    <td align="center">제목·URL·메모로 검색하며,<br>결과가 없으면 안내를 표시합니다.</td>
+    <td align="center">어두운 배경과 큰 글꼴로<br>링크의 제목과 메모를 읽습니다.</td>
+  </tr>
+</table>
 
 위 이미지는 **기존 QA 캡처**입니다. 내 보관함·검색 필터·다크 테마는
 합성 자료로 실제 Compose 컴포넌트를 렌더링한 화면이며, 검색은 결과가 없는 상태의 앱 화면입니다.
 실제 회원 자료나 SNS 앱 연동 성공의 증거는 아닙니다.
+이미지는 원본 비율을 유지하며, 검색 필터에는 높이를 맞추기 위한 상하 여백을 추가했습니다.
 
 ## 왜 Link Vault인가
 

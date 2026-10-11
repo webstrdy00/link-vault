@@ -16,18 +16,10 @@ GOALS.md
 # 기획 문서 (원본은 로컬 보관. 공유가 필요하면 이 블록을 해제한다)
 # ---------------------------------------------------------------------------
 docs/*
-!docs/DEPLOYMENT.md
-!docs/IMPLEMENTATION_STATUS.md
-# 공개 README의 안내 문서·기록과 검토된 합성 화면만 공유한다.
-!docs/development.md
-!docs/architecture.md
-!docs/verification.md
-!docs/operations.md
-!docs/development-record.md
-!docs/assets/
-docs/assets/*
-!docs/assets/library.png
-!docs/assets/filters.png
+# docs 하위에서는 PNG 이미지만 공유한다.
+docs/**/*
+!docs/**/
+!docs/**/*.png
 secrets/
 
 # Android build outputs and machine-local settings

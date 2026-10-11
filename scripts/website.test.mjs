@@ -45,14 +45,14 @@ for (const name of pages) {
       }
     }
   });
-  test(`${name}: review gate, accessibility landmarks and receive-only policy remain explicit`, () => {
+  test(`${name}: review gate and accessible contact guidance remain explicit`, () => {
     assert.match(html, /<html\s+lang="ko"/);
     assert.match(html, /name="viewport"/);
     assert.match(html, /name="robots"\s+content="noindex,nofollow"/);
     assert.equal([...html.matchAll(/<h1(?:\s|>)/g)].length, 1);
     assert.match(html, /<main\s+id="main"/);
     assert.match(html, /검토본/);
-    assert.match(html, /수신 전용/);
+    assert.doesNotMatch(html, /수신\s*전용|발신 설정|발신·답장 서비스/);
     assert.doesNotMatch(html, /<script\b|<iframe\b|<form\b|@gmail\.com/i);
   });
 }

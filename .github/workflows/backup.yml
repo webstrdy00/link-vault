@@ -2,7 +2,7 @@ name: Encrypted migration backup
 
 on:
   schedule:
-    - cron: '25 18 * * *'
+    - cron: "25 18 * * *"
   workflow_dispatch:
   push:
     branches: [main, feature/goal]
@@ -86,17 +86,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          days=$(python3 - <<'PY'
+          title=''
+          if [ "$BACKUP_RESULT" != success ]; then
+            title='[운영] 암호화 서버 백업 실행 실패'
+          elif days=$(python3 - <<'PY'
           import datetime, os
           expiry = datetime.date.fromisoformat(os.environ["SERVER_EXPIRES_ON"])
           print((expiry - datetime.datetime.now(datetime.timezone.utc).date()).days)
           PY
-          )
-          title=''
-          if [ "$BACKUP_RESULT" != success ]; then
-            title='[운영] 암호화 서버 백업 실행 실패'
-          elif [ "$days" -le 14 ]; then
-            title='[운영] 서버 이용 종료 전 연장 또는 이전 필요'
+          ); then
+            if [ "$days" -le 14 ]; then
+              title='[운영] 서버 이용 종료 전 연장 또는 이전 필요'
+            fi
+          else
+            title='[운영] 서버 만료 예정일 설정 누락 또는 오류'
           fi
           if [ -n "$title" ]; then
             existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')

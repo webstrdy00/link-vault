@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 
 const workflow = readFileSync(
@@ -13,6 +23,11 @@ const manifest = JSON.parse(readFileSync(
   new URL("../package.json", import.meta.url),
   "utf8",
 ));
+const backupWorkflow = readFileSync(
+  new URL("../.github/workflows/backup.yml", import.meta.url),
+  "utf8",
+).replace(/\r\n/g, "\n");
+const BACKUP_NOTIFY_TODAY = "2030-01-15";
 
 // Inspect the small workflow's mapping blocks, not its whitespace or step names.
 function block(source, key) {
@@ -75,6 +90,240 @@ function runCommands() {
 
 const commands = runCommands();
 
+function backupNotifyScript() {
+  const notify = block(block(backupWorkflow, "jobs"), "notify");
+  const run = block(notify, "run");
+  assert.equal(scalar(run, "run"), "|");
+  const lines = run.split("\n").slice(1);
+  const indentation = Math.min(
+    ...lines.filter((line) => line.trim()).map((line) =>
+      line.match(/^ */)[0].length
+    ),
+  );
+  return lines.map((line) => line.slice(indentation)).join("\n");
+}
+
+function backupNotifyExecutables() {
+  const windows = process.platform === "win32";
+  const directories = (process.env.PATH ?? "").split(delimiter).filter((
+    directory,
+  ) =>
+    directory &&
+    (!windows || !/[\\/]Microsoft[\\/]WindowsApps(?:[\\/]|$)/i.test(directory))
+  );
+  const executable = (names, paths = directories) =>
+    names.flatMap((name) => paths.map((directory) => resolve(directory, name)))
+      .find((path) => existsSync(path));
+  // Resolve Git's own Bash, never the Windows System32 WSL launcher.
+  const gitDirectories = directories.filter((directory) =>
+    existsSync(resolve(directory, "git.exe"))
+  );
+  const bash = windows
+    ? executable(
+      ["bash.exe"],
+      gitDirectories.flatMap((directory) => [
+        directory,
+        resolve(directory, "..", "bin"),
+      ]),
+    )
+    : executable(["bash"]);
+  // Windows python3.exe can be a Store alias; use an installed interpreter.
+  const python = executable(
+    windows ? ["python.exe", "python3.exe"] : ["python3"],
+  );
+  assert.ok(
+    bash,
+    windows
+      ? "Git Bash is required for notify tests"
+      : "Bash is required for notify tests",
+  );
+  assert.ok(
+    python,
+    "An installed Python interpreter is required for notify tests",
+  );
+  return { bash, python };
+}
+
+function runBackupNotify(t, result, expiry, existing = "") {
+  const { bash, python } = backupNotifyExecutables();
+  const directory = mkdtempSync(join(tmpdir(), "backup-notify-test-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const bin = join(directory, "bin");
+  const log = join(directory, "gh-calls");
+  mkdirSync(bin);
+  writeFileSync(log, "");
+  writeFileSync(
+    join(directory, "sitecustomize.py"),
+    `import datetime
+
+class FrozenDateTime(datetime.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        instant = cls.fromisoformat("${BACKUP_NOTIFY_TODAY}T12:00:00+00:00")
+        return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+datetime.datetime = FrozenDateTime
+`,
+  );
+  writeFileSync(
+    join(bin, "gh"),
+    `#!/bin/bash
+set -euo pipefail
+printf '%s\\0' "$#" "$@" >> "$GH_CALLS"
+case "$1 $2" in
+  'issue list') printf '%s\\n' "$EXISTING_ISSUE" ;;
+  'issue create') ;;
+  *) exit 64 ;;
+esac
+`,
+    { mode: 0o700 },
+  );
+  writeFileSync(
+    join(directory, "notify.sh"),
+    `
+set -euo pipefail
+python3() { "$NOTIFY_PYTHON" "$@"; }
+gh() { "$BASH" "$PWD/bin/gh" "$@"; }
+# Only the local gh stub is executable through PATH; no real CLI or network tools.
+export PATH="$PWD/bin"
+export GH_CALLS="$PWD/gh-calls"
+${backupNotifyScript()}
+`,
+  );
+  const execution = spawnSync(bash, ["--noprofile", "--norc", "./notify.sh"], {
+    cwd: directory,
+    encoding: "utf8",
+    timeout: 10_000,
+    env: {
+      PATH: process.env.PATH,
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      HOME: directory,
+      NOTIFY_PYTHON: python.replace(/\\/g, "/"),
+      PYTHONPATH: directory,
+      PYTHONNOUSERSITE: "1",
+      PYTHONDONTWRITEBYTECODE: "1",
+      GH_TOKEN: "fixture-only-token",
+      GH_REPO: "fixture-owner/fixture-repo",
+      BACKUP_RESULT: result,
+      SERVER_EXPIRES_ON: expiry,
+      ASSIGNEE: "fixture-owner",
+      RUN_URL: "https://example.invalid/actions/runs/1",
+      EXISTING_ISSUE: existing,
+    },
+  });
+  assert.equal(execution.error, undefined);
+  assert.equal(execution.status, 0, execution.stderr);
+  assert.equal(execution.stdout, "");
+  const fields = readFileSync(log, "utf8").split("\0");
+  assert.equal(fields.pop(), "");
+  const calls = [];
+  for (let index = 0; index < fields.length;) {
+    const count = Number(fields[index++]);
+    assert.ok(Number.isInteger(count) && count > 0);
+    calls.push(fields.slice(index, index + count));
+    index += count;
+  }
+  return calls;
+}
+
+function expiryInDays(days) {
+  const expiry = new Date(`${BACKUP_NOTIFY_TODAY}T12:00:00Z`);
+  expiry.setUTCDate(expiry.getUTCDate() + days);
+  return expiry.toISOString().slice(0, 10);
+}
+
+function assertBackupAlert(calls, title, result, expiry, existing = "") {
+  assert.deepEqual(calls[0], [
+    "issue",
+    "list",
+    "--state",
+    "open",
+    "--search",
+    `${title} in:title`,
+    "--json",
+    "number",
+    "--jq",
+    ".[0].number // empty",
+  ]);
+  assert.equal(calls.length, existing ? 1 : 2);
+  if (!existing) {
+    assert.deepEqual(calls[1].slice(0, 7), [
+      "issue",
+      "create",
+      "--title",
+      title,
+      "--assignee",
+      "fixture-owner",
+      "--body",
+    ]);
+    assert.equal(calls[1].length, 8);
+    assert.ok(calls[1][7].includes(`백업 결과: ${result}.`));
+    assert.ok(calls[1][7].includes(`서버 만료 예정: ${expiry}.`));
+    assert.ok(calls[1][7].includes("https://example.invalid/actions/runs/1"));
+  }
+}
+
+test("failed backups alert even when resource expiry is missing or malformed", (t) => {
+  for (const result of ["failure", "cancelled", "skipped"]) {
+    for (const expiry of ["", "not-a-date", "2026-02-30"]) {
+      assertBackupAlert(
+        runBackupNotify(t, result, expiry),
+        "[운영] 암호화 서버 백업 실행 실패",
+        result,
+        expiry,
+      );
+    }
+  }
+});
+
+test("successful backups explicitly alert on missing or malformed resource expiry", (t) => {
+  for (const expiry of ["", "not-a-date", "2026-02-30"]) {
+    assertBackupAlert(
+      runBackupNotify(t, "success", expiry),
+      "[운영] 서버 만료 예정일 설정 누락 또는 오류",
+      "success",
+      expiry,
+    );
+  }
+});
+
+test("successful backups alert for expired and near expiry but not distant expiry", (t) => {
+  for (const days of [-30, -1, 0, 1, 14]) {
+    const expiry = expiryInDays(days);
+    assertBackupAlert(
+      runBackupNotify(t, "success", expiry),
+      "[운영] 서버 이용 종료 전 연장 또는 이전 필요",
+      "success",
+      expiry,
+    );
+  }
+  for (const days of [15, 365]) {
+    assert.deepEqual(runBackupNotify(t, "success", expiryInDays(days)), []);
+  }
+});
+
+test("backup notifications do not duplicate an existing open issue", (t) => {
+  for (
+    const [result, expiry, title] of [
+      ["failure", "", "[운영] 암호화 서버 백업 실행 실패"],
+      ["success", "not-a-date", "[운영] 서버 만료 예정일 설정 누락 또는 오류"],
+      [
+        "success",
+        expiryInDays(14),
+        "[운영] 서버 이용 종료 전 연장 또는 이전 필요",
+      ],
+    ]
+  ) {
+    assertBackupAlert(
+      runBackupNotify(t, result, expiry, "42"),
+      title,
+      result,
+      expiry,
+      "42",
+    );
+  }
+});
+
 test("public deployment passes the same required Google audience to auth and functions", () => {
   const compose = readFileSync(
     new URL("../deployment/compose.public.yml", import.meta.url),
@@ -84,7 +333,10 @@ test("public deployment passes the same required Google audience to auth and fun
   const functions = block(block(services, "functions"), "environment");
   const auth = block(block(services, "auth"), "environment");
   const audience = scalar(functions, "GOOGLE_WEB_CLIENT_ID");
-  assert.equal(audience, "${GOOGLE_WEB_CLIENT_ID:?Google web client ID required}");
+  assert.equal(
+    audience,
+    "${GOOGLE_WEB_CLIENT_ID:?Google web client ID required}",
+  );
   assert.equal(scalar(auth, "GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID"), audience);
   assert.doesNotMatch(functions, /GOOGLE_CLIENT_SECRET/);
 });

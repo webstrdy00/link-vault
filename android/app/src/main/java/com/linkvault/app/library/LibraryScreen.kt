@@ -61,6 +61,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -70,6 +71,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.linkvault.app.R
 import com.linkvault.app.attachment.AttachmentControls
 import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.auth.AccountClient
@@ -433,7 +435,7 @@ internal fun LibraryRootHeader(
                     modifier = Modifier.size(18.dp),
                 )
                 Text(
-                    text = "link vault",
+                    text = stringResource(R.string.app_name),
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     fontWeight = FontWeight.Bold,

@@ -32,11 +32,13 @@ class LibraryViewModel internal constructor(
     private val outbox: OutboxRepository,
     private val attachments: AttachmentRepository,
     private val ownerId: String?,
+    private val sessionGeneration: Long,
     initialUrl: String?,
     sharedText: String,
     initialItemId: String?,
 ) : ViewModel() {
     private val json = Json { ignoreUnknownKeys = true }
+    private val listRecoveryPolicy = LibraryListRecoveryPolicy()
     private val mutableUiState = MutableStateFlow(
         LibraryUiState(
             availability = LibraryAvailability.Checking,
@@ -249,6 +251,33 @@ class LibraryViewModel internal constructor(
     fun retryList() {
         val state = mutableUiState.value
         loadItems(reset = state.isShowingCache || state.items.isEmpty())
+    }
+
+    fun setRecoveryEnvironment(visible: Boolean, hasValidatedNetwork: Boolean) {
+        if (
+            visible &&
+            mutableUiState.value.availability is LibraryAvailability.Ready &&
+            !identityMatches()
+        ) {
+            invalidateIdentity()
+            return
+        }
+        listRecoveryPolicy.updateEnvironment(visible, hasValidatedNetwork)
+        recoverFailedListIfNeeded()
+    }
+
+    private fun recoverFailedListIfNeeded() {
+        if (
+            mutableUiState.value.availability !is LibraryAvailability.Ready ||
+            !listRecoveryPolicy.takeRecovery()
+        ) {
+            return
+        }
+        if (!identityMatches()) {
+            invalidateIdentity()
+            return
+        }
+        loadItems(reset = true)
     }
 
     fun loadMore() {
@@ -1070,22 +1099,19 @@ class LibraryViewModel internal constructor(
                     return@launch
                 }
                 outbox.resumeOwner(requestOwner)
-                loadItems(reset = true)
             } catch (error: CancellationException) {
                 throw error
-            } catch (_: AccountAuthenticationRequiredException) {
-                if (identityMatches()) {
-                    showCachedList("로그인 상태를 확인하지 못했어요. 다시 시도해 주세요.")
-                } else {
-                    invalidateIdentity()
-                }
             } catch (error: Exception) {
-                if (identityMatches()) {
-                    showCachedList(error.listMessage())
-                } else {
+                if (!identityMatches()) {
                     invalidateIdentity()
+                    return@launch
                 }
+                mutableUiState.value = mutableUiState.value.copy(
+                    queueError = error.localQueueMessage(),
+                )
             }
+            // Worker scheduling failures are not failures to retrieve the server list.
+            loadItems(reset = true)
         }
         restoreJob = job
         job.invokeOnCompletion {
@@ -1149,11 +1175,12 @@ class LibraryViewModel internal constructor(
             invalidateIdentity()
             return
         }
+        if (!listRecoveryPolicy.startRequest()) return
         val offset = if (reset) 0 else current.nextOffset
         mutableUiState.value = current.copy(
             isListLoading = true,
-            listError = null,
         )
+        var succeeded: Boolean? = null
         val job = viewModelScope.launch {
             try {
                 val response = client.libraryRequest(
@@ -1191,11 +1218,13 @@ class LibraryViewModel internal constructor(
                     isShowingCache = false,
                     cacheFetchedAt = null,
                 )
+                succeeded = true
             } catch (error: CancellationException) {
                 throw error
             } catch (_: AccountAuthenticationRequiredException) {
                 if (identityMatches()) {
                     showCachedList("로그인 상태를 확인하지 못했어요. 다시 시도해 주세요.")
+                    succeeded = false
                 } else {
                     invalidateIdentity()
                 }
@@ -1204,12 +1233,17 @@ class LibraryViewModel internal constructor(
                     invalidateIdentity()
                 } else {
                     showCachedList(error.listMessage())
+                    succeeded = false
                 }
             }
         }
         listJob = job
         job.invokeOnCompletion {
-            if (listJob === job) listJob = null
+            if (listJob === job) {
+                listJob = null
+                listRecoveryPolicy.finishRequest(succeeded)
+                recoverFailedListIfNeeded()
+            }
         }
     }
 
@@ -1261,7 +1295,7 @@ class LibraryViewModel internal constructor(
                         return@collect
                     } catch (error: Exception) {
                         mutableUiState.value = mutableUiState.value.copy(
-                            listError = error.localQueueMessage(),
+                            queueError = error.localQueueMessage(),
                         )
                     }
                 }
@@ -1637,10 +1671,13 @@ class LibraryViewModel internal constructor(
             when {
                 entry.method == "POST" && entry.path == "/items" -> {
                     val result = parseLibrarySaveResponse(response)
-                    if (
-                        outbox.isItemDeleted(entry.ownerId, result.item.id) ||
+                    val isDeleted = outbox.isItemDeleted(entry.ownerId, result.item.id) ||
                         result.item.id in deletedItemIds
-                    ) {
+                    if (!responseBelongsTo(entry.ownerId)) {
+                        invalidateIdentity()
+                        return
+                    }
+                    if (isDeleted) {
                         if (pendingSaveRequestId == entry.requestId) {
                             pendingSaveRequestId = null
                         }
@@ -1660,6 +1697,8 @@ class LibraryViewModel internal constructor(
                             )
                         }
                     }
+                    listRecoveryPolicy.onSavedReceipt(entry.requestId)
+                    recoverFailedListIfNeeded()
                 }
 
                 deleteItemId != null -> {
@@ -2049,6 +2088,11 @@ class LibraryViewModel internal constructor(
         viewModelScope.launch {
             try {
                 mutation(boundOwner)
+                if (!responseBelongsTo(boundOwner)) {
+                    invalidateIdentity()
+                    return@launch
+                }
+                mutableUiState.value = mutableUiState.value.copy(queueError = null)
             } catch (_: AccountAuthenticationRequiredException) {
                 invalidateIdentity()
             } catch (error: Exception) {
@@ -2057,7 +2101,7 @@ class LibraryViewModel internal constructor(
                     return@launch
                 }
                 mutableUiState.value = mutableUiState.value.copy(
-                    listError = error.localQueueMessage(),
+                    queueError = error.localQueueMessage(),
                 )
             }
         }
@@ -2079,7 +2123,8 @@ class LibraryViewModel internal constructor(
         requestOwner == ownerId && identityMatches()
 
     private fun identityMatches(): Boolean =
-        ownerId != null && client.sessionUserId() == ownerId
+        ownerId != null && client.sessionUserId() == ownerId &&
+            client.sessionState.value.generation == sessionGeneration
 
     private fun acquireEditRequestOwnership(requestOwner: String, requestId: String): Boolean {
         if (!responseBelongsTo(requestOwner)) {
@@ -2107,6 +2152,7 @@ class LibraryViewModel internal constructor(
     }
 
     private fun invalidateIdentity() {
+        listRecoveryPolicy.invalidateIdentity()
         releaseAllEditRequestOwnership()
         listJob?.cancel()
         saveJob?.cancel()
@@ -2143,6 +2189,7 @@ class LibraryViewModel internal constructor(
     }
 
     override fun onCleared() {
+        listRecoveryPolicy.invalidateIdentity()
         releaseAllEditRequestOwnership()
         super.onCleared()
     }
@@ -2155,6 +2202,7 @@ class LibraryViewModel internal constructor(
             outbox: OutboxRepository,
             attachments: AttachmentRepository,
             ownerId: String?,
+            sessionGeneration: Long,
             initialUrl: String?,
             sharedText: String,
             initialItemId: String? = null,
@@ -2167,6 +2215,7 @@ class LibraryViewModel internal constructor(
                     outbox,
                     attachments,
                     ownerId,
+                    sessionGeneration,
                     initialUrl,
                     sharedText,
                     initialItemId,
@@ -2198,6 +2247,7 @@ data class LibraryUiState(
     val nextOffset: Int = 0,
     val isListLoading: Boolean = true,
     val listError: String? = null,
+    val queueError: String? = null,
     val isShowingCache: Boolean = false,
     val cacheFetchedAt: Long? = null,
     val detail: LibraryDetailState = LibraryDetailState.None,
@@ -2207,6 +2257,71 @@ data class LibraryUiState(
     val outboxEntries: List<OutboxEntry> = emptyList(),
     val receiptsAwaitingAcknowledgement: Set<String> = emptySet(),
 )
+
+internal class LibraryListRecoveryPolicy {
+    var hasFailedRequest: Boolean = false
+        private set
+
+    private var identityValid = true
+    private var visible = false
+    private var hasValidatedNetwork = false
+    private var requestInFlight = false
+    // External triggers share one pending attempt; request failure never arms another.
+    private var pendingRecovery = false
+    private val handledSavedReceipts = mutableSetOf<String>()
+
+    fun updateEnvironment(visible: Boolean, hasValidatedNetwork: Boolean) {
+        if (!identityValid) return
+        val becameUsable = visible && hasValidatedNetwork &&
+            !(this.visible && this.hasValidatedNetwork)
+        this.visible = visible
+        this.hasValidatedNetwork = hasValidatedNetwork
+        if (becameUsable) requestRecovery()
+    }
+
+    fun onSavedReceipt(requestId: String) {
+        if (!identityValid || !handledSavedReceipts.add(requestId)) return
+        requestRecovery()
+    }
+
+    private fun requestRecovery() {
+        if (hasFailedRequest || requestInFlight) pendingRecovery = true
+    }
+
+    fun takeRecovery(): Boolean {
+        if (
+            !identityValid || !visible || !hasValidatedNetwork ||
+            !hasFailedRequest || requestInFlight || !pendingRecovery
+        ) {
+            return false
+        }
+        pendingRecovery = false
+        return true
+    }
+
+    fun startRequest(): Boolean {
+        if (!identityValid || requestInFlight) return false
+        requestInFlight = true
+        pendingRecovery = false
+        return true
+    }
+
+    fun finishRequest(succeeded: Boolean?) {
+        if (!identityValid || !requestInFlight) return
+        requestInFlight = false
+        // Cancellation has no new retrieval outcome.
+        if (succeeded != null) hasFailedRequest = !succeeded
+        if (succeeded == true) pendingRecovery = false
+    }
+
+    fun invalidateIdentity() {
+        identityValid = false
+        hasFailedRequest = false
+        requestInFlight = false
+        pendingRecovery = false
+        handledSavedReceipts.clear()
+    }
+}
 
 sealed interface LibraryAvailability {
     data object Checking : LibraryAvailability

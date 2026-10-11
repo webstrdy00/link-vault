@@ -75,6 +75,20 @@ function runCommands() {
 
 const commands = runCommands();
 
+test("public deployment passes the same required Google audience to auth and functions", () => {
+  const compose = readFileSync(
+    new URL("../deployment/compose.public.yml", import.meta.url),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  const services = block(compose, "services");
+  const functions = block(block(services, "functions"), "environment");
+  const auth = block(block(services, "auth"), "environment");
+  const audience = scalar(functions, "GOOGLE_WEB_CLIENT_ID");
+  assert.equal(audience, "${GOOGLE_WEB_CLIENT_ID:?Google web client ID required}");
+  assert.equal(scalar(auth, "GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID"), audience);
+  assert.doesNotMatch(functions, /GOOGLE_CLIENT_SECRET/);
+});
+
 test("CI runs ordinary PRs and supports a credential-free reusable call", () => {
   const triggers = block(workflow, "on");
   block(triggers, "pull_request");

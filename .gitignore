@@ -18,7 +18,11 @@ GOALS.md
 docs/*
 !docs/DEPLOYMENT.md
 !docs/IMPLEMENTATION_STATUS.md
-# 공개 README에서 사용하는 기록과 검토된 합성 화면만 공유한다.
+# 공개 README의 안내 문서·기록과 검토된 합성 화면만 공유한다.
+!docs/development.md
+!docs/architecture.md
+!docs/verification.md
+!docs/operations.md
 !docs/development-record.md
 !docs/assets/
 docs/assets/*

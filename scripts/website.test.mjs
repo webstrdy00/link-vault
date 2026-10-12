@@ -74,3 +74,16 @@ test("privacy notice distinguishes conditional cleanup from a maximum retention 
   assert.match(html, /진행 중인 계정 삭제 작업은 기간만으로 삭제하지 않습니다/);
   assert.match(html, /최대 보관 기간이 아닙니다/);
 });
+test("approved policy choices are not presented as deployed web or recovery features", () => {
+  const privacy = readFileSync(resolve(root, "privacy/index.html"), "utf8");
+  const deletion = readFileSync(
+    resolve(root, "account-deletion/index.html"),
+    "utf8",
+  );
+  assert.match(privacy, /마지막 검증 복구본/);
+  assert.match(privacy, /예외 보존하고 운영 경고/);
+  assert.match(privacy, /자동 집행 기능은 아직 구현·검증되지 않았습니다/);
+  assert.match(deletion, /Google 재인증 기반 웹 탈퇴·진행 상태 조회/);
+  assert.match(deletion, /웹 기능은 아직 구현·검증되지 않아/);
+  assert.match(deletion, /이메일 발신 주소만으로 소유자를 판단하지 않습니다/);
+});

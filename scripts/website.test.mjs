@@ -53,9 +53,49 @@ for (const name of pages) {
     assert.match(html, /<main\s+id="main"/);
     assert.match(html, /검토본/);
     assert.doesNotMatch(html, /수신\s*전용|발신 설정|발신·답장 서비스/);
-    assert.doesNotMatch(html, /<script\b|<iframe\b|<form\b|@gmail\.com/i);
+    assert.doesNotMatch(html, /<iframe\b|<form\b|@gmail\.com|\bon[a-z]+\s*=/i);
+    const scripts = [...html.matchAll(/<script\b[^>]*>[\s\S]*?<\/script>/gi)]
+      .map((match) => match[0]);
+    assert.deepEqual(
+      scripts,
+      name === "account-deletion/index.html"
+        ? ['<script type="module" src="./account-deletion.js"></script>']
+        : [],
+      "Only the account deletion page may load its exact local module",
+    );
   });
 }
+test("account deletion module allows only the user-triggered Google authentication loader, not tracking", () => {
+  const source = readFileSync(
+    resolve(root, "account-deletion/account-deletion.js"),
+    "utf8",
+  );
+  const externalUrls = [...source.matchAll(/https:\/\/[A-Za-z0-9._/-]+/g)].map((
+    match,
+  ) => match[0]);
+  assert.ok(externalUrls.length > 0);
+  for (const url of externalUrls) {
+    assert.ok(
+      [
+        "https://linkfilebox.com",
+        "https://api.linkfilebox.com/functions/v1/library-api/v1/web-account",
+        "https://accounts.google.com/gsi/client",
+      ].includes(url),
+      `Unexpected external dependency: ${url}`,
+    );
+  }
+  assert.equal([...source.matchAll(/createElement\("script"\)/g)].length, 1);
+  assert.match(source, /script\.src = GIS_URL;/);
+  assert.match(
+    source,
+    /if \(!await controller\.start\(purpose\)\) return;[\s\S]*?await loadGoogleButton\(\)/,
+  );
+  assert.doesNotMatch(
+    source,
+    /\b(?:localStorage|sessionStorage|indexedDB|sendBeacon)\b|document\.cookie|console\.|googletagmanager|google-analytics|gtag\(/i,
+  );
+  assert.doesNotMatch(source, /\bimport\b|eval\s*\(|new Function\b/);
+});
 test("deletion notice does not equate an email with authenticated deletion", () => {
   const html = readFileSync(
     resolve(root, "account-deletion/index.html"),
@@ -66,6 +106,11 @@ test("deletion notice does not equate an email with authenticated deletion", () 
   assert.match(html, /72시간 이내를 목표/);
   assert.match(html, /최대 30일 순환을 목표/);
   assert.match(html, /Google 계정 자체를 삭제하는 절차는 아닙니다/);
+  assert.doesNotMatch(html, /mailto:[^"]+\?subject=/);
+  assert.match(
+    html,
+    /이메일을 발송하거나 개인 이메일 주소를 공개하지 않습니다/,
+  );
 });
 test("privacy notice distinguishes conditional cleanup from a maximum retention promise", () => {
   const html = readFileSync(resolve(root, "privacy/index.html"), "utf8");
@@ -74,7 +119,7 @@ test("privacy notice distinguishes conditional cleanup from a maximum retention 
   assert.match(html, /진행 중인 계정 삭제 작업은 기간만으로 삭제하지 않습니다/);
   assert.match(html, /최대 보관 기간이 아닙니다/);
 });
-test("approved policy choices are not presented as deployed web or recovery features", () => {
+test("policy drafts retain recovery caveats and do not claim web deployment is enabled", () => {
   const privacy = readFileSync(resolve(root, "privacy/index.html"), "utf8");
   const deletion = readFileSync(
     resolve(root, "account-deletion/index.html"),
@@ -82,8 +127,10 @@ test("approved policy choices are not presented as deployed web or recovery feat
   );
   assert.match(privacy, /마지막 검증 복구본/);
   assert.match(privacy, /예외 보존하고 운영 경고/);
-  assert.match(privacy, /자동 집행 기능은 아직 구현·검증되지 않았습니다/);
+  assert.match(privacy, /독립 복원 검증 증거의 등록은 아직 완료되지 않았습니다/);
   assert.match(deletion, /Google 재인증 기반 웹 탈퇴·진행 상태 조회/);
-  assert.match(deletion, /웹 기능은 아직 구현·검증되지 않아/);
+  assert.match(deletion, /공개 설정이 활성화된 경우에만 사용할 수 있습니다/);
+  assert.match(deletion, /최종 삭제 요청 보내기/);
+  assert.match(deletion, /삭제 완료로 판단하지 마세요/);
   assert.match(deletion, /이메일 발신 주소만으로 소유자를 판단하지 않습니다/);
 });

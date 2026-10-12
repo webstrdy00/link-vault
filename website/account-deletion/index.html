@@ -6,6 +6,47 @@
     <meta name="robots" content="noindex,nofollow">
     <title>계정과 자료 삭제 | LinkFileBox</title>
     <link rel="stylesheet" href="../site.css">
+    <style>
+    .account-controls button {
+      padding: 12px 16px;
+      border: 1px solid #075c48;
+      border-radius: 8px;
+      background: white;
+      color: #142b3d;
+      font: inherit;
+      cursor: pointer;
+    }
+    .account-controls button:disabled {
+      cursor: not-allowed;
+      opacity: .6;
+    }
+    .account-controls button:focus-visible,
+    .account-controls input:focus-visible {
+      outline: 3px solid #075c48;
+      outline-offset: 4px;
+    }
+    .account-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-block: 16px;
+    }
+    .account-controls label {
+      display: block;
+    }
+    .account-controls input {
+      width: 20px;
+      height: 20px;
+      vertical-align: middle;
+    }
+    #account-message {
+      white-space: pre-line;
+    }
+    #account-message[data-error="true"] {
+      border-left-color: #9b2424;
+    }
+    </style>
+    <script type="module" src="./account-deletion.js"></script>
   </head>
   <body>
     <a class="skip" href="#main">본문으로</a>
@@ -15,7 +56,7 @@
         aria-label="주요 메뉴"><a href="../privacy/">개인정보 안내</a><a href="./" aria-current="page">탈퇴 안내</a></nav>
     </header>
     <aside
-      class="draft">공개 전 검토본 · 이메일 응대 절차와 최종 보관 정책 검토가 남아 있습니다.</aside>
+      class="draft">공개 전 검토본 · 문의 응대 절차와 최종 보관 정책 검토가 남아 있습니다.</aside>
     <main id="main" class="policy">
       <article class="policy-card" aria-labelledby="policy-title">
         <div class="policy-heading">
@@ -42,10 +83,44 @@
           </section>
           <section>
             <h2>3. 앱에 접근할 수 없을 때</h2>
-            <p><a href="mailto:support@linkfilebox.com?subject=LinkFileBox%20%EA%B3%84%EC%A0%95%20%EC%82%AD%EC%A0%9C%20%EC%9A%94%EC%B2%AD">support@linkfilebox.com으로 삭제 요청</a>을 보내주세요. 가능하면 가입한 Google 이메일에서 요청하고 앱 접근이 어려운 상황을 짧게 설명하세요.</p>
-            <p>메일 발송만으로 계정을 자동 삭제하지 않습니다. 운영자가 계정 소유를 확인한 후 처리해야 합니다. <strong>비밀번호·인증 코드·세션 토큰·신분증 사본은 보내지 마세요.</strong></p>
-            <p>앱 밖 요청은 <strong>Google 재인증 기반 웹 탈퇴·진행 상태 조회</strong> 방식으로 구현하기로 결정했습니다. 본인 확인은 Google의 계정 인증과 기존 회원의 연결 정보를 대조하며, 이메일 발신 주소만으로 소유자를 판단하지 않습니다.</p>
-            <p>처리 결과는 인증된 웹 조회 화면으로 안내하는 방향이며 개인 이메일 주소를 공개하는 회신 방식은 사용하지 않습니다. 현재 웹 기능은 아직 구현·검증되지 않아 이 페이지에서 탈퇴를 실행하거나 결과를 조회할 수 없습니다. 사용할 수 있는 탈퇴 기능은 위의 앱 내 절차입니다.</p>
+            <p><strong>Google 재인증 기반 웹 탈퇴·진행 상태 조회</strong>를 이용합니다. 본인 확인은 Google의 계정 인증과 기존 회원의 연결 정보를 대조하며, 이메일 발신 주소만으로 소유자를 판단하지 않습니다. 이 절차는 신규 가입이나 LinkFileBox 로그인 세션을 만들지 않습니다.</p>
+            <p>삭제하려는 계정으로 가입할 때 사용한 Google 계정을 직접 선택하세요. Google 인증 후에도 아래의 최종 전송 버튼을 눌러야 삭제를 요청합니다. 결과는 이 화면에서 확인하며 이메일을 발송하거나 개인 이메일 주소를 공개하지 않습니다.</p>
+            <p>메일 발송만으로 계정을 자동 삭제하지 않습니다. 문의 주소는 일반 문의용입니다. <strong>비밀번호·인증 코드·세션 토큰·신분증 사본은 보내지 마세요.</strong></p>
+            <div id="web-account" class="account-controls"
+              aria-labelledby="web-account-title">
+              <h3 id="web-account-title">웹에서 본인 확인 및 삭제 요청</h3>
+              <p
+                id="account-consent-note"><strong>삭제 요청은 되돌릴 수 없습니다.</strong> 위의 삭제 범위와 백업·기기 자료 제한을 확인하세요. 상태 조회만 할 때는 삭제 동의가 필요하지 않습니다.</p>
+              <label><input id="account-consent" type="checkbox" aria-describedby="account-consent-note"> LinkFileBox 계정과 서버 자료의 되돌릴 수 없는 삭제에 동의합니다.</label>
+              <div class="account-actions">
+                <button id="account-start-delete" type="button"
+                  disabled>삭제 요청을 위한 Google 인증 시작</button>
+                <button id="account-start-status" type="button"
+                  disabled>진행 상태 조회를 위한 Google 인증 시작</button>
+              </div>
+              <div id="account-google-area" hidden>
+                <p id="account-google-purpose"></p>
+                <div id="account-google-button"></div>
+              </div>
+              <div class="account-actions">
+                <button id="account-send" type="button" hidden
+                  disabled>최종 삭제 요청 보내기</button>
+                <button id="account-retry" type="button" hidden
+                  disabled>동일 요청 다시 전송</button>
+                <button id="account-cancel" type="button"
+                  hidden>취소하고 인증 정보 지우기</button>
+              </div>
+              <p id="account-message" class="notice" role="status"
+                aria-live="polite"
+                aria-atomic="true">웹 기능은 https://linkfilebox.com의 공개 설정이 활성화된 경우에만 사용할 수 있습니다. 자바스크립트를 사용해야 합니다.</p>
+              <div id="account-result" hidden>
+                <h3>인증된 진행 상태</h3>
+                <p id="account-result-state"></p>
+                <dl id="account-result-times"></dl>
+              </div>
+              <p>응답이 끊기거나 오류가 표시되면 삭제 완료로 판단하지 마세요. 전송 후 취소는 이 화면의 인증 정보만 지우며 이미 접수된 삭제 요청을 철회하지 않습니다. 다시 열거나 인증이 만료된 경우 새 Google 인증으로 진행 상태를 조회하세요.</p>
+              <noscript><p>웹 요청과 상태 조회에는 자바스크립트가 필요합니다. 앱 내 탈퇴 절차를 이용할 수 있습니다.</p></noscript>
+            </div>
           </section>
           <section class="policy-contact">
             <h2>4. 문의처</h2>

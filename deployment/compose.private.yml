@@ -13,6 +13,8 @@ services:
       - 127.0.0.1:8000:8000/tcp
   auth:
     logging: *private-container-logging
+  rest:
+    logging: *private-container-logging
   functions:
     logging: *private-container-logging
   storage:

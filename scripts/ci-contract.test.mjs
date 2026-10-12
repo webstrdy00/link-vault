@@ -29,6 +29,24 @@ const backupWorkflow = readFileSync(
 ).replace(/\r\n/g, "\n");
 const BACKUP_NOTIFY_TODAY = "2030-01-15";
 
+test("browser deletion origin is rejected before the generic API proxy", () => {
+  const caddy = readFileSync(
+    new URL("../deployment/Caddyfile", import.meta.url),
+    "utf8",
+  );
+  const api = caddy.slice(caddy.indexOf("api.linkfilebox.com {"));
+  const origin = api.indexOf("handle @webAccountWrongOrigin");
+  assert.ok(origin >= 0 && origin < api.indexOf("handle @allowed"));
+  assert.match(api, /not header Origin https:\/\/linkfilebox\.com/);
+  assert.match(
+    api,
+    /path \/functions\/v1\/library-api\/v1\/web-account \/functions\/v1\/library-api\/v1\/web-account\/\*/,
+  );
+  assert.match(api, /handle @webAccountWrongOrigin\s*\{[^}]*respond 403/s);
+  assert.match(caddy, /header @account Cache-Control "no-store"/);
+  assert.match(caddy, /frame-ancestors 'none'/);
+});
+
 // Inspect the small workflow's mapping blocks, not its whitespace or step names.
 function block(source, key) {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -108,9 +126,8 @@ function runCommands() {
 
 const commands = runCommands();
 
-function backupNotifyScript() {
-  const notify = block(block(backupWorkflow, "jobs"), "notify");
-  const run = block(notify, "run");
+function literalRun(source) {
+  const run = block(source, "run");
   assert.equal(scalar(run, "run"), "|");
   const lines = run.split("\n").slice(1);
   const indentation = Math.min(
@@ -119,6 +136,19 @@ function backupNotifyScript() {
     ),
   );
   return lines.map((line) => line.slice(indentation)).join("\n");
+}
+
+function backupNotifyScript() {
+  return literalRun(block(block(backupWorkflow, "jobs"), "notify"));
+}
+
+function backupCaptureScript() {
+  const capture = backupWorkflow.split(/(?=^ *- +(?:name|uses|run|id):)/m)
+    .find((step) => /^ *id: capture$/m.test(step));
+  assert.ok(capture, "Missing backup capture step");
+  const python = literalRun(capture).match(/python3 - <<'PY'\n([\s\S]*?)\nPY/);
+  assert.ok(python, "Missing bounded backup receive/status script");
+  return python[1];
 }
 
 function backupNotifyExecutables() {
@@ -162,7 +192,13 @@ function backupNotifyExecutables() {
   return { bash, python };
 }
 
-function runBackupNotify(t, result, expiry, existing = "") {
+function runBackupNotify(
+  t,
+  result,
+  expiry,
+  existing = "",
+  recovery = "verified",
+) {
   const { bash, python } = backupNotifyExecutables();
   const directory = mkdtempSync(join(tmpdir(), "backup-notify-test-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -223,6 +259,7 @@ ${backupNotifyScript()}
       GH_TOKEN: "fixture-only-token",
       GH_REPO: "fixture-owner/fixture-repo",
       BACKUP_RESULT: result,
+      RECOVERY_STATUS: recovery,
       SERVER_EXPIRES_ON: expiry,
       ASSIGNEE: "fixture-owner",
       RUN_URL: "https://example.invalid/actions/runs/1",
@@ -242,6 +279,77 @@ ${backupNotifyScript()}
     index += count;
   }
   return calls;
+}
+
+function runBackupCapture(
+  t,
+  diagnostic,
+  returncode = 0,
+  ciphertext = "age-encryption.org/v1\n" + "x".repeat(200),
+) {
+  const { python } = backupNotifyExecutables();
+  const directory = mkdtempSync(join(tmpdir(), "backup-capture-test-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  mkdirSync(join(directory, "recovery"));
+  mkdirSync(join(directory, "work"));
+  writeFileSync(join(directory, "outputs"), "");
+  writeFileSync(join(directory, "summary"), "");
+  writeFileSync(join(directory, "capture.py"), backupCaptureScript());
+  writeFileSync(
+    join(directory, "fixture.py"),
+    `import os, subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+def fixture_run(command, stdout, stderr, timeout):
+    assert command[0:2] == ['ssh', '-T']
+    assert command[-1] == 'fixture-user@fixture-host'
+    assert 'StrictHostKeyChecking=yes' in command
+    assert 'BatchMode=yes' in command
+    assert timeout == 900
+    stdout.write(os.environ['FIXTURE_CIPHERTEXT'].encode('ascii'))
+    stderr.write(os.environ['FIXTURE_DIAGNOSTIC'].encode('ascii'))
+    if os.environ['FIXTURE_RETURN'] == 'timeout':
+        raise subprocess.TimeoutExpired(command, timeout)
+    return SimpleNamespace(returncode=int(os.environ['FIXTURE_RETURN']))
+
+# No real subprocess, SSH, credentials, Docker, or network in this fixture.
+subprocess.run = fixture_run
+exec(compile(Path('capture.py').read_text(), 'capture.py', 'exec'))
+`,
+  );
+  const execution = spawnSync(python, ["-B", "fixture.py"], {
+    cwd: directory,
+    encoding: "utf8",
+    timeout: 10_000,
+    env: {
+      PATH: process.env.PATH,
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+      PYTHONNOUSERSITE: "1",
+      PYTHONDONTWRITEBYTECODE: "1",
+      BACKUP_WORK: join(directory, "work"),
+      BACKUP_USER: "fixture-user",
+      BACKUP_HOST: "fixture-host",
+      GITHUB_OUTPUT: join(directory, "outputs"),
+      GITHUB_STEP_SUMMARY: join(directory, "summary"),
+      FIXTURE_DIAGNOSTIC: diagnostic,
+      FIXTURE_CIPHERTEXT: ciphertext,
+      FIXTURE_RETURN: String(returncode),
+    },
+  });
+  assert.equal(execution.error, undefined);
+  return {
+    ...execution,
+    stdout: execution.stdout.replace(/\r\n/g, "\n"),
+    outputs: readFileSync(join(directory, "outputs"), "utf8").replace(
+      /\r\n/g,
+      "\n",
+    ),
+    summary: readFileSync(join(directory, "summary"), "utf8").replace(
+      /\r\n/g,
+      "\n",
+    ),
+  };
 }
 
 function expiryInDays(days) {
@@ -342,6 +450,148 @@ test("backup notifications do not duplicate an existing open issue", (t) => {
   }
 });
 
+test("verified recovery expiry alerts even when capture fails and resource expiry is unavailable", (t) => {
+  for (const result of ["success", "failure", "cancelled"]) {
+    for (const expiry of ["", "invalid", expiryInDays(365)]) {
+      const calls = runBackupNotify(t, result, expiry, "", "expired");
+      assertBackupAlert(
+        calls,
+        "[운영] 검증된 복구 백업 30일 경과",
+        result,
+        expiry,
+      );
+      assert.ok(calls[1][7].includes("독립 복구 검증: expired."));
+    }
+  }
+  const calls = runBackupNotify(t, "failure", "", "42", "expired");
+  assertBackupAlert(
+    calls,
+    "[운영] 검증된 복구 백업 30일 경과",
+    "failure",
+    "",
+    "42",
+  );
+});
+
+test("missing or invalid independent recovery evidence alerts without inventing verification", (t) => {
+  for (const recovery of ["unverified", "invalid"]) {
+    for (const result of ["success", "failure"]) {
+      const calls = runBackupNotify(t, result, expiryInDays(365), "", recovery);
+      assertBackupAlert(
+        calls,
+        "[운영] 독립 복구 검증 누락 또는 오류",
+        result,
+        expiryInDays(365),
+      );
+      assert.ok(calls[1][7].includes(`독립 복구 검증: ${recovery}.`));
+    }
+  }
+});
+
+test("backup receive surfaces recovery status before reporting a capture error or success", (t) => {
+  const name = "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age";
+  for (const status of ["VERIFIED", "EXPIRED", "UNVERIFIED", "INVALID"]) {
+    for (const result of [0, 1, "timeout"]) {
+      const capture = runBackupCapture(
+        t,
+        `BACKUP_RECOVERY_${status}\nBACKUP_SNAPSHOT_NAME=${name}\n`,
+        result,
+      );
+      assert.equal(
+        capture.outputs,
+        `recovery_status=${status.toLowerCase()}\n`,
+      );
+      assert.equal(capture.status, result === 0 ? 0 : 1);
+      assert.equal(
+        capture.stdout,
+        status === "VERIFIED" ? "" : `::warning::BACKUP_RECOVERY_${status}\n`,
+      );
+      assert.equal(
+        capture.summary,
+        result === 0
+          ? `Source ciphertext filename for off-server verification attestation: \`${name}\`.\n`
+          : "",
+      );
+    }
+  }
+  for (const result of [0, 1]) {
+    const capture = runBackupCapture(
+      t,
+      "BACKUP_RECOVERY_VERIFIED\nBACKUP_RECOVERY_EXPIRED\n",
+      result,
+    );
+    assert.equal(capture.outputs, "recovery_status=expired\n");
+    assert.equal(capture.stdout, "::warning::BACKUP_RECOVERY_EXPIRED\n");
+    assert.equal(capture.status, result);
+  }
+});
+
+test("backup receive fails closed for absent ambiguous or oversized evidence and never logs raw diagnostics", (t) => {
+  for (
+    const diagnostic of [
+      "age header is not verification\nNEVER_LOG_DATABASE_PASSWORD_OR_VAULT_KEY\n",
+      "BACKUP_RECOVERY_VERIFIED\nBACKUP_RECOVERY_VERIFIED\n",
+      "BACKUP_RECOVERY_VERIFIED\n" + "x".repeat(4096),
+      "BACKUP_RECOVERY_UNKNOWN\n",
+    ]
+  ) {
+    const capture = runBackupCapture(t, diagnostic);
+    assert.equal(capture.outputs, "recovery_status=invalid\n");
+    assert.equal(capture.stdout, "::warning::BACKUP_RECOVERY_INVALID\n");
+    assert.ok(
+      !capture.stderr.includes("NEVER_LOG_DATABASE_PASSWORD_OR_VAULT_KEY"),
+    );
+  }
+  const invalidArchive = runBackupCapture(
+    t,
+    "BACKUP_RECOVERY_VERIFIED\n",
+    0,
+    "not ciphertext",
+  );
+  assert.equal(invalidArchive.status, 1);
+  assert.equal(invalidArchive.outputs, "recovery_status=verified\n");
+});
+
+test("workflow uploads successful captures but cannot claim recovery success without independent current verification", () => {
+  const exportJob = block(block(backupWorkflow, "jobs"), "export");
+  assert.equal(
+    scalar(block(exportJob, "outputs"), "recovery_status"),
+    "${{ steps.capture.outputs.recovery_status }}",
+  );
+  const steps = exportJob.split(/(?=^ *- +(?:name|uses|run|id):)/m);
+  const gateIndex = steps.findIndex((step) =>
+    /test "\$RECOVERY_STATUS" = verified/.test(step)
+  );
+  const uploadIndex = steps.findIndex((step) =>
+    /uses: actions\/upload-artifact@/.test(step)
+  );
+  assert.ok(
+    uploadIndex > 0 && gateIndex > uploadIndex,
+    "Preserve completed ciphertext before failing expired/unverified health",
+  );
+  assert.equal(
+    scalar(block(steps[gateIndex], "env"), "RECOVERY_STATUS"),
+    "${{ steps.capture.outputs.recovery_status }}",
+  );
+  assert.equal(
+    scalar(
+      block(block(block(backupWorkflow, "jobs"), "notify"), "env"),
+      "RECOVERY_STATUS",
+    ),
+    "${{ needs.export.outputs.recovery_status }}",
+  );
+  assert.ok(
+    backupWorkflow.includes(
+      "Capture and an age header are not recovery verification.",
+    ),
+  );
+  assert.ok(
+    backupWorkflow.includes(
+      "private age identity is not stored in GitHub or on the server",
+    ),
+  );
+});
+
 test("public deployment passes the same required Google audience to auth and functions", () => {
   const compose = readFileSync(
     new URL("../deployment/compose.public.yml", import.meta.url),
@@ -366,7 +616,17 @@ test("deployment rotates each relevant service's json-file logs by size, not ela
         "compose.private.yml",
         "x-private-logging",
         "private-container-logging",
-        ["db", "auth", "functions", "api-gw", "storage", "studio", "meta", "imgproxy"],
+        [
+          "db",
+          "auth",
+          "functions",
+          "api-gw",
+          "storage",
+          "studio",
+          "meta",
+          "imgproxy",
+          "rest",
+        ],
       ],
       [
         "compose.public.yml",
@@ -383,7 +643,11 @@ test("deployment rotates each relevant service's json-file logs by size, not ela
     assert.equal(scalar(compose, anchorKey), `&${anchor}`);
     for (const service of services) {
       const logging = serviceLogging(compose, service, anchorKey, anchor);
-      assert.equal(scalar(logging, "driver"), "json-file", `${file}: ${service}`);
+      assert.equal(
+        scalar(logging, "driver"),
+        "json-file",
+        `${file}: ${service}`,
+      );
       const options = block(logging, "options");
       const entries = [...options.matchAll(/^ +([\w-]+): *([^\n]+)/gm)]
         .map((match) => [match[1], unquote(match[2])]);

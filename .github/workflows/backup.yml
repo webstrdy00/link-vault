@@ -21,8 +21,11 @@ jobs:
   export:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    outputs:
+      recovery_status: ${{ steps.capture.outputs.recovery_status }}
     steps:
       - name: Receive encrypted recovery archive
+        id: capture
         shell: bash
         env:
           BACKUP_SSH_KEY: ${{ secrets.BACKUP_SSH_KEY }}
@@ -41,12 +44,35 @@ jobs:
           printf '%s\n' "$BACKUP_SSH_KEY" > "$work/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$work/known_hosts"
           mkdir -p recovery
-          ssh -T -i "$work/key" \
-            -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="$work/known_hosts" -o ConnectTimeout=20 \
-            "$BACKUP_USER@$BACKUP_HOST" > recovery/server.tar.age
+          export BACKUP_WORK="$work"
           python3 - <<'PY'
+          import os, re, subprocess
           from pathlib import Path
+          work = Path(os.environ['BACKUP_WORK'])
+          with Path('recovery/server.tar.age').open('wb') as archive, (work / 'status').open('wb') as errors:
+              try:
+                  result = subprocess.run(['ssh', '-T', '-i', str(work / 'key'),
+                      '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                      '-o', 'UserKnownHostsFile=' + str(work / 'known_hosts'), '-o', 'ConnectTimeout=20',
+                      os.environ['BACKUP_USER'] + '@' + os.environ['BACKUP_HOST']],
+                      stdout=archive, stderr=errors, timeout=900).returncode
+              except (OSError, subprocess.TimeoutExpired):
+                  result = 1
+          with (work / 'status').open('rb') as errors:
+              diagnostic = errors.read(4097)
+          tokens = re.findall(rb'^BACKUP_RECOVERY_(VERIFIED|EXPIRED|UNVERIFIED|INVALID)$', diagnostic, re.M)
+          # A capture may cross the 30-day boundary after its preflight check.
+          status = tokens[-1].decode('ascii').lower() if len(diagnostic) <= 4096 and (len(tokens) == 1 or tokens == [b'VERIFIED', b'EXPIRED']) else 'invalid'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('recovery_status=' + status + '\n')
+          if status != 'verified':
+              print('::warning::BACKUP_RECOVERY_' + status.upper())
+          names = re.findall(rb'^BACKUP_SNAPSHOT_NAME=(link-vault-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}\.tar\.age)$', diagnostic, re.M)
+          if result == 0 and len(names) == 1:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('Source ciphertext filename for off-server verification attestation: `' + names[0].decode('ascii') + '`.\n')
+          if result != 0:
+              raise SystemExit('BACKUP_CAPTURE_FAILED')
           p = Path('recovery/server.tar.age')
           with p.open('rb') as stream:
               assert stream.read(22) == b'age-encryption.org/v1\n', 'Invalid age archive'
@@ -60,10 +86,19 @@ jobs:
           retention-days: 30
           compression-level: 0
           if-no-files-found: error
+      - name: Require current independently verified recovery
+        shell: bash
+        env:
+          RECOVERY_STATUS: ${{ steps.capture.outputs.recovery_status }}
+        run: |
+          set -euo pipefail
+          test "$RECOVERY_STATUS" = verified
       - name: State recovery boundaries
+        if: always()
         run: |
           echo 'Encrypted archive only. The private age identity is not stored in GitHub or on the server.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Artifacts expire after 30 days; move required recovery points to durable storage before expiry.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Capture and an age header are not recovery verification. Root must attest the exact ciphertext filename and SHA256 only after an independent off-server isolated restore rehearsal. Without a valid verification receipt no local snapshots are pruned. The last attested local snapshot is exempt from count/age pruning, with a warning at 30 days; verification does not extend its capture age.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Scheduled workflows run only from the default branch. Snapshot capture briefly stops application services.' >> "$GITHUB_STEP_SUMMARY"
 
   notify:
@@ -80,6 +115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           BACKUP_RESULT: ${{ needs.export.result }}
+          RECOVERY_STATUS: ${{ needs.export.outputs.recovery_status }}
           SERVER_EXPIRES_ON: ${{ vars.SERVER_EXPIRES_ON }}
           ASSIGNEE: ${{ github.repository_owner }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -87,7 +123,11 @@ jobs:
         run: |
           set -euo pipefail
           title=''
-          if [ "$BACKUP_RESULT" != success ]; then
+          if [ "$RECOVERY_STATUS" = expired ]; then
+            title='[운영] 검증된 복구 백업 30일 경과'
+          elif [ "$RECOVERY_STATUS" = unverified ] || [ "$RECOVERY_STATUS" = invalid ]; then
+            title='[운영] 독립 복구 검증 누락 또는 오류'
+          elif [ "$BACKUP_RESULT" != success ]; then
             title='[운영] 암호화 서버 백업 실행 실패'
           elif days=$(python3 - <<'PY'
           import datetime, os
@@ -105,6 +145,6 @@ jobs:
             existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
             if [ -z "$existing" ]; then
               gh issue create --title "$title" --assignee "$ASSIGNEE" \
-                --body "백업 결과: $BACKUP_RESULT. 서버 만료 예정: $SERVER_EXPIRES_ON. 실행 기록: $RUN_URL . 암호화 백업과 별도 복호화 키를 확인하고, 서비스 종료 전에 연장 또는 새 서버 복원 검증을 완료하세요."
+                --body "백업 결과: $BACKUP_RESULT. 독립 복구 검증: $RECOVERY_STATUS. 서버 만료 예정: $SERVER_EXPIRES_ON. 실행 기록: $RUN_URL . 암호화 백업과 별도 복호화 키를 확인하고, 서비스 종료 전에 연장 또는 새 서버 복원 검증을 완료하세요."
             fi
           fi

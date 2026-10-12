@@ -18,6 +18,7 @@ services:
       - "443:443/tcp"
     volumes:
       - ./volumes/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,Z
+      - ./volumes/website:/srv/website:ro,Z
       - ./volumes/caddy/data:/data:Z
       - ./volumes/caddy/config:/config:Z
     depends_on:

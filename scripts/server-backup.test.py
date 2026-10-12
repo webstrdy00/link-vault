@@ -2,6 +2,8 @@
 """Pure-mock regression checks; no Docker, age, subprocesses or real disk writes."""
 
 import contextlib
+import datetime
+import hashlib
 import importlib.util
 import io
 import json
@@ -17,6 +19,99 @@ SPEC = importlib.util.spec_from_file_location("server_backup", os.path.join(os.p
 BACKUP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BACKUP)
 SECRET = "NEVER_LOG_DATABASE_PASSWORD_OR_VAULT_KEY"
+
+
+def file_info(inode=1, mode=stat.S_IFREG | 0o600, size=100, uid=0, links=1):
+    return SimpleNamespace(st_mode=mode, st_uid=uid, st_nlink=links, st_dev=1,
+                           st_ino=inode, st_size=size, st_mtime_ns=1, st_ctime_ns=1)
+
+
+class VerificationDisk:
+    """In-memory POSIX fixtures exercising the real receipt/hash/prune code."""
+    def __init__(self):
+        self.files, self.infos, self.handles, self.read_sizes = {}, {}, {}, []
+        self.removed = []
+        for path in ("/", "/opt", BACKUP.Config.root):
+            self.infos[path] = file_info(mode=stat.S_IFDIR | 0o755)
+        self.infos[BACKUP.Config.backups] = file_info(mode=stat.S_IFDIR | 0o700)
+
+    def add(self, name, value, **kwargs):
+        path = BACKUP.Config.backups + "/" + name
+        self.files[path] = value
+        self.infos[path] = file_info(inode=len(self.infos) + 1, size=len(value), **kwargs)
+        return path
+
+    def lstat(self, path):
+        if path not in self.infos:
+            raise FileNotFoundError()
+        return SimpleNamespace(**vars(self.infos[path]))
+
+    def open(self, path, flags, mode=0o600):
+        self.lstat(path)
+        descriptor = len(self.handles) + 100
+        self.handles[descriptor] = path
+        return descriptor
+
+    def fdopen(self, descriptor, mode):
+        disk, path = self, self.handles[descriptor]
+
+        class Stream(io.BytesIO):
+            def fileno(self):
+                return descriptor
+
+            def read(self, size=-1):
+                if size < 0:
+                    raise AssertionError("Unbounded fixture read")
+                disk.read_sizes.append(size)
+                return super().read(size)
+
+            def close(self):
+                if "w" in mode and not self.closed:
+                    disk.files[path] = self.getvalue()
+                    disk.infos[path].st_size = len(disk.files[path])
+                super().close()
+
+        return Stream(b"" if "w" in mode else self.files[path])
+
+    def unlink(self, path):
+        self.removed.append(path)
+        del self.files[path]
+        del self.infos[path]
+
+    def link(self, source, destination, **kwargs):
+        if destination in self.infos:
+            raise FileExistsError()
+        self.files[destination], self.infos[destination] = self.files[source], self.infos[source]
+
+    def replace(self, source, destination):
+        self.files[destination], self.infos[destination] = self.files[source], self.infos[source]
+        self.unlink(source)
+
+    def mkstemp(self, prefix, dir):
+        path = self.add(prefix + "fixture", b"")
+        return self.open(path, os.O_WRONLY), path
+
+    @contextlib.contextmanager
+    def scandir(self, path):
+        yield iter(SimpleNamespace(name=name[len(path) + 1:]) for name in list(self.files) if os.path.dirname(name) == path)
+
+    @contextlib.contextmanager
+    def patched(self):
+        with contextlib.ExitStack() as patches:
+            replacements = {"lstat": self.lstat, "open": self.open, "fdopen": self.fdopen,
+                            "fstat": lambda descriptor: self.lstat(self.handles[descriptor]),
+                            "scandir": self.scandir, "unlink": self.unlink, "link": self.link,
+                            "replace": self.replace, "fsync": lambda descriptor: None,
+                            "close": lambda descriptor: None}
+            for name, value in replacements.items():
+                patches.enter_context(mock.patch.object(BACKUP.os, name, side_effect=value))
+            for name, value in (("O_NOFOLLOW", 0x100000), ("O_DIRECTORY", 0x200000), ("O_NONBLOCK", 0x400000)):
+                patches.enter_context(mock.patch.object(BACKUP.os, name, value, create=True))
+            patches.enter_context(mock.patch.object(BACKUP.os.path, "abspath", side_effect=lambda path: path))
+            patches.enter_context(mock.patch.object(BACKUP.os.path, "join", side_effect=lambda *parts: "/".join(parts)))
+            patches.enter_context(mock.patch.object(BACKUP.os.path, "lexists", side_effect=lambda path: path in self.infos))
+            patches.enter_context(mock.patch.object(BACKUP.tempfile, "mkstemp", side_effect=self.mkstemp))
+            yield self
 
 
 def config_archive(name="postgresql-custom/pgsodium_root.key", mode=0o600,
@@ -50,6 +145,7 @@ class FakeFilesystem:
         self.manifest = None
         self.stream_failure = False
         self.cleanup_failure = False
+        self.receipt = None
 
     def prepare(self, config):
         self.events.append(("prepare",))
@@ -99,7 +195,14 @@ class FakeFilesystem:
         self.events.append(("publish", destination))
         self.files[destination] = self.files.pop(source)
 
-    def rotate(self, backups):
+    def recovery_receipt(self, backups, deadline, now):
+        deadline.remaining()
+        return self.receipt
+
+    def rotate(self, backups, receipt, deadline, now):
+        deadline.remaining()
+        if receipt != self.receipt:
+            raise BACKUP.BackupError()
         self.events.append(("rotate", backups))
 
     def stream(self, path, output, deadline):
@@ -184,7 +287,15 @@ class SnapshotTests(unittest.TestCase):
                            error_output=errors, getuid=lambda: 0)
         self.assertNotIn(SECRET, errors.getvalue())
         self.assertNotIn(SECRET.encode("ascii"), output.getvalue())
-        return code, output.getvalue(), errors.getvalue()
+        lines = errors.getvalue().splitlines(True)
+        self.assertEqual(lines.pop(0), "BACKUP_RECOVERY_UNVERIFIED\n")
+        if stream and code == 0:
+            line = lines.pop(0)
+            self.assertTrue(line.startswith("BACKUP_SNAPSHOT_NAME="))
+            name = line[len("BACKUP_SNAPSHOT_NAME="):].strip()
+            self.assertTrue(BACKUP.OWNED_NAME.fullmatch(name))
+            self.assertIn(BACKUP.Config.backups + "/" + name, backup.fs.files)
+        return code, output.getvalue(), "".join(lines)
 
     def assert_clean(self, filesystem):
         self.assertFalse(any(".incomplete-test" in name for name in filesystem.files))
@@ -371,29 +482,360 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(BACKUP.BackupError):
             BACKUP.Deadline(5, lambda: 6).remaining()
 
+    def test_expired_verified_status_precedes_capture_prepare_and_unresolved_failures(self):
+        for failure in ("dump", "prepare", "unresolved"):
+            with self.subTest(failure=failure):
+                filesystem, runner, backup = self.fixture("dump" if failure == "dump" else None)
+                backup.wallclock = lambda: datetime.datetime(2030, 1, 31, 12)
+                filesystem.receipt = {"snapshot": "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age"}
+                if failure == "prepare":
+                    filesystem.prepare = mock.Mock(side_effect=RuntimeError(SECRET))
+                if failure == "unresolved":
+                    filesystem.files[BACKUP.Config.root + "/deploy-unresolved.json"] = b"unresolved"
+                output, errors = io.BytesIO(), io.StringIO()
+                self.assertEqual(BACKUP.main([], backup, output, errors, lambda: 0), 1)
+                self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_EXPIRED\nBACKUP_FAILED\n")
+                self.assertEqual(output.getvalue(), b"")
+                self.assertFalse(any(event[0] == "rotate" for event in filesystem.events))
+                if failure != "dump":
+                    self.assertEqual(runner.calls, [])
+
+    def test_invalid_verification_blocks_capture_and_pruning(self):
+        filesystem, runner, backup = self.fixture()
+        filesystem.recovery_receipt = mock.Mock(side_effect=RuntimeError(SECRET))
+        output, errors = io.BytesIO(), io.StringIO()
+        self.assertEqual(BACKUP.main(["--stream"], backup, output, errors, lambda: 0), 1)
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_INVALID\nBACKUP_FAILED\n")
+        self.assertEqual(output.getvalue(), b"")
+        self.assertEqual(runner.calls, [])
+        self.assertFalse(any(event[0] in ("prepare", "publish", "rotate") for event in filesystem.events))
+
+    def test_capture_failure_crossing_exact_age_boundary_still_reports_expiry(self):
+        filesystem, runner, backup = self.fixture("dump")
+        now = datetime.datetime(2030, 1, 31, 11, 59, 59)
+        filesystem.receipt = {"snapshot": "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age"}
+        backup.wallclock = lambda: now
+        original = runner.run
+
+        def fail_after_expiry(command, **kwargs):
+            nonlocal now
+            if "pg_dump" in command:
+                now += datetime.timedelta(seconds=1)
+            return original(command, **kwargs)
+
+        runner.run = fail_after_expiry
+        output, errors = io.BytesIO(), io.StringIO()
+        self.assertEqual(BACKUP.main([], backup, output, errors, lambda: 0), 1)
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_VERIFIED\nBACKUP_RECOVERY_EXPIRED\nBACKUP_FAILED\n")
+        self.assertEqual(output.getvalue(), b"")
+        self.assertFalse(any(event[0] == "rotate" for event in filesystem.events))
+
+    def test_new_capture_leaves_expired_verification_unchanged(self):
+        filesystem, runner, backup = self.fixture()
+        backup.wallclock = lambda: datetime.datetime(2030, 1, 31, 12)
+        receipt = {"snapshot": "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age"}
+        filesystem.receipt = receipt
+        output, errors = io.BytesIO(), io.StringIO()
+        self.assertEqual(BACKUP.main([], backup, output, errors, lambda: 0), 0)
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_EXPIRED\nBACKUP_OK\n")
+        self.assertTrue(BACKUP.OWNED_NAME.fullmatch(output.getvalue().decode("ascii").strip()))
+        self.assertIs(filesystem.receipt, receipt)
+        self.assertTrue(any(event[0] == "rotate" for event in filesystem.events))
+
+    def test_operator_attestation_locks_deploy_then_backup_without_capture(self):
+        filesystem, runner, backup = self.fixture()
+        now = datetime.datetime(2030, 1, 31, 12)
+        name = "link-vault-20300131T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        backup.wallclock = lambda: now
+        filesystem.receipt = {"snapshot": name}
+        filesystem.attest = mock.Mock()
+        errors = io.StringIO()
+        self.assertEqual(BACKUP.main(["--attest-offserver-verified", name, "a" * 64], backup, io.BytesIO(), errors, lambda: 0), 0)
+        args = filesystem.attest.call_args[0]
+        self.assertEqual(args[:3], (BACKUP.Config.backups, name, "a" * 64))
+        self.assertEqual(args[3].remaining(), BACKUP.VERIFICATION_SECONDS)
+        self.assertEqual(args[4], now)
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_VERIFIED\nBACKUP_ATTESTED\n")
+        self.assertEqual([event[1] for event in filesystem.events if event[0] == "lock"],
+                         [BACKUP.Config.root + "/deploy.lock", BACKUP.Config.root + "/backup.lock"])
+        self.assertEqual(runner.calls, [])
+        self.assertFalse(any(event[0] in ("prepare", "temporary", "publish", "rotate") for event in filesystem.events))
+
+    def test_attestation_cli_is_explicit_root_only_and_does_not_capture(self):
+        backup = mock.Mock()
+        name = "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        for args, uid, expected in ((["--attest-offserver-verified", name], 0, "BACKUP_USAGE\n"),
+                                    (["--attest-offserver-verified", name, "a" * 64], 1000, "BACKUP_ROOT_REQUIRED\n")):
+            errors = io.StringIO()
+            self.assertNotEqual(BACKUP.main(args, backup, io.BytesIO(), errors, lambda: uid), 0)
+            self.assertEqual(errors.getvalue(), expected)
+        backup.attest.assert_not_called()
+        errors = io.StringIO()
+        self.assertEqual(BACKUP.main(["--attest-offserver-verified", name, "a" * 64], backup, io.BytesIO(), errors, lambda: 0), 0)
+        backup.attest.assert_called_once_with(name, "a" * 64, errors)
+        backup.execute.assert_not_called()
+        self.assertEqual(errors.getvalue(), "BACKUP_ATTESTED\n")
+
+
+class VerificationTests(unittest.TestCase):
+    def fixture(self):
+        disk, fs = VerificationDisk(), BACKUP.Filesystem()
+        name = "link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        path = disk.add(name, BACKUP.AGE_HEADER + b"verified ciphertext")
+        digest = hashlib.sha256(disk.files[path]).hexdigest()
+        return disk, fs, name, path, digest, datetime.datetime(2030, 1, 31, 12)
+
+    def deadline(self):
+        return BACKUP.Deadline(100, lambda: 0)
+
+    def test_attestation_round_trip_binds_exact_name_hash_inode_and_capture_expiry(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        with disk.patched():
+            receipt = fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            self.assertEqual(fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now), receipt)
+            self.assertEqual(receipt["sha256"], digest)
+            self.assertEqual(receipt["snapshot"], name)
+            self.assertEqual((receipt["device"], receipt["inode"]), (disk.infos[path].st_dev, disk.infos[path].st_ino))
+            errors = io.StringIO()
+            BACKUP.Backup(filesystem=fs).recovery_status(errors, self.deadline(), now)
+            self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_EXPIRED\n")
+            errors = io.StringIO()
+            # A newer attestation does not renew the old snapshot's capture age.
+            BACKUP.Backup(filesystem=fs).recovery_status(errors, self.deadline(), now + datetime.timedelta(days=1))
+            self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_EXPIRED\n")
+        self.assertTrue(all(size <= 1024 * 1024 for size in disk.read_sizes))
+        self.assertEqual(disk.infos[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME].st_mode, stat.S_IFREG | 0o600)
+        self.assertFalse(any(".verification-" in path for path in disk.files))
+
+    def test_replacing_receipt_requires_new_explicit_attestation_not_new_capture(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        fresh_name = "link-vault-20300131T120000Z-bbbbbbbbbbbbbbbb.tar.age"
+        fresh_path = disk.add(fresh_name, BACKUP.AGE_HEADER + b"fresh ciphertext")
+        with disk.patched():
+            old = fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            self.assertEqual(fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now), old)
+            fresh = fs.attest(BACKUP.Config.backups, fresh_name, hashlib.sha256(disk.files[fresh_path]).hexdigest(), self.deadline(), now)
+            errors = io.StringIO()
+            BACKUP.Backup(filesystem=fs).recovery_status(errors, self.deadline(), now)
+            self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_VERIFIED\n")
+            fs.rotate(BACKUP.Config.backups, fresh, self.deadline(), now)
+        self.assertNotIn(path, disk.files)
+        self.assertIn(fresh_path, disk.files)
+
+    def test_absence_is_unverified_even_with_age_files_and_receipt_symlink_is_invalid(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        with disk.patched():
+            self.assertIsNone(fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now))
+            receipt_path = disk.add(BACKUP.RECEIPT_NAME, b"outside", mode=stat.S_IFLNK | 0o600)
+            with self.assertRaises(BACKUP.BackupError):
+                fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now)
+            with self.assertRaises(BACKUP.BackupError):
+                fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+        self.assertEqual(disk.files[receipt_path], b"outside")
+
+    def test_receipt_schema_size_duplicates_future_date_inode_and_hash_fail_closed(self):
+        alterations = ({"sha256": "0" * 64}, {"inode": 999}, {"device": 999},
+                       {"snapshot": "../../outside"}, {"format_version": True}, {"inode": True},
+                       {"verified_at": "2030-02-01T12:00:00Z"}, {"verified_at": "2029-12-31T12:00:00Z"},
+                       {"unexpected": SECRET})
+        for alteration in alterations:
+            disk, fs, name, path, digest, now = self.fixture()
+            with disk.patched():
+                receipt = fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+                receipt.update(alteration)
+                disk.add(BACKUP.RECEIPT_NAME, json.dumps(receipt).encode("ascii"))
+                with self.assertRaises((BACKUP.BackupError, ValueError)):
+                    fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now)
+        for raw in (b"{}", b"x" * 4097, b'{"snapshot":"one","snapshot":"two"}', b"[]", b"\xff"):
+            disk, fs, name, path, digest, now = self.fixture()
+            disk.add(BACKUP.RECEIPT_NAME, raw)
+            with disk.patched():
+                with self.assertRaises((BACKUP.BackupError, ValueError)):
+                    fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now)
+                with self.assertRaises((BACKUP.BackupError, ValueError)):
+                    fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            self.assertEqual(disk.files[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME], raw)
+
+    def test_symlink_hardlink_nonprivate_nonroot_and_writable_ancestor_rejected(self):
+        for target, field, value in (("snapshot", "st_mode", stat.S_IFLNK | 0o600),
+                                     ("snapshot", "st_nlink", 2), ("snapshot", "st_uid", 1000),
+                                     ("snapshot", "st_mode", stat.S_IFREG | 0o644),
+                                     ("receipt", "st_mode", stat.S_IFREG | 0o640),
+                                     ("receipt", "st_nlink", 2), ("receipt", "st_uid", 1000),
+                                     ("backups", "st_mode", stat.S_IFDIR | 0o755),
+                                     ("ancestor", "st_mode", stat.S_IFLNK | 0o755),
+                                     ("ancestor", "st_mode", stat.S_IFDIR | 0o777)):
+            with self.subTest(target=target, field=field, value=value):
+                disk, fs, name, path, digest, now = self.fixture()
+                with disk.patched():
+                    fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+                    target_path = {"snapshot": path, "receipt": BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME,
+                                   "backups": BACKUP.Config.backups, "ancestor": "/opt"}[target]
+                    setattr(disk.infos[target_path], field, value)
+                    with self.assertRaises(BACKUP.BackupError):
+                        fs.recovery_receipt(BACKUP.Config.backups, self.deadline(), now)
+
+    def test_attestation_refuses_traversal_wrong_digest_invalid_date_or_future_capture(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        for candidate, checksum in (("../../outside", digest), (path, digest), ("other.tar.age", digest),
+                                    ("link-vault-20300230T120000Z-aaaaaaaaaaaaaaaa.tar.age", digest),
+                                    ("link-vault-20300201T120000Z-aaaaaaaaaaaaaaaa.tar.age", digest),
+                                    (name, "0" * 64), (name, digest.upper()), (name, "x")):
+            with disk.patched():
+                with self.assertRaises((BACKUP.BackupError, ValueError)):
+                    fs.attest(BACKUP.Config.backups, candidate, checksum, self.deadline(), now)
+            self.assertNotIn(BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME, disk.files)
+
+    def test_hash_size_and_deadline_limits_and_non_age_file_fail_before_receipt_write(self):
+        for limit, content, deadline in ((30, BACKUP.AGE_HEADER + b"large ciphertext", self.deadline()),
+                                         (100, b"not-an-age-header" * 3, self.deadline()),
+                                         (100, BACKUP.AGE_HEADER + b"ciphertext", BACKUP.Deadline(0, lambda: 1))):
+            disk, fs, name, path, digest, now = self.fixture()
+            disk.files[path] = content
+            disk.infos[path].st_size = len(content)
+            with disk.patched(), mock.patch.object(BACKUP, "MAX_SNAPSHOT_BYTES", limit):
+                with self.assertRaises(BACKUP.BackupError):
+                    fs.attest(BACKUP.Config.backups, name, hashlib.sha256(content).hexdigest(), deadline, now)
+            self.assertNotIn(BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME, disk.files)
+
+    def test_inode_replacement_between_check_and_open_rejected_without_reading(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        original = disk.open
+
+        def replace_before_open(candidate, flags, mode=0o600):
+            if candidate == path:
+                disk.infos[path].st_ino += 1
+            return original(candidate, flags, mode)
+
+        with disk.patched(), mock.patch.object(BACKUP.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(BACKUP.BackupError):
+                fs.snapshot_hash(BACKUP.Config.backups, name, self.deadline())
+        self.assertEqual(disk.read_sizes, [])
+
+    def test_atomic_receipt_write_failure_preserves_prior_receipt_and_all_snapshots(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        fresh_name = "link-vault-20300131T120000Z-bbbbbbbbbbbbbbbb.tar.age"
+        fresh_path = disk.add(fresh_name, BACKUP.AGE_HEADER + b"fresh ciphertext")
+        with disk.patched():
+            fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            old = disk.files[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME]
+            with mock.patch.object(BACKUP.os, "replace", side_effect=OSError(SECRET)):
+                with self.assertRaises(OSError):
+                    fs.attest(BACKUP.Config.backups, fresh_name, hashlib.sha256(disk.files[fresh_path]).hexdigest(), self.deadline(), now)
+        self.assertEqual(disk.files[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME], old)
+        self.assertIn(path, disk.files)
+        self.assertIn(fresh_path, disk.files)
+        self.assertFalse(any(".verification-" in path for path in disk.files))
+
 
 class RetentionTests(unittest.TestCase):
     def test_rotation_removes_only_old_completed_root_owned_regular_single_link_files(self):
-        names, entries = [], {}
+        disk, names = VerificationDisk(), []
         for index in range(10):
             name = "link-vault-20261007T120000Z-" + format(index, "016x") + ".tar.age"
             names.append(name)
-            entries[name] = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1,
-                                            st_mtime=index, st_dev=1, st_ino=index)
+            disk.add(name, BACKUP.AGE_HEADER + b"ciphertext")
         for name, mode, uid, links in (
-                ("other.tar.age", stat.S_IFREG, 0, 1),
-                (".incomplete-example.tar.age", stat.S_IFREG, 0, 1),
+                ("other.tar.age", stat.S_IFREG | 0o600, 0, 1),
+                (".incomplete-example.tar.age", stat.S_IFREG | 0o600, 0, 1),
+                ("link-vault-20260230T120000Z-dddddddddddddddd.tar.age", stat.S_IFREG | 0o600, 0, 1),
                 ("link-vault-20261007T120000Z-aaaaaaaaaaaaaaaa.tar.age", stat.S_IFLNK, 0, 1),
-                ("link-vault-20261007T120000Z-bbbbbbbbbbbbbbbb.tar.age", stat.S_IFREG, 1000, 1),
-                ("link-vault-20261007T120000Z-cccccccccccccccc.tar.age", stat.S_IFREG, 0, 2)):
-            names.append(name)
-            entries[name] = SimpleNamespace(st_mode=mode, st_uid=uid, st_nlink=links, st_mtime=-1, st_dev=1, st_ino=100)
-        with mock.patch.object(BACKUP.os, "listdir", return_value=names), \
-                mock.patch.object(BACKUP.os, "lstat", side_effect=lambda path: entries[os.path.basename(path)]), \
-                mock.patch.object(BACKUP.os, "unlink") as unlink:
-            BACKUP.Filesystem().rotate(BACKUP.Config.backups)
-        removed = {os.path.basename(call[0][0]) for call in unlink.call_args_list}
+                ("link-vault-20261007T120000Z-bbbbbbbbbbbbbbbb.tar.age", stat.S_IFREG | 0o600, 1000, 1),
+                ("link-vault-20261007T120000Z-cccccccccccccccc.tar.age", stat.S_IFREG | 0o600, 0, 2),
+                ("link-vault-20261007T120000Z-eeeeeeeeeeeeeeee.tar.age", stat.S_IFREG | 0o644, 0, 1)):
+            disk.add(name, b"user-data", mode=mode, uid=uid, links=links)
+        fs, deadline, now = BACKUP.Filesystem(), BACKUP.Deadline(100, lambda: 0), datetime.datetime(2026, 10, 8)
+        with disk.patched():
+            verified = BACKUP.Config.backups + "/" + names[-1]
+            receipt = fs.attest(BACKUP.Config.backups, names[-1], hashlib.sha256(disk.files[verified]).hexdigest(), deadline, now)
+            disk.removed.clear()
+            fs.rotate(BACKUP.Config.backups, receipt, deadline, now)
+        removed = {os.path.basename(path) for path in disk.removed}
         self.assertEqual(removed, set(names[:3]))
+
+    def test_age_boundary_and_unrecognized_data_are_not_an_exception_invention(self):
+        disk = VerificationDisk()
+        old = disk.add("link-vault-20300101T120000Z-aaaaaaaaaaaaaaaa.tar.age", BACKUP.AGE_HEADER + b"old")
+        fresh_name = "link-vault-20300101T120001Z-bbbbbbbbbbbbbbbb.tar.age"
+        fresh = disk.add(fresh_name, BACKUP.AGE_HEADER + b"fresh")
+        user = disk.add("my-verified.tar.age", SECRET.encode("ascii"))
+        fs, deadline, now = BACKUP.Filesystem(), BACKUP.Deadline(100, lambda: 0), datetime.datetime(2030, 1, 31, 12)
+        with disk.patched():
+            receipt = fs.attest(BACKUP.Config.backups, fresh_name, hashlib.sha256(disk.files[fresh]).hexdigest(), deadline, now)
+            disk.removed.clear()
+            fs.rotate(BACKUP.Config.backups, receipt, deadline, now)
+        self.assertEqual(disk.removed, [old])
+        self.assertIn(fresh, disk.files)
+        self.assertIn(user, disk.files)
+
+    def test_no_verification_receipt_preserves_all_eligible_snapshots_over_age_and_count_limits(self):
+        disk, fs = VerificationDisk(), BACKUP.Filesystem()
+        for index in range(10):
+            disk.add("link-vault-20290101T120000Z-" + format(index, "016x") + ".tar.age",
+                     BACKUP.AGE_HEADER + b"potentially recoverable but unverified")
+        disk.add("operator-data", SECRET.encode("ascii"))
+        before = dict(disk.files)
+        deadline, now = BACKUP.Deadline(100, lambda: 0), datetime.datetime(2030, 1, 31, 12)
+        with disk.patched():
+            self.assertIsNone(fs.recovery_receipt(BACKUP.Config.backups, deadline, now))
+            fs.rotate(BACKUP.Config.backups, None, deadline, now)
+            errors = io.StringIO()
+            BACKUP.Backup(filesystem=fs).recovery_status(errors, deadline, now)
+            self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_UNVERIFIED\n")
+        self.assertEqual(disk.files, before)
+        self.assertEqual(disk.removed, [])
+        self.assertNotIn(BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME, disk.files)
+
+    def test_count_and_age_pruning_preserve_exactly_last_verified_old_copy(self):
+        disk, fs = VerificationDisk(), BACKUP.Filesystem()
+        protected_name = "link-vault-20290101T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        protected = disk.add(protected_name, BACKUP.AGE_HEADER + b"independently verified")
+        other_old = disk.add("link-vault-20290102T120000Z-bbbbbbbbbbbbbbbb.tar.age", BACKUP.AGE_HEADER + b"unverified")
+        for index in range(10):
+            disk.add("link-vault-20300131T120000Z-" + format(index, "016x") + ".tar.age", BACKUP.AGE_HEADER + b"new but not verified")
+        now, deadline = datetime.datetime(2030, 1, 31, 12), BACKUP.Deadline(100, lambda: 0)
+        with disk.patched():
+            receipt = fs.attest(BACKUP.Config.backups, protected_name, hashlib.sha256(disk.files[protected]).hexdigest(), deadline, now)
+            disk.removed.clear()
+            fs.rotate(BACKUP.Config.backups, receipt, deadline, now)
+        self.assertIn(protected, disk.files)
+        self.assertNotIn(other_old, disk.files)
+        self.assertEqual(len([path for path in disk.files if BACKUP.OWNED_NAME.fullmatch(os.path.basename(path))]), 8)
+        self.assertEqual(json.loads(disk.files[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME]), receipt)
+
+    def test_pruning_rejects_receipt_hash_or_inode_change_before_any_deletion(self):
+        for field in ("ciphertext", "inode"):
+            disk, fs = VerificationDisk(), BACKUP.Filesystem()
+            name = "link-vault-20290101T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+            path = disk.add(name, BACKUP.AGE_HEADER + b"verified")
+            disk.add("link-vault-20290102T120000Z-bbbbbbbbbbbbbbbb.tar.age", BACKUP.AGE_HEADER + b"old")
+            now, deadline = datetime.datetime(2030, 1, 31, 12), BACKUP.Deadline(100, lambda: 0)
+            with disk.patched():
+                receipt = fs.attest(BACKUP.Config.backups, name, hashlib.sha256(disk.files[path]).hexdigest(), deadline, now)
+                disk.removed.clear()
+                if field == "ciphertext":
+                    disk.files[path] = BACKUP.AGE_HEADER + b"tampered"
+                else:
+                    disk.infos[path].st_ino += 1
+                with self.assertRaises(BACKUP.BackupError):
+                    fs.rotate(BACKUP.Config.backups, receipt, deadline, now)
+            self.assertEqual(disk.removed, [])
+
+    def test_pruning_entry_limit_and_deadline_fail_before_deleting(self):
+        disk, fs = VerificationDisk(), BACKUP.Filesystem()
+        name = "link-vault-20290101T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        path = disk.add(name, BACKUP.AGE_HEADER + b"old")
+        for index in range(3):
+            disk.add("user-file-" + str(index), b"user")
+        now = datetime.datetime(2030, 1, 31)
+        with disk.patched():
+            receipt = fs.attest(BACKUP.Config.backups, name, hashlib.sha256(disk.files[path]).hexdigest(), BACKUP.Deadline(100, lambda: 0), now)
+            disk.removed.clear()
+        for deadline, limit in ((BACKUP.Deadline(100, lambda: 0), 2), (BACKUP.Deadline(0, lambda: 1), 10000)):
+            with disk.patched(), mock.patch.object(BACKUP, "MAX_BACKUP_ENTRIES", limit):
+                with self.assertRaises(BACKUP.BackupError):
+                    fs.rotate(BACKUP.Config.backups, receipt, deadline, now)
+            self.assertEqual(disk.removed, [])
 
     def test_symlink_source_is_rejected_without_opening_target(self):
         def info(path):

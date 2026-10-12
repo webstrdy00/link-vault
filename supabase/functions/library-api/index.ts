@@ -29,6 +29,13 @@ import {
   type MaintenanceGateway,
   runDeletionBatch,
 } from "./deletion-worker.ts";
+import {
+  createProductionWebAccountDeletionService,
+  createWebAccountDeletionHandler,
+  isWebAccountDeletionPath,
+  type WebAccountDeletionService,
+  type WebAccountGateway,
+} from "./web-account-deletion.ts";
 
 const supabaseUrl = requiredEnv("SUPABASE_URL");
 const supabaseAnonKey = requiredEnv("SUPABASE_ANON_KEY");
@@ -328,6 +335,14 @@ const accountDeletionGateway: AccountDeletionGateway = {
 
 const accountDeletionService = createAccountDeletionService();
 
+const webAccountGateway: WebAccountGateway = {
+  async rpc(name, args) {
+    const { data, error } = await serviceClient.rpc(name, args)
+      .abortSignal(AbortSignal.timeout(10000));
+    return accountDeletionRpcResult(data, error);
+  },
+};
+
 const maintenanceGateway: MaintenanceGateway = {
   ...gateway,
 
@@ -500,6 +515,10 @@ const publicHandler = createHandler(
   scheduleBackgroundWork,
   accountDeletionService,
 );
+const webAccountHandler = createWebAccountDeletionHandler(
+  createWebAccountDeletionService(),
+  scheduleBackgroundWork,
+);
 const classificationHandler = createClassificationHandler(
   classificationGateway,
   supabaseServiceRoleKey,
@@ -519,6 +538,9 @@ const maintenanceHandler = createMaintenanceHandler(
 
 Deno.serve((request) => {
   const pathname = new URL(request.url).pathname;
+  if (isWebAccountDeletionPath(pathname)) {
+    return webAccountHandler(request);
+  }
   if (isInternalClassificationPath(pathname)) {
     return classificationHandler(request);
   }
@@ -556,6 +578,19 @@ function createAccountDeletionService(): AccountDeletionService | undefined {
   try {
     return createProductionAccountDeletionService(
       accountDeletionGateway,
+      supabaseServiceRoleKey,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function createWebAccountDeletionService():
+  | WebAccountDeletionService
+  | undefined {
+  try {
+    return createProductionWebAccountDeletionService(
+      webAccountGateway,
       supabaseServiceRoleKey,
     );
   } catch {

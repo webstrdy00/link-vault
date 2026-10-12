@@ -67,3 +67,10 @@ test("deletion notice does not equate an email with authenticated deletion", () 
   assert.match(html, /최대 30일 순환을 목표/);
   assert.match(html, /Google 계정 자체를 삭제하는 절차는 아닙니다/);
 });
+test("privacy notice distinguishes conditional cleanup from a maximum retention promise", () => {
+  const html = readFileSync(resolve(root, "privacy/index.html"), "utf8");
+  assert.match(html, /내보내기 확인이 필요합니다/);
+  assert.match(html, /확인되지 않으면 더 오래 보관될 수 있습니다/);
+  assert.match(html, /진행 중인 계정 삭제 작업은 기간만으로 삭제하지 않습니다/);
+  assert.match(html, /최대 보관 기간이 아닙니다/);
+});

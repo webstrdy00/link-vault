@@ -51,6 +51,24 @@ function scalar(source, key) {
   return unquote(block(source, key).split("\n")[0].split(/:(.*)/s)[1]);
 }
 
+function serviceLogging(compose, service, anchorKey, anchor) {
+  const logging = block(block(block(compose, "services"), service), "logging");
+  const reference = scalar(logging, "logging");
+  if (!reference) return logging;
+  assert.equal(
+    reference,
+    `*${anchor}`,
+    `${service} must reference its overlay's logging anchor`,
+  );
+  const definition = block(compose, anchorKey);
+  assert.equal(
+    scalar(definition, anchorKey),
+    `&${anchor}`,
+    `${service} logging anchor must be defined in the same overlay`,
+  );
+  return definition;
+}
+
 function actionSteps(action) {
   return workflow.split(/(?=^ *- +(?:name|uses|run|id):)/m).filter((step) => {
     const use = step.match(/^ *(?:- +)?uses: +([^\s]+)/m);
@@ -339,6 +357,42 @@ test("public deployment passes the same required Google audience to auth and fun
   );
   assert.equal(scalar(auth, "GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID"), audience);
   assert.doesNotMatch(functions, /GOOGLE_CLIENT_SECRET/);
+});
+
+test("deployment rotates each relevant service's json-file logs by size, not elapsed days", () => {
+  for (
+    const [file, anchorKey, anchor, services] of [
+      [
+        "compose.private.yml",
+        "x-private-logging",
+        "private-container-logging",
+        ["db", "auth", "functions", "api-gw", "storage", "studio", "meta", "imgproxy"],
+      ],
+      [
+        "compose.public.yml",
+        "x-public-logging",
+        "public-gateway-logging",
+        ["public-gateway"],
+      ],
+    ]
+  ) {
+    const compose = readFileSync(
+      new URL(`../deployment/${file}`, import.meta.url),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    assert.equal(scalar(compose, anchorKey), `&${anchor}`);
+    for (const service of services) {
+      const logging = serviceLogging(compose, service, anchorKey, anchor);
+      assert.equal(scalar(logging, "driver"), "json-file", `${file}: ${service}`);
+      const options = block(logging, "options");
+      const entries = [...options.matchAll(/^ +([\w-]+): *([^\n]+)/gm)]
+        .map((match) => [match[1], unquote(match[2])]);
+      assert.deepEqual(entries.sort(), [
+        ["max-file", "3"],
+        ["max-size", "10m"],
+      ], `${file}: ${service} requires size/file limits, not time retention`);
+    }
+  }
 });
 
 test("CI runs ordinary PRs and supports a credential-free reusable call", () => {

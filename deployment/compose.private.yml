@@ -1,15 +1,35 @@
 # Layer over Supabase self-hosted/v0.8.2 (564eab8ad7840b13324f68b1bfac074ef8d51c21).
 # Keep the upstream .env and Vault master key outside Git.
+# Size-based rotation only; age-based retention requires a separate policy.
+x-private-logging: &private-container-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 services:
   api-gw:
+    logging: *private-container-logging
     ports: !override
       - 127.0.0.1:8000:8000/tcp
+  auth:
+    logging: *private-container-logging
+  functions:
+    logging: *private-container-logging
+  storage:
+    logging: *private-container-logging
+  studio:
+    logging: *private-container-logging
+  meta:
+    logging: *private-container-logging
+  imgproxy:
+    logging: *private-container-logging
   realtime:
     profiles: [optional]
   supavisor:
     profiles: [optional]
     ports: !reset []
   db:
+    logging: *private-container-logging
     command:
       - postgres
       - -c

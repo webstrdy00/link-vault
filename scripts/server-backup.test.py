@@ -200,6 +200,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue(all(item["image_id"].startswith("sha256:") and item["repo_digests"] for item in filesystem.manifest["containers"]))
         self.assertIn("pgsodium_root.key", filesystem.manifest["restore_instructions"])
         self.assertIn("--numeric-owner --same-owner --same-permissions", filesystem.manifest["restore_instructions"])
+        self.assertIn("including deletions requested after capture", filesystem.manifest["restore_instructions"])
+        self.assertIn("MUST block service restoration", filesystem.manifest["restore_instructions"])
+        self.assertIn("Keep application traffic and cron/worker writers disabled", filesystem.manifest["restore_instructions"])
         self.assertEqual(filesystem.manifest["postgresql_custom_key_metadata"], {"uid": 100, "gid": 101, "mode": 0o600})
         commands = [item[0] for item in runner.calls]
         stop = next(index for index, cmd in enumerate(commands) if cmd[:3] == ["docker", "compose", "stop"])

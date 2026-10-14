@@ -1,4 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">LinkFileBox</string>
+    <string name="privacy_title">개인정보 안내</string>
+    <string name="privacy_back">뒤로</string>
+    <string name="privacy_status">검토 중인 안내이며, 확정 개인정보 처리방침이 아닙니다.</string>
+    <string name="privacy_operator_title">운영자·문의</string>
+    <string name="privacy_operator">개인 개발자가 운영합니다. 공개 운영자명: LinkFileBox 운영자\n문의: support@linkfilebox.com</string>
+    <string name="privacy_data_title">처리하는 정보와 목적</string>
+    <string name="privacy_data">Google 로그인 식별정보·이메일·승인 상태: 인증·접근 제어. Google 계정 비밀번호는 앱에 입력받지 않습니다.\nURL·제목·메모·분류·링크 메타정보: 보관·검색·분류.\n직접 선택한 이미지(항목당 1장)·OCR 결과: 보관·검색. OCR은 기기에서 실행되지만 이미지와 결과는 서버에 업로드됩니다.\n기기에 로그인 세션·전송 대기 요청·임시 작성 내용·보관함 캐시를 저장합니다.\n문의 이메일·요청 내용과 삭제 처리 기록: 문의·삭제 요청 확인.</string>
+    <string name="privacy_data_warning">불필요한 민감정보나 다른 사람의 개인정보를 저장하지 마세요.</string>
+    <string name="privacy_providers_title">외부 서비스</string>
+    <string name="privacy_providers">Google: 로그인·기기 내 ML Kit OCR.\n자체 운영 Supabase: 계정·DB·비공개 이미지·API(AI Testbed 제공 NCP 서버).\nCloudflare: 도메인·API 네트워크 처리·문의 메일 전달.\nGmail: 문의 메일 확인.\nGitHub Actions: 운영 자동화·암호화 백업 아티팩트.</string>
+    <string name="privacy_retention_title">보관과 삭제</string>
+    <string name="privacy_deletion">계정 탈퇴는 되돌릴 수 없으며 LinkFileBox 계정·보관 자료의 삭제를 요청합니다. Google 계정은 삭제되지 않습니다. 로그아웃은 서버 계정·자료를 삭제하지 않습니다.</string>
+    <string name="privacy_retention_targets">운영 자료 정리는 72시간 이내, 운영 백업은 최대 30일 순환을 목표로 합니다. 모든 사본의 삭제나 완료 시각을 보장하지 않습니다.</string>
+    <string name="privacy_retention_records">완료된 첨부 정리 기록·웹 탈퇴 조회 연결은 완료 후 30일 경과 시 정리 대상입니다. 항목 삭제 표식·완료된 계정 삭제 작업은 30일 경과와 삭제 기록 내보내기 확인이 필요합니다. 삭제 원장은 연결된 삭제 기록 정리와 내보내기 확인 후 정리 대상입니다. 미확인·진행 중인 기록은 더 오래 남을 수 있습니다.\nAPI 요청 기록은 7일, 빈도 제한 기록은 1일 경과 후 정리 대상입니다. 이 조건은 실제 삭제 완료 기한이 아닙니다.</string>
+    <string name="privacy_retention_backups">서버 백업은 복원 검증 증거가 있을 때 30일 이내·최근 7개로 순환하며, 마지막 검증 복구본과 필요한 삭제 원장은 예외 보존합니다. 현재 검증 증거가 없어 기존 서버 스냅샷을 자동 정리하지 않습니다. GitHub 아티팩트는 30일 보관 설정이며, 별도 복사본에는 이 기준이 일괄 적용되지 않습니다. 복원 시 삭제 요청을 다시 반영해야 합니다.</string>
+    <string name="privacy_requests_title">열람·정정·삭제 요청</string>
+    <string name="privacy_requests">보관함에서 항목을 수정·삭제하거나 계정 화면에서 탈퇴를 요청하세요. 접근이 어려우면 support@linkfilebox.com으로 요청 내용을 보내세요. 이메일 접수만으로 처리가 완료되지는 않으며 본인 확인이 필요합니다. 비밀번호·인증 코드·토큰·신분증 사본은 보내지 마세요.</string>
+    <string name="privacy_unresolved_title">미확정 항목</string>
+    <string name="privacy_unresolved">외부 처리 계약·처리 지역·국외 이전 여부와 필요한 고지·동의, 전체 인증 정보·운영 로그 수집 범위, 문의·감사·삭제 기록과 모든 백업의 최종 보관·파기 정책, 운영자·담당자 표시와 권리 요청 절차·처리 근거·분쟁 구제 안내는 미확정입니다. 이 안내는 법적 적합성을 보증하지 않습니다.</string>
+    <string name="privacy_web_link">웹 개인정보 안내</string>
+    <string name="privacy_deletion_link">웹 계정 탈퇴 안내</string>
 </resources>

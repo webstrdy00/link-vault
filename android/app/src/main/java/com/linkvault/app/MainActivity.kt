@@ -72,6 +72,7 @@ import com.linkvault.app.capture.CaptureInput
 import com.linkvault.app.capture.InvalidUrlReason
 import com.linkvault.app.discovery.DiscoveryScreen
 import com.linkvault.app.library.LibraryScreen
+import com.linkvault.app.privacy.PrivacyScreen
 import com.linkvault.app.ui.VaultTheme
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -166,6 +167,7 @@ class MainActivity : ComponentActivity() {
         val selectedRoot = RootDestination.entries[selectedRootOrdinal]
         var showCapture by rememberSaveable { mutableStateOf(capture.isExternalShare) }
         var saveFlowActive by rememberSaveable { mutableStateOf(false) }
+        var showPrivacy by rememberSaveable { mutableStateOf(false) }
         var discoveryItemId by rememberSaveable { mutableStateOf<String?>(null) }
         var rootLibraryEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
         var saveEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
@@ -200,6 +202,7 @@ class MainActivity : ComponentActivity() {
         fun openRoot(destination: RootDestination) {
             showCapture = false
             saveFlowActive = false
+            showPrivacy = false
             discoveryItemId = null
             selectedRootOrdinal = destination.ordinal
         }
@@ -265,6 +268,7 @@ class MainActivity : ComponentActivity() {
                 selectedSharedImageIndex = if (capture.imageUris.size == 1) 0 else null
                 if (capture.isExternalShare) {
                     saveFlowActive = false
+                    showPrivacy = false
                     discoveryItemId = null
                     showCapture = true
                 }
@@ -306,18 +310,20 @@ class MainActivity : ComponentActivity() {
             saveUrl = url
             saveSharedText = sharedText
             showCapture = false
+            showPrivacy = false
             discoveryItemId = null
             saveFlowActive = true
         }
 
         val openCapture: () -> Unit = {
             saveFlowActive = false
+            showPrivacy = false
             discoveryItemId = null
             showCapture = true
         }
         Scaffold(
             floatingActionButton = {
-                if (!showCapture && !saveFlowActive && discoveryItemId == null &&
+                if (!showCapture && !saveFlowActive && !showPrivacy && discoveryItemId == null &&
                     selectedRoot != RootDestination.LIBRARY
                 ) {
                     FloatingActionButton(
@@ -333,7 +339,9 @@ class MainActivity : ComponentActivity() {
             },
             bottomBar = {
                 Column {
-                    if (!showCapture && !saveFlowActive && discoveryItemId == null && hasCaptureDraft) {
+                    if (!showCapture && !saveFlowActive && !showPrivacy &&
+                        discoveryItemId == null && hasCaptureDraft
+                    ) {
                         DraftResumeBar(onResume = { showCapture = true })
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -507,11 +515,19 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                    else -> AccountScreen(
-                        client = app.accountClient,
-                        outbox = app.outboxRepository,
-                        onBack = { openRoot(RootDestination.LIBRARY) },
-                    )
+                    else -> if (showPrivacy) {
+                        PrivacyScreen(
+                            onBack = { showPrivacy = false },
+                            onOpenExternalUrl = openFromLibrary,
+                        )
+                    } else {
+                        AccountScreen(
+                            client = app.accountClient,
+                            outbox = app.outboxRepository,
+                            onBack = { openRoot(RootDestination.LIBRARY) },
+                            onOpenPrivacy = { showPrivacy = true },
+                        )
+                    }
                 }
             }
         }

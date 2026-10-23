@@ -19,6 +19,33 @@ function sectionText(html, heading) {
   assert.ok(section, `Missing section: ${heading}`);
   return textContent(section[1]);
 }
+test("offline app notice preserves the canonical deletion and recovery limitations", () => {
+  const xml = readFileSync(
+    new URL("../android/app/src/main/res/values/strings.xml", import.meta.url),
+    "utf8",
+  );
+  const strings = new Map(
+    [...xml.matchAll(/<string name="([^"]+)">([\s\S]*?)<\/string>/g)]
+      .map((match) => [match[1], match[2]]),
+  );
+  const value = (name) => {
+    assert.ok(strings.has(name), `Missing native privacy text: ${name}`);
+    return strings.get(name);
+  };
+  assert.match(value("privacy_status"), /확정 개인정보 처리방침이 아닙니다/);
+  assert.match(value("privacy_operator"), /support@linkfilebox\.com/);
+  assert.match(value("privacy_data"), /이미지와 결과는 서버에 업로드/);
+  assert.match(value("privacy_deletion"), /Google 계정은 삭제되지 않습니다/);
+  assert.match(value("privacy_retention_targets"), /보장하지 않습니다/);
+  assert.match(value("privacy_retention_records"), /내보내기 확인/);
+  assert.match(value("privacy_retention_backups"), /검증 증거가 있을 때/);
+  assert.match(value("privacy_retention_backups"), /자동 정리하지 않습니다/);
+  assert.match(value("privacy_retention_backups"), /삭제 요청을 다시 반영/);
+  assert.match(value("privacy_requests"), /본인 확인이 필요/);
+  const notice = [...strings].filter(([name]) => name.startsWith("privacy_"))
+    .map(([, text]) => text).join("\n");
+  assert.doesNotMatch(notice, /[A-Z0-9._%+-]+@gmail\.com/i);
+});
 for (const name of pages) {
   const file = resolve(root, name);
   const html = readFileSync(file, "utf8");
@@ -131,7 +158,10 @@ test("web deletion keeps opt-in consent and a separate final submission", () => 
   assert.match(consent, /type="checkbox"/);
   assert.match(consent, /aria-describedby="account-consent-note"/);
   assert.doesNotMatch(consent, /\bchecked(?:\s|=|>)/);
-  assert.match(html, /id="account-consent-note"[^>]*>[\s\S]*?되돌릴 수 없습니다/);
+  assert.match(
+    html,
+    /id="account-consent-note"[^>]*>[\s\S]*?되돌릴 수 없습니다/,
+  );
   assert.match(html, /id="account-send"[^>]*\bhidden\b[^>]*\bdisabled\b/);
   assert.match(html, /id="account-start-status"[^>]*type="button"/);
   const web = sectionText(html, /앱에 접근할 수 없을 때/);
@@ -148,7 +178,10 @@ test("web deletion distinguishes uncertain submission and in-progress work from 
   assert.match(web, /오류·접수·처리 중[^.]*완료가 아니/);
   assert.match(web, /새 Google 인증[^.]*진행 상태/);
   assert.match(web, /취소[^.]*요청을 철회하지 않습니다/);
-  assert.match(html, /id="account-message"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(
+    html,
+    /id="account-message"[^>]*role="status"[^>]*aria-live="polite"/,
+  );
   assert.match(html, /id="account-result"\s+hidden/);
 });
 test("retention targets are not maximums and unverified server snapshots remain preserved", () => {
@@ -167,7 +200,10 @@ test("retention targets are not maximums and unverified server snapshots remain 
     assert.match(text, /최근 7개·30일 기준/);
     assert.match(text, /검증 증거가 없어[^.]*스냅샷을 모두 보존/);
   }
-  assert.match(retention, /마지막 검증 복구본[^.]*삭제 원장[^.]*예외 보존[^.]*운영 경고/);
+  assert.match(
+    retention,
+    /마지막 검증 복구본[^.]*삭제 원장[^.]*예외 보존[^.]*운영 경고/,
+  );
   assert.match(retention, /복원할 때도[^.]*삭제 요청[^.]*다시 적용/);
   assert.match(retention, /파일 생성·암호화[^.]*복원 검증이 되지는 않습니다/);
 });
@@ -179,9 +215,15 @@ test("record cleanup and web status expiry are conditional, not deletion guarant
   assert.match(retention, /API 요청 기록: 7일/);
   assert.match(retention, /요청 빈도 제한 기록: 1일/);
   assert.match(retention, /첨부 정리 기록: 완료 후 30일/);
-  assert.match(retention, /삭제 표식·완료된 계정 삭제 작업: 30일[^.]*내보내기 확인/);
+  assert.match(
+    retention,
+    /삭제 표식·완료된 계정 삭제 작업: 30일[^.]*내보내기 확인/,
+  );
   assert.match(retention, /확인되지 않으면 더 오래 보관/);
-  assert.match(retention, /진행 중인 계정 삭제 작업[^.]*기간만으로 삭제하지 않습니다/);
+  assert.match(
+    retention,
+    /진행 중인 계정 삭제 작업[^.]*기간만으로 삭제하지 않습니다/,
+  );
   assert.match(requests, /해시값[^.]*삭제 작업/);
   assert.match(requests, /웹 재인증 토큰[^.]*서버에 저장하지 않습니다/);
   assert.match(requests, /완료 후 30일[^.]*조회 연결[^.]*정리 대상/);
@@ -201,7 +243,10 @@ test("policy remains canonical and unresolved policy details stay gated, not dep
   assert.match(unresolved, /시행일/);
   for (const name of pages) {
     const html = readFileSync(resolve(root, name), "utf8");
-    assert.doesNotMatch(html, /웹 공개 설정과 실제 Google 연동 인수[^.]*완료되지/);
+    assert.doesNotMatch(
+      html,
+      /웹 공개 설정과 실제 Google 연동 인수[^.]*완료되지/,
+    );
     assert.doesNotMatch(html, /공개 설정이 활성화된 경우에만/);
     assert.doesNotMatch(html, /기본 브랜치 반영 전/);
   }

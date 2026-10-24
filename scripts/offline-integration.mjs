@@ -12,13 +12,13 @@ const serial = devices.match(/^(emulator-\d+)\s+device$/m)?.[1];
 assert.ok(serial, "An emulator is required; physical devices are not targeted");
 const email = `offline-${randomUUID()}@example.test`;
 const password = `Local-offline-${randomUUID()}`;
-const url = `https://example.com/offline-${randomUUID()}`;
+const url = `https://example.invalid/offline-${randomUUID()}`;
 let userId;
 let token;
 const adb = (...args) =>
   execFileSync("adb", ["-s", serial, ...args], {
     encoding: "utf8",
-    timeout: 90000,
+    timeout: args.includes("instrument") ? 300000 : 90000,
   });
 async function screenXml() {
   let result = "";
@@ -122,7 +122,7 @@ try {
   const seeded = await api("/functions/v1/library-api/v1/items", {
     method: "POST",
     body: {
-      url: "https://example.com/online-cache",
+      url: "https://example.invalid/online-cache",
       title: "온라인 캐시 기준",
     },
     headers: { "X-Request-Id": randomUUID() },
@@ -177,7 +177,7 @@ try {
   );
   adb("shell", "am", "force-stop", "com.linkvault.app");
   adb("shell", "am", "start", "-W", "-n", "com.linkvault.app/.MainActivity");
-  tapText(await screenXml(), "회원 계정");
+  tapText(await screenXml(), "설정");
   const recoveryDeadline = Date.now() + 45000;
   let recoveryScreen = "";
   while (Date.now() < recoveryDeadline) {

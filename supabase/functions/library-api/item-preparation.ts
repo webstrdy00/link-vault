@@ -1,4 +1,5 @@
 import rules from "./rules.json" with { type: "json" };
+import { isMetadataUrlEligible } from "./metadata-url.ts";
 
 export interface ItemPreparationInput {
   url: string;
@@ -126,7 +127,6 @@ export const topicFields: TopicField[] = [
   "body",
   "ocr",
 ];
-const metadataHosts = new Set(["blog.naver.com", "m.blog.naver.com"]);
 
 export class InvalidItemUrlError extends Error {}
 
@@ -134,8 +134,7 @@ export async function prepareItem(
   body: ItemPreparationInput,
 ): Promise<PreparedItem> {
   const { normalizedUrl, parsed } = normalizeUrl(body.url);
-  const metadataAllowed = parsed.protocol === "https:" &&
-    parsed.port === "" && metadataHosts.has(parsed.hostname);
+  const metadataAllowed = isMetadataUrlEligible(body.url);
   const indexItem: IndexItem = {
     user_title: body.title,
     fetched_title: "",
@@ -170,8 +169,7 @@ export async function prepareItemUpdate(
   selectedCategories: ItemCategoryReference[],
 ): Promise<PreparedItemUpdate> {
   const { normalizedUrl, parsed } = normalizeUrl(snapshot.url);
-  const metadataAllowed = parsed.protocol === "https:" &&
-    parsed.port === "" && metadataHosts.has(parsed.hostname);
+  const metadataAllowed = isMetadataUrlEligible(snapshot.url);
   const userTitle = Object.hasOwn(body, "title")
     ? body.title
     : snapshot.user_title;
@@ -498,7 +496,7 @@ function sourceFor(hostname: string): PreparedItem["source"] {
   ) {
     return "threads";
   }
-  if (metadataHosts.has(hostname)) {
+  if (hostname === "blog.naver.com" || hostname === "m.blog.naver.com") {
     return "naver_blog";
   }
   return "other";

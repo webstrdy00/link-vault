@@ -109,13 +109,22 @@ internal data class AttachmentUiState(
         get() = canMutateActiveAsset && item.activeAsset != null && item.ocrState == "failed"
 
     val supportsMetadataRetry: Boolean
-        get() = item.version != null &&
-            (item.metadataState == "partial" || item.metadataState == "failed") &&
-            item.extractionMeta.errorCode?.let(RETRYABLE_METADATA_ERRORS::contains) == true
+        get() = item.version != null && when (item.metadataState) {
+            "unsupported" -> true
+            "partial", "failed" ->
+                item.extractionMeta.errorCode?.let(RETRYABLE_METADATA_ERRORS::contains) == true
+            else -> false
+        }
 
     val canRetryMetadata: Boolean
         get() = canMutateActiveAsset && supportsMetadataRetry
 }
+
+internal val LibraryItemDetail.isMetadataProcessing: Boolean
+    get() = metadataState == "queued" || metadataState == "running"
+
+internal val LibraryItemDetail.hasPendingEnrichment: Boolean
+    get() = isMetadataProcessing || classificationState == "pending"
 
 internal class AttachmentViewModel(
     private val client: AccountClient,
@@ -211,7 +220,7 @@ internal class AttachmentViewModel(
         if (awaitingDeletedAssetId != null && activeId != awaitingDeletedAssetId) {
             awaitingDeletedAssetId = null
         }
-        if (awaitingMetadata && item.metadataState != "pending") awaitingMetadata = false
+        if (awaitingMetadata && !item.isMetadataProcessing) awaitingMetadata = false
         val deleteConfirmation = mutableUiState.value.deleteConfirmation?.takeIf {
             activeId == it.assetId
         }
@@ -903,7 +912,13 @@ internal class AttachmentViewModel(
                     }
                     outbox.cacheDetail(boundOwner, response)
                     if (!visible || !identityMatches()) return@launch
+                    val previousItem = mutableUiState.value.item
                     updateItem(latest)
+                    if (mutableUiState.value.item != previousItem) {
+                        mutableUiState.value = mutableUiState.value.copy(
+                            refreshGeneration = mutableUiState.value.refreshGeneration + 1L,
+                        )
+                    }
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: AccountAuthenticationRequiredException) {
@@ -921,7 +936,7 @@ internal class AttachmentViewModel(
         }
     }
 
-    private fun shouldPoll(): Boolean = mutableUiState.value.item.metadataState == "pending" ||
+    private fun shouldPoll(): Boolean = mutableUiState.value.item.hasPendingEnrichment ||
         awaitingMetadata || awaitingAssetId != null || awaitingDeletedAssetId != null
 
     private fun loadPreviewIfNeeded() {
@@ -1053,7 +1068,7 @@ internal class AttachmentViewModel(
 
     companion object {
         private const val POLL_INTERVAL_MILLIS = 5_000L
-        private const val POLL_DURATION_MILLIS = 60_000L
+        private const val POLL_DURATION_MILLIS = 180_000L
         private const val NANOS_PER_MILLISECOND = 1_000_000L
 
         fun factory(

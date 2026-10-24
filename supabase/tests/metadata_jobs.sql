@@ -248,8 +248,8 @@ as $$
     'metadata_state', p_state,
     'extraction_meta', pg_catalog.jsonb_strip_nulls(
       pg_catalog.jsonb_build_object(
-        'adapter_version', 'naver-v1',
-        'final_url', 'https://blog.naver.com/final',
+        'adapter_version', 'html-v1',
+        'final_url', 'https://example.com/final',
         'title_truncated', false,
         'description_truncated', false,
         'body_truncated', false,
@@ -350,15 +350,66 @@ select ok(
   'only service_role can invoke metadata transactions or inspect their internal rows'
 );
 
-select ok(
-  private.metadata_url_allowed('https://blog.naver.com/post')
-  and private.metadata_url_allowed('HTTPS://M.BLOG.NAVER.COM:443/post')
-  and not private.metadata_url_allowed('http://blog.naver.com/post')
-  and not private.metadata_url_allowed('https://blog.naver.com:444/post')
-  and not private.metadata_url_allowed('https://evil.blog.naver.com/post')
-  and not private.metadata_url_allowed('https://www.instagram.com/post'),
-  'only exact verified Naver hosts over HTTPS port 443 are metadata eligible'
-);
+select is(
+  private.metadata_url_allowed(candidate.url),
+  candidate.allowed,
+  'metadata URL eligibility: ' || coalesce(candidate.url, '<null>')
+)
+from (values
+  ('https://blog.naver.com/post', true),
+  ('HTTPS://M.BLOG.NAVER.COM:443/post', true),
+  ('http://blog.naver.com:80/post', true),
+  ('https://example.com/post?source=share#section', true),
+  ('http://example.com/post', true),
+  ('https://www.instagram.com/post', true),
+  ('https://www.threads.net/@example/post', true),
+  ('https://xn--bcher-kva.de/post', true),
+  ('https://example.com:444/post', false),
+  ('http://example.com:443/post', false),
+  ('https://example.com:80/post', false),
+  ('https://example.com:0443/post', false),
+  ('https://example.com:/post', false),
+  ('ftp://example.com/post', false),
+  ('https://user:password@example.com/post', false),
+  ('https://@example.com/post', false),
+  ('https://127.0.0.1/post', false),
+  ('https://8.8.8.8/post', false),
+  ('https://[::1]/post', false),
+  ('https://[2606:4700:4700::1111]/post', false),
+  ('https://2130706433/post', false),
+  ('https://0x7f.0.0.1/post', false),
+  ('https://0x7f.0x0.0x0.0x1/post', false),
+  ('https://example.0x/post', false),
+  ('https://localhost/post', false),
+  ('https://service.localhost/post', false),
+  ('https://service.local/post', false),
+  ('https://service.localdomain/post', false),
+  ('https://service.internal/post', false),
+  ('https://service.home/post', false),
+  ('https://home.arpa/post', false),
+  ('https://service.home.arpa/post', false),
+  ('https://service.lan/post', false),
+  ('https://service.test/post', false),
+  ('https://service.invalid/post', false),
+  ('https://service.example/post', false),
+  ('https://service.onion/post', false),
+  ('https://singlelabel/post', false),
+  ('https://example.com./post', false),
+  ('https://bad_label.example.com/post', false),
+  ('https://-bad.example.com/post', false),
+  ('https://bad-.example.com/post', false),
+  ('https://%65xample.com/post', false),
+  ('https://bücher.de/post', false),
+  ('https://K.example.com/post', false),
+  (' https://example.com/post', false),
+  ('https://example.com/a b', false),
+  ('https://example.com/' || pg_catalog.chr(10) || 'post', false),
+  ('https://example.com/' || pg_catalog.chr(92) || 'post', false),
+  ('https://' || pg_catalog.repeat('a', 64) || '.com/post', false),
+  ('https://example.com/' || pg_catalog.repeat('a', 4096), false),
+  ('', false),
+  (null, false)
+) as candidate(url, allowed);
 
 select ok(
   private.valid_metadata_result(
@@ -392,6 +443,17 @@ select ok(
 );
 
 select ok(
+  not private.valid_metadata_result(
+    pg_catalog.jsonb_set(
+      pg_temp.metadata_result('title', null, null),
+      '{extraction_meta,final_url}',
+      '"https://metadata.invalid/redirect"'::jsonb
+    )
+  ),
+  'metadata completion rejects a blocked final URL even with otherwise valid fields'
+);
+
+select ok(
   private.metadata_error_retryable('METADATA_TIMEOUT')
   and private.metadata_error_retryable('NETWORK_ERROR')
   and private.metadata_error_retryable('RATE_LIMITED')
@@ -420,7 +482,8 @@ select ok(
 
 select pg_temp.seed_metadata_item(
   '54000000-0000-0000-0000-000000000001',
-  '64000000-0000-0000-0000-000000000001'
+  '64000000-0000-0000-0000-000000000001',
+  p_url => 'https://example.com/post'
 );
 insert into metadata_receipts (label, payload)
 values ('lease-a', public.library_claim_metadata_jobs(1));
@@ -518,6 +581,9 @@ select ok(
     select fetched_title = 'new title'
       and description = 'new description'
       and body_text = 'new body'
+      and user_title = '사용자 제목'
+      and note = '사용자 메모'
+      and shared_text = '공유 원문'
       and metadata_state = 'ready'
       and text_revision = 2
       and version = 3
@@ -536,8 +602,16 @@ select ok(
     select state = 'succeeded' and attempts = 2
     from public.processing_jobs
     where id = '64000000-0000-0000-0000-000000000001'
+  )
+  and (
+    select count(*) = 1
+    from public.processing_jobs
+    where item_id = '54000000-0000-0000-0000-000000000001'
+      and kind = 'classify'
+      and target_revision = 2
+      and state = 'queued'
   ),
-  'the current lease atomically advances bounded raw fields index revision version and job state'
+  'generic metadata advances fields and index revision, preserves user text, and queues current-revision classification'
 );
 
 select is(
@@ -677,7 +751,7 @@ select pg_temp.seed_metadata_item(
   '54000000-0000-0000-0000-000000000004',
   '64000000-0000-0000-0000-000000000004',
   '14000000-0000-0000-0000-000000000001',
-  null,
+  'https://www.threads.net/@example/post',
   1,
   1,
   'queued',
@@ -777,7 +851,7 @@ select pg_temp.seed_metadata_item(
   '54000000-0000-0000-0000-000000000006',
   '64000000-0000-0000-0000-000000000006',
   '14000000-0000-0000-0000-000000000001',
-  'https://www.instagram.com/p/unsupported'
+  'https://metadata.invalid/unsupported'
 );
 select is(
   pg_catalog.jsonb_array_length(public.library_claim_metadata_jobs(1) -> 'jobs'),
@@ -801,6 +875,21 @@ select ok(
     where operation = 'metadata_fetch:54000000-0000-0000-0000-000000000006'
   ),
   'unsupported jobs terminate without consuming external-fetch budget or looping'
+);
+
+select throws_ok(
+  $$select public.library_retry_metadata(
+    '14000000-0000-0000-0000-000000000001',
+    '74000000-0000-0000-0000-000000000106',
+    '54000000-0000-0000-0000-000000000006',
+    pg_catalog.jsonb_build_object(
+      'expected_version',
+      (select version from public.items where id = '54000000-0000-0000-0000-000000000006')
+    )
+  )$$,
+  'P0001',
+  'METADATA_UNSUPPORTED',
+  'explicit retry still rejects blocked URLs'
 );
 
 select pg_temp.seed_metadata_item(
@@ -886,15 +975,34 @@ select pg_temp.seed_metadata_item(
   '54000000-0000-0000-0000-000000000008',
   '64000000-0000-0000-0000-000000000008',
   '14000000-0000-0000-0000-000000000001',
-  null,
+  'https://example.com/previously-unsupported',
   1,
   1,
-  'ready',
+  'unsupported',
   false,
   null,
   null,
   null,
   false
+);
+select is(
+  pg_catalog.jsonb_array_length(public.library_claim_metadata_jobs(1) -> 'jobs'),
+  0,
+  'previously unsupported generic links are not automatically backfilled'
+);
+select ok(
+  (
+    select metadata_state = 'unsupported'
+    from public.items
+    where id = '54000000-0000-0000-0000-000000000008'
+  )
+  and not exists (
+    select 1
+    from public.processing_jobs
+    where item_id = '54000000-0000-0000-0000-000000000008'
+      and kind = 'metadata'
+  ),
+  'eligibility expansion leaves old unsupported state and job history unchanged'
 );
 insert into metadata_receipts (label, payload)
 values (
@@ -918,7 +1026,8 @@ values (
 );
 
 select ok(
-  (select payload ->> 'job_id' from metadata_receipts where label = 'manual-one')
+  (select payload ->> 'http_status' = '202' from metadata_receipts where label = 'manual-one')
+  and (select payload ->> 'job_id' from metadata_receipts where label = 'manual-one')
     = (select payload ->> 'job_id' from metadata_receipts where label = 'manual-replay')
   and (
     select count(*) = 1
@@ -932,7 +1041,7 @@ select ok(
     from public.api_rate_buckets
     where operation = 'metadata_manual:54000000-0000-0000-0000-000000000008'
   ),
-  'same request replay returns the same active job without another job or manual-budget charge'
+  'explicit retry accepts previously unsupported generic links and replay reuses the job and budget'
 );
 
 select throws_ok(

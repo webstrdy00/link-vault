@@ -13,7 +13,7 @@ assert.equal(
 );
 const fixtureEmail = `emulator-${randomUUID()}@example.test`;
 const fixturePassword = `Local-emulator-${randomUUID()}`;
-const fixtureUrl = `https://example.com/emulator-${randomUUID()}`;
+const fixtureUrl = `https://example.com/?capture-fixture=${randomUUID()}`;
 let userId;
 let accessToken;
 const devices = execFileSync("adb", ["devices"], { encoding: "utf8" });
@@ -113,8 +113,28 @@ try {
   assert.equal(detail.data.url, fixtureUrl, "original URL persisted");
   assert.equal(
     detail.data.note,
-    "에뮬레이터 실제 서버 저장 검증",
-    "actual UI note persisted",
+    null,
+    "URL-only UI save requires no note",
+  );
+  assert.equal(
+    detail.data.user_title,
+    null,
+    "URL-only UI save requires no manual title",
+  );
+  assert.equal(
+    detail.data.fetched_title,
+    "Example Domain",
+    "public title reached the saved item",
+  );
+  assert.equal(
+    detail.data.metadata_state,
+    "partial",
+    "title-only pages remain explicitly partial",
+  );
+  assert.notEqual(
+    detail.data.classification_state,
+    "pending",
+    "automatic classification settled",
   );
   console.log(
     "PASS emulator UI -> real Auth session -> Edge API -> PostgreSQL -> reload",

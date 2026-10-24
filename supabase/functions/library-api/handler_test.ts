@@ -730,7 +730,7 @@ Deno.test("prepared aliases use sealed boundaries and cue states", async () => {
 
   const missingGateway = new FakeGateway();
   await createHandler(missingGateway)(itemRequest({
-    url: "http://blog.naver.com/post/1",
+    url: "http://localhost/post/1",
   }));
   assertEquals(missingGateway.createCalls[0].prepared.metadata_allowed, false);
   assertEquals(missingGateway.createCalls[0].prepared.cue_state, "missing");
@@ -740,7 +740,24 @@ Deno.test("prepared aliases use sealed boundaries and cue states", async () => {
     url: "https://www.threads.com/@example/post/1",
   }));
   assertEquals(threadsGateway.createCalls[0].prepared.source, "threads");
-  assertEquals(threadsGateway.createCalls[0].prepared.metadata_allowed, false);
+  assertEquals(threadsGateway.createCalls[0].prepared.metadata_allowed, true);
+  assertEquals(threadsGateway.createCalls[0].prepared.cue_state, "pending");
+});
+
+Deno.test("URL-only public HTTP and HTTPS items queue metadata without requiring a title", async () => {
+  for (
+    const url of [
+      "http://example.com/article",
+      "https://example.com/article",
+      "https://www.threads.net/@example/post/1",
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    await createHandler(gateway)(itemRequest({ url }));
+    assertEquals(gateway.createCalls.length, 1);
+    assertEquals(gateway.createCalls[0].prepared.metadata_allowed, true);
+    assertEquals(gateway.createCalls[0].prepared.cue_state, "pending");
+  }
 });
 
 Deno.test("POST items returns DB-selected new and duplicate statuses without internal fields", async () => {

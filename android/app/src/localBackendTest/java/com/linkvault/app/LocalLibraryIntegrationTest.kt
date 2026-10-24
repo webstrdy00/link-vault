@@ -4,9 +4,7 @@ import android.content.Intent
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertIsEnabled
-import androidx.compose.ui.test.hasAnyDescendant
 import androidx.compose.ui.test.hasTestTag
-import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -31,8 +29,8 @@ class LocalLibraryIntegrationTest {
     @get:Rule
     val compose = createEmptyComposeRule()
 
-    private fun awaitText(text: String, substring: Boolean = false) {
-        compose.waitUntil(timeoutMillis = 20_000) {
+    private fun awaitText(text: String, substring: Boolean = false, timeoutMillis: Long = 20_000) {
+        compose.waitUntil(timeoutMillis = timeoutMillis) {
             compose.onAllNodesWithText(text, substring = substring).fetchSemanticsNodes().isNotEmpty()
         }
     }
@@ -45,10 +43,10 @@ class LocalLibraryIntegrationTest {
         compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
     }
 
-    private fun openItemWithText(text: String) {
+    private fun openSingleSavedItem() {
         val itemCard = androidx.compose.ui.test.SemanticsMatcher("library item card") { node ->
             node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("detail-") == true
-        } and hasAnyDescendant(hasText(text))
+        }
         compose.waitUntil(timeoutMillis = 20_000) {
             compose.onAllNodes(itemCard, useUnmergedTree = true)
                 .fetchSemanticsNodes().isNotEmpty()
@@ -91,19 +89,21 @@ class LocalLibraryIntegrationTest {
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo()
                     .performTextReplacement(fixtureUrl)
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
-                awaitText("서버에 보관")
-                compose.onNodeWithText("나중에 찾을 메모").performScrollTo()
-                    .performTextReplacement("에뮬레이터 실제 서버 저장 검증")
-                compose.onNodeWithText("서버에 보관").performScrollTo().assertIsEnabled().performClick()
-                awaitText("서버에 보관했어요.")
+                awaitText("저장")
+                compose.onNodeWithText("제목 (선택 사항)").assertDoesNotExist()
+                compose.onNodeWithText("메모 (선택 사항)").assertDoesNotExist()
+                compose.onNodeWithText("저장").performScrollTo().assertIsEnabled().performClick()
+                awaitText("저장했어요.")
                 compose.onNodeWithText("새로고침").performScrollTo().performClick()
-                awaitText("에뮬레이터 실제 서버 저장 검증")
-                openItemWithText("에뮬레이터 실제 서버 저장 검증")
+                openSingleSavedItem()
                 awaitText("처리 정보 보기")
                 compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
                 awaitText("처리 정보")
-                awaitText("링크 정보 ·", substring = true)
-                compose.onNodeWithText("에뮬레이터 실제 서버 저장 검증").assertExists()
+                awaitText("Example Domain", timeoutMillis = 180_000)
+                awaitText("링크 정보 · 일부만 가져옴")
+                compose.waitUntil(timeoutMillis = 180_000) {
+                    compose.onAllNodesWithText("자동 분류 · 분류 없음").fetchSemanticsNodes().isNotEmpty()
+                }
             }
         } finally {
             sessionClient.auth.clearSession()

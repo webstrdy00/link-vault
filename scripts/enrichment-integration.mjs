@@ -21,8 +21,8 @@ const MAX_IMAGE_BYTES = 2_000_000;
 const OWNER_STORAGE_BYTES = 20_000_000;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const PUBLIC_NAVER_FIXTURE =
-  "https://blog.naver.com/PostView.naver?blogId=naverofficial&logNo=221163636811";
+const PUBLIC_METADATA_FIXTURE = "https://example.com/";
+const BLOCKED_METADATA_ORIGIN = "https://metadata.invalid";
 const METADATA_WORKER_KEYS = [
   "claimed",
   "discarded",
@@ -496,7 +496,7 @@ try {
   assert.ok(UUID_PATTERN.test(customCategoryId), "M4-CUSTOM-CATEGORY-ID");
 
   const created = await saveItem(owner, {
-    url: `https://example.test/enrichment-${randomUUID()}`,
+    url: `${BLOCKED_METADATA_ORIGIN}/enrichment-${randomUUID()}`,
     title: "첨부 통합 검증",
     category_ids: [customCategoryId],
   });
@@ -1264,7 +1264,7 @@ try {
   const quotaItems = [];
   for (let index = 0; index < 11; index++) {
     const quotaItem = await saveItem(quotaOwner, {
-      url: `https://example.test/quota-${randomUUID()}`,
+      url: `${BLOCKED_METADATA_ORIGIN}/quota-${randomUUID()}`,
     });
     quotaItems.push(await stableItem(quotaOwner, quotaItem.id));
   }
@@ -1352,8 +1352,18 @@ try {
   check(invalidMetadataId.status === 400, "M4-METADATA-UUID-VALIDATION");
 
   const publicMetadataItem = await saveItem(owner, {
-    url: PUBLIC_NAVER_FIXTURE,
+    url: PUBLIC_METADATA_FIXTURE,
   });
+  const scheduledMetadata = await selectOwned(
+    "processing_jobs",
+    owner,
+    "id,target_revision",
+    { item_id: `eq.${publicMetadataItem.id}`, kind: "eq.metadata" },
+  );
+  check(
+    scheduledMetadata.some((job) => job.target_revision === 1),
+    "M4-GENERIC-SAVE-SCHEDULES-METADATA",
+  );
   await stableItem(owner, publicMetadataItem.id);
   await settleActiveMetadata(
     owner,
@@ -1408,7 +1418,9 @@ try {
   );
 
   const workerMetadataItem = await saveItem(workerOwner, {
-    url: PUBLIC_NAVER_FIXTURE,
+    url: PUBLIC_METADATA_FIXTURE,
+    title: "직접 입력 제목",
+    note: "직접 입력 메모",
   });
   await stableItem(workerOwner, workerMetadataItem.id);
   await settleActiveMetadata(
@@ -1437,9 +1449,16 @@ try {
   const terminalJob = terminal.job;
   workerDetail = await currentItem(workerOwner, workerMetadataItem.id);
   check(explicitlyClaimed > 0, "M4-METADATA-EXPLICIT-WORKER-CLAIMED");
-  if (
-    terminalJob.state !== "succeeded" || workerDetail.metadata_state !== "ready"
-  ) {
+  // example.com exposes a meaningful title but no metadata description. This
+  // is a successful title-only extraction, not a complete ready result.
+  const validTitleOnlyResult = terminalJob.state === "succeeded" &&
+    terminalJob.last_error_code == null &&
+    workerDetail.metadata_state === "partial" &&
+    workerDetail.fetched_title === "Example Domain" &&
+    workerDetail.description === null &&
+    workerDetail.body_text === null &&
+    workerDetail.extraction_meta?.error_code === "INVALID_RESULT";
+  if (!validTitleOnlyResult) {
     console.error(JSON.stringify({
       case: "M4-METADATA-TERMINAL",
       job_state: terminalJob.state,
@@ -1449,12 +1468,27 @@ try {
     }));
   }
   check(
-    terminalJob.state === "succeeded" &&
-      workerDetail.metadata_state === "ready" &&
-      terminalJob.last_error_code == null &&
-      typeof workerDetail.fetched_title === "string" &&
-      workerDetail.fetched_title.length > 0,
+    validTitleOnlyResult,
     "M4-METADATA-TERMINAL-SUCCESS",
+  );
+  check(
+    workerDetail.user_title === "직접 입력 제목" &&
+      workerDetail.note === "직접 입력 메모",
+    "M4-GENERIC-METADATA-PRESERVES-USER-TEXT",
+  );
+  const enrichedClassification = await selectOwned(
+    "processing_jobs",
+    workerOwner,
+    "id,target_revision",
+    {
+      item_id: `eq.${workerDetail.id}`,
+      kind: "eq.classify",
+      target_revision: `eq.${workerDetail.text_revision}`,
+    },
+  );
+  check(
+    enrichedClassification.length > 0,
+    "M4-GENERIC-ENRICHMENT-SCHEDULES-CLASSIFICATION",
   );
 } catch (error) {
   primaryFailure = error;

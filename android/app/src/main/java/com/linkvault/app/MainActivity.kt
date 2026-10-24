@@ -595,6 +595,10 @@ class MainActivity : ComponentActivity() {
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.SemiBold,
             )
+            Text(
+                text = "제목·메모 없이 링크부터 보관하세요. 저장 후 공개 정보를 자동으로 가져오며, 사이트에 따라 제한될 수 있어요.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             TextButton(onClick = onToggleHelp) {
                 Text(if (showHelp) "저장 방법 닫기" else "저장 방법 보기")
             }
@@ -940,8 +944,18 @@ class MainActivity : ComponentActivity() {
         val mimeType = intent.type.orEmpty()
         val isImageShare = mimeType.startsWith("image/", ignoreCase = true)
         val sharedText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
+        val subject = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim().orEmpty()
+        val whitespace = Regex("\\s+")
+        val subjectAlreadyIncluded = " ${sharedText.replace(whitespace, " ")} ".contains(
+            " ${subject.replace(whitespace, " ")} ",
+        )
+        val receivedText = when {
+            subject.isBlank() || subjectAlreadyIncluded -> sharedText
+            sharedText.isBlank() -> subject
+            else -> "$subject\n$sharedText"
+        }
         return IncomingCapture(
-            text = sharedText,
+            text = receivedText,
             imageUris = if (isImageShare) readSharedImageUris(intent) else emptyList(),
             isImageShare = isImageShare,
             isExternalShare = true,

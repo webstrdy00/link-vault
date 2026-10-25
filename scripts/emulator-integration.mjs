@@ -15,6 +15,11 @@ const fixtureEmail = `emulator-${randomUUID()}@example.test`;
 const fixturePassword = `Local-emulator-${randomUUID()}`;
 const fixtureKind = process.env.LINK_VAULT_TEST_FIXTURE ?? "generic";
 const verifyListDeletion = process.env.LINK_VAULT_TEST_DELETE === "1";
+const verifyDetailEditing = process.env.LINK_VAULT_TEST_DETAIL_EDIT === "1";
+assert.ok(
+  !(verifyDetailEditing && verifyListDeletion),
+  "Choose one mutation scenario",
+);
 const verifyUncachedDeletion =
   process.env.LINK_VAULT_TEST_DELETE_UNCACHED === "1";
 assert.ok(
@@ -130,7 +135,7 @@ try {
   assert.equal(session.status, 200);
   accessToken = session.data.access_token;
   let seededItemId = "";
-  if (verifyUncachedDeletion) {
+  if (verifyUncachedDeletion || verifyDetailEditing) {
     const bootstrap = await api("/functions/v1/library-api/v1/bootstrap", {
       token: accessToken,
       method: "POST",
@@ -144,7 +149,10 @@ try {
       headers: { "X-Request-Id": randomUUID() },
       body: {
         url: `https://list-delete.invalid/${randomUUID()}`,
-        title: "목록 삭제 검증",
+        title: verifyDetailEditing ? "상세 편집 검증" : "목록 삭제 검증",
+        ...(verifyDetailEditing
+          ? { note: "현재 저장된 내용\n두 번째 줄도 유지합니다." }
+          : {}),
       },
     });
     assert.equal(seeded.status, 201);
@@ -183,6 +191,7 @@ try {
     `-Pandroid.testInstrumentationRunnerArguments.fixtureUrl=${fixtureUrl}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureKind=${fixtureKind}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureDelete=${verifyListDeletion}`,
+    `-Pandroid.testInstrumentationRunnerArguments.fixtureDetailEdit=${verifyDetailEditing}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureSeededItemId=${seededItemId}`,
   ];
   const env = {
@@ -319,7 +328,22 @@ try {
     token: accessToken,
   });
   assert.equal(items.status, 200);
-  if (verifyListDeletion) {
+  if (verifyDetailEditing) {
+    assert.equal(items.data.items.length, 1);
+    const edited = await api(
+      `/functions/v1/library-api/v1/items/${seededItemId}`,
+      { token: accessToken },
+    );
+    assert.equal(edited.status, 200);
+    assert.equal(edited.data.user_title, "수정한 제목");
+    assert.equal(edited.data.note, "수정한 내용\n줄바꿈도 보존합니다.");
+    assert.ok(
+      edited.data.category_refs.some((category) => category.name === "여행"),
+    );
+    console.log(
+      "PASS direct category selection and prefilled title/content editing persist on server",
+    );
+  } else if (verifyListDeletion) {
     assert.equal(
       items.data.items.length,
       0,

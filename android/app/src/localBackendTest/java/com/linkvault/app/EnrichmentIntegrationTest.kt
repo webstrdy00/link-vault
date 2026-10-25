@@ -123,6 +123,7 @@ class EnrichmentIntegrationTest {
             "첨부 이미지 미리보기",
             useUnmergedTree = true,
         ).assertExists()
+        compose.onNodeWithTag("attachment-image", useUnmergedTree = true).assertExists()
     }
 
     private fun shell(command: String) {
@@ -240,10 +241,15 @@ class EnrichmentIntegrationTest {
         compose.onNodeWithText("링크 정보 ·", substring = true).assertDoesNotExist()
     }
 
-    private fun openImageManagement() {
-        clickTag("detail-more")
-        clickRoot("detail-manage-images")
-        awaitText("이미지 첨부")
+    private fun assertInlineImageControls() {
+        compose.waitUntil(UI_TIMEOUT_MILLIS) {
+            compose.onAllNodes(
+                hasTestTag("attachment-pick") or hasTestTag("attachment-replace"),
+                useUnmergedTree = true,
+            ).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag("detail-manage-images", useUnmergedTree = true)
+            .assertDoesNotExist()
     }
 
     private suspend fun currentItem(): JsonObject = app.accountClient.libraryRequest(
@@ -332,7 +338,7 @@ class EnrichmentIntegrationTest {
                     app.attachmentRepository.observe(ownerId, itemId).first().isEmpty(),
                 )
                 assertTrue(app.incomingImageStore.draft.value != null)
-                openImageManagement()
+                assertInlineImageControls()
                 awaitTag("attachment-import-shared")
 
                 setNetwork(enabled = false)
@@ -347,12 +353,12 @@ class EnrichmentIntegrationTest {
                 assertTrue("same-owner prepared file is durable", queuedFile(pending).isFile)
                 assertTrue("the fixture provider source remains unchanged", original.readBytes().contentEquals(originalBytes))
                 awaitDraftConsumed()
-                awaitText("기기에 보관됨 · 전송 대기 중")
+                awaitText("이미지 첨부 ·", substring = true)
 
                 scenario.recreate()
                 awaitTag("detail-back")
-                openImageManagement()
-                awaitTag("attachment-queue-status")
+                assertInlineImageControls()
+                awaitText("이미지 첨부 ·", substring = true)
                 val restored = awaitPending(ownerId, itemId) {
                     it.operationId == pending.operationId
                 }
@@ -400,45 +406,17 @@ class EnrichmentIntegrationTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
             openFixtureDetail()
-            openImageManagement()
+            assertInlineImageControls()
             awaitText("이미지 첨부 ·", substring = true)
             setNetwork(enabled = true)
-            awaitText("서버에 저장된 활성 이미지가 있어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             awaitPreviewImage()
 
             val (firstItem, firstAsset) = awaitActiveAsset()
             val firstAssetId = firstAsset.getValue("id").jsonPrimitive.content
             val firstTextRevision = firstItem.getValue("text_revision").jsonPrimitive.long
-            val stable = withTimeout(SERVER_TIMEOUT_MILLIS) {
-                while (true) {
-                    val candidate = currentItem()
-                    if (candidate["classification_state"]?.jsonPrimitive?.content !in
-                        setOf("pending", "queued", "running", "retry")
-                    ) return@withTimeout candidate
-                    delay(250)
-                }
-                error("unreachable")
-            }
-            val failedOcr = app.accountClient.libraryRequest(
-                expectedOwnerId = ownerId,
-                path = "/items/$itemId/assets/$firstAssetId/ocr",
-                method = "PATCH",
-                body = """{"expected_version":${stable.getValue("version").jsonPrimitive.long},"ocr_state":"failed"}""",
-                requestId = UUID.randomUUID().toString(),
-            )
-            assertEquals(firstAssetId, (failedOcr.getValue("active_asset") as JsonObject)
-                .getValue("id").jsonPrimitive.content)
-            clickTag("detail-back")
-            openFixtureDetail()
-            openImageManagement()
-            awaitText("OCR은 실패했지만 서버의 이미지는 정상적으로 유지돼요.")
-            clickTag("attachment-ocr-retry")
-            awaitText("OCR 텍스트가 저장돼 있어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
-            val retriedOcr = currentItem()
-            assertEquals("ready", retriedOcr.getValue("ocr_state").jsonPrimitive.content)
-            assertEquals(firstAssetId, (retriedOcr.getValue("active_asset") as JsonObject)
-                .getValue("id").jsonPrimitive.content)
+            assertEquals("ready", firstItem.getValue("ocr_state").jsonPrimitive.content)
+            assertTrue(firstAsset.getValue("ocr_text").jsonPrimitive.content.contains("서울"))
             compose.waitUntil(UI_TIMEOUT_MILLIS) {
                 File(app.noBackupFilesDir, "attachment_queue").walkTopDown().none { file -> file.isFile }
             }
@@ -461,8 +439,8 @@ class EnrichmentIntegrationTest {
                 .performScrollTo()
                 .performClick()
             openFixtureDetail()
-            openImageManagement()
-            awaitText("서버에 저장된 활성 이미지가 있어요.")
+            assertInlineImageControls()
+            awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             val beforeReplacement = currentItem()
             val expectedReplacementVersion = beforeReplacement.getValue("version").jsonPrimitive.long
             val firstAssetId = (beforeReplacement.getValue("active_asset") as JsonObject)
@@ -487,6 +465,8 @@ class EnrichmentIntegrationTest {
             val replacementTextRevision = replacementItem.getValue("text_revision").jsonPrimitive.long
             assertNotEquals(firstAssetId, replacementAssetId)
             assertTrue(replacementTextRevision > firstItemTextRevision())
+            assertEquals("ready", replacementItem.getValue("ocr_state").jsonPrimitive.content)
+            assertTrue(replacementAsset.getValue("ocr_text").jsonPrimitive.content.contains("제주"))
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
 
             openSearch()
@@ -518,7 +498,7 @@ class EnrichmentIntegrationTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
             openFixtureDetail()
-            openImageManagement()
+            assertInlineImageControls()
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             compose.onNodeWithTag("attachment-delete", useUnmergedTree = true)
                 .performScrollTo()
@@ -528,7 +508,11 @@ class EnrichmentIntegrationTest {
                 .performScrollTo()
                 .assertIsEnabled()
                 .performClick()
-            awaitText("첨부 이미지가 없어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            awaitTag("attachment-pick", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            val deleted = currentItem()
+            assertTrue(deleted["active_asset"] !is JsonObject)
+            compose.onNodeWithTag("attachment-preview", useUnmergedTree = true)
+                .assertDoesNotExist()
             writeReceipt { put("deleteConfirmed", true) }
         }
     }

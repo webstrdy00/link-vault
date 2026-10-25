@@ -5,12 +5,15 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -21,13 +24,12 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -71,6 +73,8 @@ fun ClassificationControls(
     item: LibraryItemDetail,
     onRefresh: () -> Unit,
     onEditNote: () -> Unit,
+    editorVisible: Boolean,
+    onDismiss: () -> Unit,
 ) {
     val accountSession by client.sessionState.collectAsState()
     val ownerId = accountSession.ownerId
@@ -92,7 +96,6 @@ fun ClassificationControls(
         factory = factory,
     )
     val state by controlsViewModel.uiState.collectAsState()
-    var showCategoryManagement by rememberSaveable(item.id) { mutableStateOf(false) }
 
     LaunchedEffect(controlsViewModel, item) {
         controlsViewModel.updateItem(item)
@@ -105,131 +108,42 @@ fun ClassificationControls(
         onDispose { controlsViewModel.setVisible(false) }
     }
 
-    HorizontalDivider()
-    if (!state.sessionValid) {
-        Text(
-            text = "로그인이 필요해요.",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(vertical = 12.dp),
-        )
-        return
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "카테고리",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            TextButton(onClick = { showCategoryManagement = !showCategoryManagement }) {
-                Text(if (showCategoryManagement) "관리 닫기" else "카테고리 관리")
-            }
-        }
-        if (state.item.manualOverride == true) {
-            Text(
-                text = "직접 선택",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelMedium,
-            )
-        }
+    if (!editorVisible) return
 
-        CurrentCategoryReasons(
-            item = state.item,
-            expandedCategoryId = state.expandedCategoryId,
-            onCategoryClick = controlsViewModel::toggleReason,
-        )
-
-        state.categoriesError?.let { message ->
-            Text(message, color = MaterialTheme.colorScheme.error)
-            OutlinedButton(
-                onClick = controlsViewModel::reloadCategories,
-                enabled = !state.categoriesLoading,
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.small,
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("category-editor"),
+        title = { Text("분류 수정") },
+        confirmButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("category-editor-close")
+                    .semantics { contentDescription = "분류 수정 닫기" },
             ) {
-                Text("카테고리 다시 불러오기")
+                Text("닫기")
             }
-        }
-        if (state.missingSelectedCategoryIds.isNotEmpty() && !showCategoryManagement) {
-            Text(
-                text = "더 이상 사용할 수 없는 카테고리가 선택되어 있어요.",
-                color = MaterialTheme.colorScheme.error,
-            )
-            OutlinedButton(
-                onClick = { showCategoryManagement = true },
-                modifier = Modifier.fillMaxWidth(),
-                shape = MaterialTheme.shapes.small,
+        },
+        text = {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 440.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Text("카테고리 확인")
-            }
-        }
-
-        ControlOutboxContent(
-            state = state,
-            onRetry = controlsViewModel::retry,
-            onDiscard = controlsViewModel::discard,
-            onLoadLatestCategories = controlsViewModel::loadLatestForCategories,
-            onRefreshLatest = controlsViewModel::refreshLatest,
-        )
-
-        state.message?.let { message ->
-            Text(
-                text = message,
-                color = MaterialTheme.colorScheme.primary,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        state.actionError?.let { message ->
-            Text(message, color = MaterialTheme.colorScheme.error)
-        }
-
-        if (state.item.needsCuePrompt()) {
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                shape = MaterialTheme.shapes.medium,
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    Text(
-                        text = "검색을 위한 메모",
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text("나중에 떠올릴 만한 말을 메모에 남기면 더 쉽게 찾을 수 있어요.")
-                    Button(
-                        onClick = onEditNote,
-                        enabled = !state.hasUnresolvedControlRequest,
+                if (!state.sessionValid) {
+                    Text("로그인이 필요해요.", color = MaterialTheme.colorScheme.error)
+                    return@Column
+                }
+                state.categoriesError?.let { message ->
+                    Text(message, color = MaterialTheme.colorScheme.error)
+                    OutlinedButton(
+                        onClick = controlsViewModel::reloadCategories,
+                        enabled = !state.categoriesLoading,
                         modifier = Modifier.fillMaxWidth(),
                         shape = MaterialTheme.shapes.small,
                     ) {
-                        Text("메모 쓰기")
-                    }
-                    TextButton(
-                        onClick = controlsViewModel::dismissCue,
-                        enabled = state.item.version != null &&
-                            state.item.textRevision != null &&
-                            !state.hasUnresolvedControlRequest &&
-                            !state.commandQueuing,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("나중에")
+                        Text("카테고리 다시 불러오기")
                     }
                 }
-            }
-        }
-
-        if (showCategoryManagement) {
-            HorizontalDivider()
-            Text(
-                text = "카테고리 관리",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
             if (state.categoriesLoading && !state.hasCategorySnapshot) {
                 Text("카테고리를 불러오고 있어요.")
             }
@@ -319,6 +233,41 @@ fun ClassificationControls(
                 }
             }
 
+            ControlOutboxContent(
+                state = state,
+                onRetry = controlsViewModel::retry,
+                onDiscard = controlsViewModel::discard,
+                onLoadLatestCategories = controlsViewModel::loadLatestForCategories,
+                onRefreshLatest = controlsViewModel::refreshLatest,
+            )
+            state.message?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.primary)
+            }
+            state.actionError?.let { message ->
+                Text(message, color = MaterialTheme.colorScheme.error)
+            }
+            CurrentCategoryReasons(
+                item = state.item,
+                expandedCategoryId = state.expandedCategoryId,
+                onCategoryClick = controlsViewModel::toggleReason,
+            )
+            if (state.item.needsCuePrompt()) {
+                OutlinedButton(
+                    onClick = onEditNote,
+                    enabled = !state.hasUnresolvedControlRequest,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text("내용 쓰기")
+                }
+                TextButton(
+                    onClick = controlsViewModel::dismissCue,
+                    enabled = state.item.version != null && state.item.textRevision != null &&
+                        !state.hasUnresolvedControlRequest && !state.commandQueuing,
+                ) {
+                    Text("나중에")
+                }
+            }
             if (state.showReclassifyConfirmation) {
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -364,8 +313,9 @@ fun ClassificationControls(
                     Text("자동 분류 다시 적용")
                 }
             }
-        }
-    }
+            }
+        },
+    )
 }
 
 @Composable

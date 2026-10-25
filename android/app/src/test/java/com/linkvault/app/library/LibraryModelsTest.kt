@@ -3,6 +3,7 @@ package com.linkvault.app.library
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxState
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -109,6 +110,9 @@ class LibraryModelsTest {
         assertEquals(description, detail.description)
         assertEquals(bodyText, detail.bodyText)
         assertEquals(sharedText, detail.sharedText)
+        assertEquals("수동 메모", detail.note)
+        assertEquals(userTitle, detail.editableTitle())
+        assertEquals("수동 메모", detail.displayedContent())
 
         val preparation = prepareLibraryEdit(
             ownerId = "member-a",
@@ -117,13 +121,318 @@ class LibraryModelsTest {
             expectedVersion = requireNotNull(detail.version),
             originalTitle = detail.userTitle,
             originalNote = detail.note,
+            baselineForm = detail.editForm(),
             form = LibraryEditForm(title = detail.userTitle.orEmpty(), note = "메모만 수정"),
         ) as LibraryEditPreparation.Valid
         val body = Json.parseToJsonElement(preparation.operation.body).jsonObject
         assertEquals(userTitle, preparation.operation.originalTitle)
+        assertEquals("수동 메모", preparation.operation.originalNote)
         assertEquals(userTitle, preparation.operation.form.title)
         assertFalse(body.containsKey("title"))
         assertEquals("메모만 수정", body.getValue("note").jsonPrimitive.content)
+    }
+
+    @Test
+    fun editFormPrefillsCompactGeneratedTitleAndFullKoreanContentWithoutChangingRawFields() {
+        val detail = generatedEditDetail()
+
+        val form = detail.editForm()
+
+        assertEquals("자동으로 수집한 제목입니다.", form.title)
+        assertEquals(detail.editableTitle(), form.title)
+        assertEquals(detail.bodyText, form.note)
+        assertEquals(detail.displayedContent(), form.note)
+        assertEquals("  자동으로 수집한 제목입니다.  후속 문장입니다.\n마지막 줄", detail.displayTitle)
+        assertEquals("  수집한 한국어 본문입니다.\r\n둘째 줄 😀\n마지막 줄  ", detail.bodyText)
+        assertEquals("미리보기 설명\n원본 그대로", detail.description)
+        assertEquals("공유한 원문\nhttps://example.com/article", detail.sharedText)
+        assertNull(detail.userTitle)
+        assertNull(detail.note)
+    }
+
+    @Test
+    fun editFormPreservesFullManualTitleAndManualContentIncludingWhitespaceAndLineBreaks() {
+        val title = "  내가 정한 제목\t" + "긴 제목의 모든 단어 ".repeat(12) + "\n마지막 줄"
+        val note = "  내가 수정한 내용입니다.\r\n빈 줄도 남깁니다.\n\n마지막 줄 😀  "
+        val detail = generatedEditDetail().copy(userTitle = title, note = note)
+
+        assertTrue(title.codePointLength() > 60)
+        assertEquals(LibraryEditForm(title, note), detail.editForm())
+        assertEquals(title, detail.userTitle)
+        assertEquals(note, detail.note)
+        assertEquals(generatedEditDetail().bodyText, detail.bodyText)
+        assertEquals(generatedEditDetail().description, detail.description)
+        assertEquals(generatedEditDetail().sharedText, detail.sharedText)
+    }
+
+    @Test
+    fun editableTitleUsesTheDisplayTitleOrUrlOnlyWhenManualTitleIsBlank() {
+        val detail = generatedEditDetail().copy(displayTitle = "가".repeat(90))
+        listOf(null, "", " \t\r\n ").forEach { title ->
+            assertEquals("가".repeat(59) + "…", detail.copy(userTitle = title).editableTitle())
+        }
+        assertEquals(
+            detail.url,
+            detail.copy(userTitle = " \n", displayTitle = " ").editableTitle(),
+        )
+        val longUrl = "https://example.com/" + "a".repeat(90)
+        assertEquals(
+            longUrl.take(59) + "…",
+            detail.copy(url = longUrl, displayTitle = null).editableTitle(),
+        )
+    }
+
+    @Test
+    fun displayedContentSkipsBlankAndUrlOnlyAcquiredFieldsButNeverFiltersAManualOverride() {
+        val urls = " \nHTTPS://example.com/one\tHttp://example.com/two\r\nWWW.example.com/three  "
+        val description = "  설명 첫 줄\r\n둘째 줄을 생략하지 않습니다.  "
+        val sharedText = "공유한 한국어 원문\nhttps://example.com/article"
+        val detail = generatedEditDetail().copy(
+            note = " \t\r\n",
+            bodyText = urls,
+            description = description,
+            sharedText = sharedText,
+        )
+
+        assertEquals(description, detail.displayedContent())
+        assertEquals(sharedText, detail.copy(description = urls).displayedContent())
+        assertNull(detail.copy(description = " \n", sharedText = urls).displayedContent())
+        assertNull(detail.copy(bodyText = null, description = null, sharedText = null).displayedContent())
+        assertEquals(urls, detail.copy(note = urls).displayedContent())
+        assertEquals(urls, detail.bodyText)
+        assertEquals(" \t\r\n", detail.note)
+    }
+
+    @Test
+    fun oversizedGeneratedContentRemainsCompleteAndProducesVisibleEditValidation() {
+        val content = "한글😀\r\n".repeat(801)
+        val detail = generatedEditDetail().copy(bodyText = content)
+        val form = detail.editForm()
+
+        assertTrue(content.codePointLength() > LIBRARY_NOTE_MAX_CODE_POINTS)
+        assertEquals(content, form.note)
+        val issue = validateLibraryEditForm(form).single()
+        assertEquals(LibraryFormField.NOTE, issue.field)
+        assertEquals("내용은 최대 4000자까지 입력할 수 있어요.", issue.message)
+        val preparation = prepareEdit(detail, form.copy(title = "제목만 변경"))
+        assertTrue(preparation is LibraryEditPreparation.Invalid)
+        assertTrue((preparation as LibraryEditPreparation.Invalid).issues.contains(issue))
+        assertEquals(content, detail.bodyText)
+        assertTrue(
+            validateLibraryEditForm(form.copy(note = "😀".repeat(LIBRARY_NOTE_MAX_CODE_POINTS)))
+                .isEmpty(),
+        )
+        assertEquals(
+            LibraryFormField.NOTE,
+            validateLibraryEditForm(
+                form.copy(note = "😀".repeat(LIBRARY_NOTE_MAX_CODE_POINTS) + "가"),
+            ).single().field,
+        )
+    }
+
+    @Test
+    fun changingOnlyTitleDoesNotPersistPrefilledGeneratedContent() {
+        val detail = generatedEditDetail()
+        val preparation = prepareEdit(detail, detail.editForm().copy(title = "내가 바꾼 제목 😀"))
+            as LibraryEditPreparation.Valid
+        val operation = preparation.operation
+        val request = operation.requestArguments()
+        val body = Json.parseToJsonElement(operation.body).jsonObject
+
+        assertEquals(setOf("expected_version", "title"), body.keys)
+        assertEquals("7", body.getValue("expected_version").jsonPrimitive.content)
+        assertEquals("내가 바꾼 제목 😀", body.getValue("title").jsonPrimitive.content)
+        assertNull(operation.originalTitle)
+        assertNull(operation.originalNote)
+        assertEquals(detail.bodyText, operation.form.note)
+        assertEquals(request, operation.requestArguments())
+        assertEquals(requestId, request.requestId)
+        assertEquals("PATCH", request.method)
+        assertEquals("/items/${detail.id}", request.path)
+        assertEquals("내가 바꾼 제목 😀", detail.copy(userTitle = "내가 바꾼 제목 😀").editableTitle())
+    }
+
+    @Test
+    fun changingOnlyContentDoesNotPersistPrefilledGeneratedTitle() {
+        val detail = generatedEditDetail()
+        val content = "  내가 수정한 한국어 내용\r\n두 번째 줄 😀\n\n마지막 줄  "
+        val preparation = prepareEdit(detail, detail.editForm().copy(note = content))
+            as LibraryEditPreparation.Valid
+        val body = Json.parseToJsonElement(preparation.operation.body).jsonObject
+
+        assertEquals(setOf("expected_version", "note"), body.keys)
+        assertEquals(content, body.getValue("note").jsonPrimitive.content)
+        assertNull(preparation.operation.originalTitle)
+        assertNull(preparation.operation.originalNote)
+        assertEquals(detail.editableTitle(), preparation.operation.form.title)
+        assertEquals(content, detail.copy(note = content).displayedContent())
+        assertEquals(generatedEditDetail().bodyText, detail.bodyText)
+    }
+
+    @Test
+    fun untouchedPrefilledGeneratedAndManualFormsNeverCreateAnEditOperation() {
+        val generated = generatedEditDetail()
+        val manual = generated.copy(userTitle = "  수동 제목\n둘째 줄 ", note = " 수동 내용\n원본 ")
+        val urlOnly = generated.copy(
+            displayTitle = null,
+            bodyText = generated.url,
+            description = " \n",
+            sharedText = "www.example.com",
+        )
+        assertEquals(LibraryEditForm(generated.url, ""), urlOnly.editForm())
+        listOf(generated, manual, urlOnly).forEach { detail ->
+            val preparation = prepareEdit(detail)
+
+            assertTrue(preparation is LibraryEditPreparation.Invalid)
+            assertEquals(
+                "변경된 제목이나 내용이 없어요.",
+                (preparation as LibraryEditPreparation.Invalid).issues.single().message,
+            )
+        }
+    }
+
+    @Test
+    fun explicitlyBlankManualContentClearsTheOverrideAndShowsGeneratedContentAgain() {
+        val detail = generatedEditDetail().copy(note = "  이전 수동 내용\n그대로 보관  ")
+        listOf("", " \t\r\n").forEach { blank ->
+            val preparation = prepareEdit(detail, detail.editForm().copy(note = blank))
+                as LibraryEditPreparation.Valid
+            val body = Json.parseToJsonElement(preparation.operation.body).jsonObject
+
+            assertEquals(setOf("expected_version", "note"), body.keys)
+            assertEquals(JsonNull, body.getValue("note"))
+            assertEquals(detail.note, preparation.operation.originalNote)
+            assertEquals(blank, preparation.operation.form.note)
+            assertEquals(detail.bodyText, detail.copy(note = null).displayedContent())
+            assertEquals("  이전 수동 내용\n그대로 보관  ", detail.note)
+        }
+    }
+
+    @Test
+    fun clearingGeneratedContentWithoutAManualOverrideDoesNotInventABlankOverride() {
+        val detail = generatedEditDetail()
+        val cleared = detail.editForm().copy(note = "")
+
+        assertTrue(prepareEdit(detail, cleared) is LibraryEditPreparation.Invalid)
+        val titleOnly = prepareEdit(detail, cleared.copy(title = "다른 제목"))
+            as LibraryEditPreparation.Valid
+        assertEquals(
+            setOf("expected_version", "title"),
+            Json.parseToJsonElement(titleOnly.operation.body).jsonObject.keys,
+        )
+        assertEquals(detail.bodyText, detail.displayedContent())
+    }
+
+    @Test
+    fun restoredTitleOnlyPatchKeepsOriginalVersionAndUsesLatestUntouchedContent() {
+        val original = generatedEditDetail()
+        val operation = (
+            prepareEdit(original, original.editForm().copy(title = "내가 저장하려던 제목"))
+                as LibraryEditPreparation.Valid
+            ).operation
+        val request = operation.requestArguments()
+        val patch = parseLibraryEditPatch(requireNotNull(request.body))
+        val cached = generatedEditDetail().copy(version = 9, note = "캐시의 수동 내용\n둘째 줄")
+        val restored = editState(cached).copy(
+            expectedVersion = patch.expectedVersion,
+            form = patch.applyToForm(cached.editForm()),
+            submittedPatch = patch,
+        )
+        val latest = cached.copy(version = 11, userTitle = "다른 곳에서 수정한 제목", note = "최신 수동 내용\n둘째 줄")
+
+        val reviewed = restored.withLatestForm(latest)
+        val reconfirmed = prepareEdit(latest, reviewed.form, requestId = otherItemId)
+            as LibraryEditPreparation.Valid
+        val body = Json.parseToJsonElement(reconfirmed.operation.body).jsonObject
+
+        assertEquals("내가 저장하려던 제목", restored.form.title)
+        assertEquals(cached.note, restored.form.note)
+        assertEquals(7L, reviewed.expectedVersion)
+        assertEquals(cached.userTitle, reviewed.originalTitle)
+        assertEquals(cached.note, reviewed.originalNote)
+        assertEquals(latest.note, reviewed.form.note)
+        assertEquals(latest.editForm(), reviewed.baselineForm)
+        assertEquals(patch, reviewed.submittedPatch)
+        assertEquals(setOf("expected_version", "title"), body.keys)
+        assertEquals("11", body.getValue("expected_version").jsonPrimitive.content)
+        assertEquals("내가 저장하려던 제목", body.getValue("title").jsonPrimitive.content)
+        assertEquals(latest.note, reconfirmed.operation.originalNote)
+        assertEquals(otherItemId, reconfirmed.operation.requestId)
+        assertEquals(request, operation.requestArguments())
+        assertEquals(7L, operation.expectedVersion)
+        assertNull(operation.originalTitle)
+        assertNull(operation.originalNote)
+        assertEquals(7L, patch.expectedVersion)
+    }
+
+    @Test
+    fun restoredContentOnlyPatchRetainsIntentEvenWhenTheCacheAlreadyMatchesItsContent() {
+        val patch = parseLibraryEditPatch("""{"expected_version":7,"note":"내가 저장하려던 내용\n둘째 줄"}""")
+        val cached = generatedEditDetail().copy(version = 9, note = patch.note)
+        val restored = editState(cached).copy(
+            expectedVersion = patch.expectedVersion,
+            form = patch.applyToForm(cached.editForm()),
+            submittedPatch = patch,
+        )
+        val latestTitle = "  최신 수동 제목 " + "모든 단어 ".repeat(15) + "\n마지막 줄"
+        val latest = cached.copy(version = 12, userTitle = latestTitle, note = "다른 곳에서 변경한 내용")
+
+        assertEquals(restored.baselineForm, restored.form)
+        val reviewed = restored.withLatestForm(latest)
+        val reconfirmed = prepareEdit(latest, reviewed.form) as LibraryEditPreparation.Valid
+        val body = Json.parseToJsonElement(reconfirmed.operation.body).jsonObject
+
+        assertEquals(latestTitle, reviewed.form.title)
+        assertEquals(patch.note, reviewed.form.note)
+        assertEquals(7L, reviewed.expectedVersion)
+        assertEquals(patch, reviewed.submittedPatch)
+        assertEquals(setOf("expected_version", "note"), body.keys)
+        assertEquals("12", body.getValue("expected_version").jsonPrimitive.content)
+        assertEquals(patch.note, body.getValue("note").jsonPrimitive.content)
+    }
+
+    @Test
+    fun restoredClearRemainsAnExplicitResetAfterLoadingLatestGeneratedFields() {
+        val patch = parseLibraryEditPatch("""{"expected_version":7,"note":null}""")
+        val cached = generatedEditDetail().copy(note = "이전 수동 내용")
+        val restored = editState(cached).copy(
+            form = patch.applyToForm(cached.editForm()),
+            submittedPatch = patch,
+        )
+        val latest = cached.copy(version = 8, displayTitle = "최신 자동 제목", note = "최신 수동 내용")
+
+        val reviewed = restored.withLatestForm(latest)
+        val preparation = prepareEdit(latest, reviewed.form) as LibraryEditPreparation.Valid
+        val body = Json.parseToJsonElement(preparation.operation.body).jsonObject
+
+        assertEquals("최신 자동 제목", reviewed.form.title)
+        assertEquals("", reviewed.form.note)
+        assertEquals(setOf("expected_version", "note"), body.keys)
+        assertEquals(JsonNull, body.getValue("note"))
+        assertEquals(7L, reviewed.expectedVersion)
+        assertEquals("이전 수동 내용", reviewed.originalNote)
+
+        val alreadyCleared = latest.copy(note = null)
+        val noChange = prepareEdit(alreadyCleared, restored.withLatestForm(alreadyCleared).form)
+            as LibraryEditPreparation.Invalid
+        assertEquals("변경된 제목이나 내용이 없어요.", noChange.issues.single().message)
+    }
+
+    @Test
+    fun latestFormPreservesOnlyDirtyFieldsAndRecognizesAlreadySavedChangesAsANoOp() {
+        val detail = generatedEditDetail()
+        val draft = editState(detail).copy(form = detail.editForm().copy(title = "수정한 제목"))
+        val latest = detail.copy(version = 10, userTitle = "수정한 제목", bodyText = "최신 본문\n모두 보관")
+
+        val reviewed = draft.withLatestForm(latest)
+
+        assertEquals("수정한 제목", reviewed.form.title)
+        assertEquals(latest.bodyText, reviewed.form.note)
+        assertEquals(7L, reviewed.expectedVersion)
+        assertNull(reviewed.originalTitle)
+        assertNull(reviewed.originalNote)
+        val preparation = prepareEdit(latest, reviewed.form) as LibraryEditPreparation.Invalid
+        assertEquals("변경된 제목이나 내용이 없어요.", preparation.issues.single().message)
     }
 
     @Test
@@ -765,7 +1074,9 @@ class LibraryModelsTest {
     fun listDeleteCannotReplaceAnExistingEditOrDeletion() {
         val state = listDeleteState()
         val editing = state.copy(
-            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("", "")),
+            edit = LibraryEditUiState(
+                otherItemId, 5, null, null, LibraryEditForm("", ""), LibraryEditForm("", ""),
+            ),
         )
         assertEquals(editing, editing.withListDeleteConfirmation(deleteItemId))
         val confirming = state.withListDeleteConfirmation(deleteItemId)
@@ -829,7 +1140,9 @@ class LibraryModelsTest {
         val selectedOther = state.copy(detail = LibraryDetailState.Loading(otherItemId))
         assertNull(selectedOther.restoredDelete(listOf(entry), "member-a"))
         val editing = state.copy(
-            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("", "")),
+            edit = LibraryEditUiState(
+                otherItemId, 5, null, null, LibraryEditForm("", ""), LibraryEditForm("", ""),
+            ),
         )
         assertNull(editing.restoredDelete(listOf(entry), "member-a"))
     }
@@ -878,7 +1191,9 @@ class LibraryModelsTest {
     fun listDeleteReceiptRemovesOnlyItsTargetAndKeepsUnrelatedSelectedDetailAndEditor() {
         val state = listDeleteState().withListDeleteConfirmation(deleteItemId).copy(
             detail = LibraryDetailState.Loading(otherItemId),
-            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("draft", "note")),
+            edit = LibraryEditUiState(
+                otherItemId, 5, null, null, LibraryEditForm("draft", "note"), LibraryEditForm("", ""),
+            ),
         )
         val applied = state.withDeletedItems(setOf(deleteItemId), "삭제 완료")
 
@@ -895,6 +1210,40 @@ class LibraryModelsTest {
             .withDeletedItems(setOf(deleteItemId), "삭제 완료")
         assertEquals(LibraryDetailState.None, targetSelected.detail)
     }
+
+    private fun generatedEditDetail() = LibraryItemDetail(
+        id = deleteItemId,
+        version = 7,
+        url = "https://example.com/article",
+        displayTitle = "  자동으로 수집한 제목입니다.  후속 문장입니다.\n마지막 줄",
+        bodyText = "  수집한 한국어 본문입니다.\r\n둘째 줄 😀\n마지막 줄  ",
+        description = "미리보기 설명\n원본 그대로",
+        sharedText = "공유한 원문\nhttps://example.com/article",
+    )
+
+    private fun editState(detail: LibraryItemDetail) = LibraryEditUiState(
+        itemId = detail.id,
+        expectedVersion = requireNotNull(detail.version),
+        originalTitle = detail.userTitle,
+        originalNote = detail.note,
+        form = detail.editForm(),
+        baselineForm = detail.editForm(),
+    )
+
+    private fun prepareEdit(
+        detail: LibraryItemDetail,
+        form: LibraryEditForm = detail.editForm(),
+        requestId: String = this.requestId,
+    ) = prepareLibraryEdit(
+        ownerId = "member-a",
+        itemId = detail.id,
+        requestId = requestId,
+        expectedVersion = requireNotNull(detail.version),
+        originalTitle = detail.userTitle,
+        originalNote = detail.note,
+        baselineForm = detail.editForm(),
+        form = form,
+    )
 
     private fun listDeleteState() = LibraryUiState(
         availability = LibraryAvailability.Ready,

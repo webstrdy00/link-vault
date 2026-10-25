@@ -4,6 +4,8 @@ import android.content.Intent
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
@@ -24,6 +26,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -64,6 +69,76 @@ class LocalLibraryIntegrationTest {
             .performScrollTo()
             .performClick()
         return itemId
+    }
+
+    private suspend fun verifyDetailEditing(itemId: String, scenario: ActivityScenario<MainActivity>) {
+        val app = ApplicationProvider.getApplicationContext<LinkVaultApplication>()
+        val owner = checkNotNull(app.accountClient.sessionUserId())
+        val originalContent = "현재 저장된 내용\n두 번째 줄도 유지합니다."
+        suspend fun currentItem() = app.accountClient.libraryRequest(owner, "/items/$itemId")
+        suspend fun awaitItem(predicate: (JsonObject) -> Boolean) = withTimeout(30_000) {
+            while (!predicate(currentItem())) delay(500)
+        }
+        fun openEditor() {
+            compose.onNodeWithTag("detail-more").performScrollTo().performClick()
+            compose.onNodeWithText("제목/내용 수정").performClick()
+            awaitText("변경 사항 저장")
+        }
+
+        clickRoot("root-library")
+        awaitText("상세 편집 검증")
+        compose.onNodeWithTag("detail-$itemId").performScrollTo().performClick()
+        awaitText(originalContent)
+        val travelId = app.accountClient.libraryRequest(owner, "/categories")
+            .getValue("categories").jsonArray.single {
+                it.jsonObject.getValue("name").jsonPrimitive.content == "여행"
+            }.jsonObject.getValue("id").jsonPrimitive.content
+        compose.onNodeWithTag("detail-more").performScrollTo().performClick()
+        compose.onNodeWithTag("detail-manage-categories").performClick()
+        compose.onNodeWithTag("category-editor").assertIsDisplayed()
+        compose.waitUntil(timeoutMillis = 20_000) {
+            compose.onAllNodes(hasTestTag("classification-choice-$travelId")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag("classification-choice-$travelId").performScrollTo().performClick()
+        compose.onNodeWithText("선택 저장").performScrollTo().performClick()
+        awaitItem { item -> item.getValue("category_refs").jsonArray.any {
+            it.jsonObject.getValue("id").jsonPrimitive.content == travelId
+        } }
+        compose.onNodeWithTag("category-editor-close").performClick()
+        awaitText("여행")
+
+        openEditor()
+        compose.onNodeWithText("제목").assertTextContains("상세 편집 검증")
+        compose.onNodeWithText("내용").assertTextContains(originalContent)
+        compose.onNodeWithText("수정 취소").performScrollTo().performClick()
+        assertEquals(originalContent, currentItem().getValue("note").jsonPrimitive.content)
+        openEditor()
+        compose.onNodeWithText("제목").performScrollTo().performTextReplacement("수정한 제목")
+        compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
+        awaitItem { it.getValue("user_title").jsonPrimitive.content == "수정한 제목" }
+        assertEquals(originalContent, currentItem().getValue("note").jsonPrimitive.content)
+        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        awaitText(originalContent)
+        openEditor()
+        compose.onNodeWithText("내용").assertTextContains(originalContent)
+            .performScrollTo().performTextReplacement("수정한 내용\n줄바꿈도 보존합니다.")
+        compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
+        awaitItem { it.getValue("note").jsonPrimitive.content == "수정한 내용\n줄바꿈도 보존합니다." }
+        assertEquals("수정한 제목", currentItem().getValue("user_title").jsonPrimitive.content)
+        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        awaitText("수정한 내용\n줄바꿈도 보존합니다.")
+        scenario.recreate()
+        clickRoot("root-library")
+        awaitText("수정한 제목")
+        if (compose.onAllNodes(hasTestTag("detail-back")).fetchSemanticsNodes().isNotEmpty()) {
+            compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        }
+        compose.waitUntil(timeoutMillis = 20_000) {
+            compose.onAllNodes(hasTestTag("detail-$itemId")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag("detail-$itemId").performScrollTo().performClick()
+        awaitText("수정한 내용\n줄바꿈도 보존합니다.")
+        awaitText("여행")
     }
 
     @Test
@@ -114,6 +189,11 @@ class LocalLibraryIntegrationTest {
                 val app = ApplicationProvider.getApplicationContext<LinkVaultApplication>()
                 val owner = checkNotNull(app.accountClient.sessionUserId())
                 val seededItemId = arguments.getString("fixtureSeededItemId").orEmpty()
+                if (arguments.getString("fixtureDetailEdit") == "true") {
+                    check(seededItemId.isNotBlank())
+                    verifyDetailEditing(seededItemId, scenario)
+                    return@use
+                }
                 if (seededItemId.isNotBlank()) {
                     clickRoot("root-library")
                     awaitText("목록 삭제 검증")

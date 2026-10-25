@@ -297,11 +297,8 @@ fun LibraryScreen(
                     )
 
                     is LibraryDetailState.Loaded -> {
-                        var activeEditor by rememberSaveable(detail.item.id) {
-                            mutableStateOf<String?>(null)
-                        }
-                        LaunchedEffect(detail.item.id, incomingImageUri) {
-                            if (incomingImageUri != null) activeEditor = "images"
+                        var categoryEditorVisible by rememberSaveable(detail.item.id) {
+                            mutableStateOf(false)
                         }
                         DetailContent(
                             detail = detail,
@@ -317,19 +314,12 @@ fun LibraryScreen(
                             onLoadLatest = libraryViewModel::loadLatestForEdit,
                             onConfirmAgain = libraryViewModel::confirmEditAgain,
                             onBeginDelete = libraryViewModel::beginDelete,
-                            onManageImages = { activeEditor = "images" },
-                            onManageCategories = { activeEditor = "categories" },
+                            onManageCategories = { categoryEditorVisible = true },
                         )
-                        val canShowEditor = state.edit == null && state.delete == null
                         Column(
                             modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth(),
                             verticalArrangement = Arrangement.spacedBy(16.dp),
                         ) {
-                            if (activeEditor != null && canShowEditor) {
-                                TextButton(onClick = { activeEditor = null }) {
-                                    Text("관리 닫기")
-                                }
-                            }
                             AttachmentControls(
                                 item = detail.item,
                                 client = client,
@@ -338,20 +328,22 @@ fun LibraryScreen(
                                 onRefreshItem = { libraryViewModel.refreshDetail(detail.item.id) },
                                 incomingImageUri = incomingImageUri,
                                 onIncomingImageConsumed = onIncomingImageConsumed,
-                                showEditor = activeEditor == "images" && canShowEditor,
                             )
-                            if (activeEditor == "categories" && canShowEditor) {
-                                ClassificationControls(
-                                    client = client,
-                                    outbox = outbox,
-                                    entryId = entryId,
-                                    item = detail.item,
-                                    onRefresh = {
-                                        libraryViewModel.refreshDetail(detail.item.id)
-                                    },
-                                    onEditNote = libraryViewModel::beginEdit,
-                                )
-                            }
+                            ClassificationControls(
+                                client = client,
+                                outbox = outbox,
+                                entryId = entryId,
+                                item = detail.item,
+                                onRefresh = {
+                                    libraryViewModel.refreshDetail(detail.item.id)
+                                },
+                                onEditNote = {
+                                    categoryEditorVisible = false
+                                    libraryViewModel.beginEdit()
+                                },
+                                editorVisible = categoryEditorVisible,
+                                onDismiss = { categoryEditorVisible = false },
+                            )
                         }
                     }
                 }
@@ -1111,14 +1103,6 @@ internal fun LibraryItemCard(
                     }
                 }
             }
-            item.processingProblem()?.let { problem ->
-                Text(
-                    text = problem,
-                    modifier = Modifier.padding(top = 8.dp),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
         }
             if (onDelete != null) {
                 IconButton(
@@ -1358,7 +1342,6 @@ internal fun DetailContent(
     onLoadLatest: () -> Unit,
     onConfirmAgain: () -> Unit,
     onBeginDelete: () -> Unit,
-    onManageImages: (() -> Unit)? = null,
     onManageCategories: (() -> Unit)? = null,
 ) {
     val item = detail.item
@@ -1404,23 +1387,13 @@ internal fun DetailContent(
                     onDismissRequest = { showMoreMenu = false },
                 ) {
                     DropdownMenuItem(
-                        text = { Text("제목·메모 수정") },
+                        text = { Text("제목/내용 수정") },
                         onClick = {
                             showMoreMenu = false
                             onBeginEdit()
                         },
                         enabled = item.version != null,
                     )
-                    if (onManageImages != null) {
-                        DropdownMenuItem(
-                            text = { Text("이미지 관리") },
-                            onClick = {
-                                showMoreMenu = false
-                                onManageImages()
-                            },
-                            modifier = Modifier.testTag("detail-manage-images"),
-                        )
-                    }
                     if (onManageCategories != null) {
                         DropdownMenuItem(
                             text = { Text("분류 수정") },
@@ -1463,10 +1436,7 @@ internal fun DetailContent(
         }
         SelectionContainer(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = compactLibraryTitle(
-                    item.userTitle?.takeUnless(String::isBlank) ?: item.displayTitle,
-                    item.url,
-                ),
+                text = item.editableTitle(),
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.fillMaxWidth().testTag("detail-title"),
                 fontWeight = FontWeight.Bold,
@@ -1493,7 +1463,7 @@ internal fun DetailContent(
             Text("원문 열기")
         }
 
-        acquiredContent(item)?.let { content ->
+        item.displayedContent()?.let { content ->
             SelectionContainer {
                 Text(
                     text = content,
@@ -1505,15 +1475,6 @@ internal fun DetailContent(
         }
     }
 }
-
-private fun acquiredContent(item: LibraryItemDetail): String? =
-    listOf(item.bodyText, item.description, item.sharedText).firstOrNull { text ->
-        !text.isNullOrBlank() && !text.trim().split(Regex("\\s+")).all { part ->
-            part.startsWith("https://", ignoreCase = true) ||
-                part.startsWith("http://", ignoreCase = true) ||
-                part.startsWith("www.", ignoreCase = true)
-        }
-    }
 
 @Composable
 private fun DeleteStatusContent(
@@ -1598,7 +1559,7 @@ private fun EditContent(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "제목·메모 수정",
+                text = "제목/내용 수정",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -1606,8 +1567,8 @@ private fun EditContent(
                 value = edit.form.title,
                 onValueChange = onTitleChange,
                 enabled = canEdit,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("제목 (선택 사항)") },
+                modifier = Modifier.fillMaxWidth().testTag("detail-edit-title"),
+                label = { Text("제목") },
                 supportingText = {
                     Text("${edit.form.title.codePointLength()} / $LIBRARY_TITLE_MAX_CODE_POINTS")
                 },
@@ -1618,10 +1579,13 @@ private fun EditContent(
                 value = edit.form.note,
                 onValueChange = onNoteChange,
                 enabled = canEdit,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("메모 (선택 사항)") },
+                modifier = Modifier.fillMaxWidth().testTag("detail-edit-content"),
+                label = { Text("내용") },
                 supportingText = {
-                    Text("${edit.form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS")
+                    Column {
+                        Text("${edit.form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS")
+                        Text("내용을 비우면 수집한 내용을 다시 보여요.")
+                    }
                 },
                 isError = issues.any { it.field == LibraryFormField.NOTE },
                 minLines = 3,
@@ -1743,14 +1707,14 @@ private fun DraftComparison(form: LibraryEditForm, latest: LibraryItemDetail?) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text("내가 저장하려던 제목", fontWeight = FontWeight.SemiBold)
         SelectionContainer { Text(form.title.ifEmpty { "삭제" }) }
-        Text("내가 저장하려던 메모", fontWeight = FontWeight.SemiBold)
+        Text("내가 저장하려던 내용", fontWeight = FontWeight.SemiBold)
         SelectionContainer { Text(form.note.ifEmpty { "삭제" }) }
         if (latest != null) {
             HorizontalDivider()
             Text("최신 제목", fontWeight = FontWeight.SemiBold)
-            SelectionContainer { Text(latest.userTitle?.takeUnless(String::isEmpty) ?: "없음") }
-            Text("최신 메모", fontWeight = FontWeight.SemiBold)
-            SelectionContainer { Text(latest.note?.takeUnless(String::isEmpty) ?: "없음") }
+            SelectionContainer { Text(latest.editableTitle()) }
+            Text("최신 내용", fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(latest.displayedContent() ?: "없음") }
         }
     }
 }
@@ -1780,14 +1744,6 @@ private fun LoadingMessage(message: String) {
         CircularProgressIndicator(modifier = Modifier.size(24.dp))
         Text(message)
     }
-}
-
-private fun LibraryItemSummary.processingProblem(): String? {
-    val problems = buildList {
-        if (metadataState == "failed") add("링크 정보를 가져오지 못했어요.")
-        if (ocrState == "failed") add("이미지에서 글자를 읽지 못했어요.")
-    }
-    return problems.takeIf { it.isNotEmpty() }?.joinToString(" ")
 }
 
 private fun OutboxState.queueMessage(): String = when (this) {

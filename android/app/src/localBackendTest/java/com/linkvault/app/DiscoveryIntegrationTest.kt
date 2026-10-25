@@ -95,7 +95,16 @@ class DiscoveryIntegrationTest {
         awaitText("원문 열기")
         clickTag("detail-more")
         clickTag("detail-manage-categories", scrollTo = false)
-        awaitText("카테고리")
+        awaitTag("category-editor")
+        awaitText("직접 선택 (", substring = true)
+    }
+
+    private fun closeDetailCategories() {
+        clickTag("category-editor-close", scrollTo = false)
+        compose.waitUntil(timeoutMillis = UI_TIMEOUT_MILLIS) {
+            compose.onAllNodes(hasTestTag("category-editor"), useUnmergedTree = true)
+                .fetchSemanticsNodes().isEmpty()
+        }
     }
 
     private fun openCategoryManagement() {
@@ -215,6 +224,7 @@ class DiscoveryIntegrationTest {
                 compose.onNodeWithText("신뢰도", substring = true).assertDoesNotExist()
                 compose.onNodeWithText("점수", substring = true).assertDoesNotExist()
 
+                closeDetailCategories()
                 clickRoot("root-discovery")
                 openCategoryManagement()
                 compose.onNodeWithTag("category-name-field")
@@ -227,7 +237,6 @@ class DiscoveryIntegrationTest {
 
                 clickTag("search-item-$aliasItemId")
                 openDetailCategories()
-                compose.onNodeWithText("카테고리 관리").performScrollTo().performClick()
                 awaitText("직접 선택 (1 / 5)")
                 clickTag("classification-choice-$workCategoryId")
                 clickTag("classification-choice-$customCategoryId")
@@ -289,6 +298,7 @@ class DiscoveryIntegrationTest {
                 awaitText("분류에 반영된 표현 · 엑셀")
                 assertWorkExplanation(readItem(application, aliasItemId))
 
+                closeDetailCategories()
                 clickRoot("root-discovery")
                 awaitTag("search-query")
                 compose.onNodeWithTag("search-query").performTextReplacement("")
@@ -302,6 +312,7 @@ class DiscoveryIntegrationTest {
                 val dismissed = readItem(application, cueItemId)
                 assertEquals(true, dismissed["cue_prompt_dismissed"]?.jsonPrimitive?.booleanOrNull)
 
+                closeDetailCategories()
                 scenario.recreate()
                 compose.waitForIdle()
                 awaitTag("detail-back")
@@ -314,15 +325,16 @@ class DiscoveryIntegrationTest {
                 )
                 compose.onNodeWithText(CUE_PROMPT).assertDoesNotExist()
 
+                closeDetailCategories()
                 clickTag("detail-more")
-                awaitText("제목·메모 수정")
-                compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
+                awaitText("제목/내용 수정")
+                compose.onNodeWithText("제목/내용 수정").performScrollTo().performClick()
                 awaitText("변경 사항 저장")
-                compose.onNodeWithText("메모 (선택 사항)")
+                compose.onNodeWithTag("detail-edit-content")
                     .performScrollTo()
                     .performTextReplacement("메모")
                 compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
-                awaitText("제목·메모를 저장했어요.")
+                awaitText("제목·내용을 저장했어요.")
                 compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
                 openDetailCategories()
                 awaitText(CUE_PROMPT)
@@ -466,7 +478,7 @@ class DiscoveryIntegrationTest {
     private companion object {
         const val UI_TIMEOUT_MILLIS = 60_000L
         const val CUSTOM_CATEGORY_NAME = "에뮬레이터분류"
-        const val CUE_PROMPT = "검색을 위한 메모"
+        const val CUE_PROMPT = "내용 쓰기"
         const val REAPPLY_SCREENSHOT_PATH = "/data/local/tmp/link-vault-reapply.png"
         val FIXED_CLASSIFICATION_STATES = setOf(
             "pending",

@@ -24,6 +24,7 @@ private val libraryJson = Json { ignoreUnknownKeys = true }
 private const val LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS = 60
 private val libraryTitleWhitespace = Regex("[\\s\\p{Z}]+")
 private val libraryTitleSentenceEnd = Regex("""[.!?。！？]+["'”’」』)]*(?= |$)""")
+private val libraryContentWhitespace = Regex("\\s+")
 
 internal fun compactLibraryTitle(title: String?, url: String): String {
     val original = title?.takeUnless(String::isBlank) ?: url
@@ -90,6 +91,11 @@ data class LibrarySaveOperation(
 data class LibraryEditForm(
     val title: String,
     val note: String,
+)
+
+internal fun LibraryItemDetail.editForm() = LibraryEditForm(
+    title = editableTitle(),
+    note = displayedContent().orEmpty(),
 )
 
 sealed interface LibraryEditPreparation {
@@ -319,7 +325,7 @@ fun validateLibraryEditForm(form: LibraryEditForm): List<LibraryFormIssue> = bui
         add(
             LibraryFormIssue(
                 LibraryFormField.NOTE,
-                "메모는 최대 ${LIBRARY_NOTE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
+                "내용은 최대 ${LIBRARY_NOTE_MAX_CODE_POINTS}자까지 입력할 수 있어요.",
             ),
         )
     }
@@ -332,6 +338,7 @@ fun prepareLibraryEdit(
     expectedVersion: Long,
     originalTitle: String?,
     originalNote: String?,
+    baselineForm: LibraryEditForm,
     form: LibraryEditForm,
 ): LibraryEditPreparation {
     val issues = validateLibraryEditForm(form).toMutableList()
@@ -348,14 +355,14 @@ fun prepareLibraryEdit(
         )
     }
 
-    val desiredTitle = form.title.takeUnless(String::isEmpty)
-    val desiredNote = form.note.takeUnless(String::isEmpty)
-    val changesTitle = desiredTitle != originalTitle
-    val changesNote = desiredNote != originalNote
+    val desiredTitle = form.title.takeUnless(String::isBlank)
+    val desiredNote = form.note.takeUnless(String::isBlank)
+    val changesTitle = form.title != baselineForm.title && desiredTitle != originalTitle
+    val changesNote = form.note != baselineForm.note && desiredNote != originalNote
     if (!changesTitle && !changesNote) {
         issues += LibraryFormIssue(
             LibraryFormField.TITLE,
-            "변경된 제목이나 메모가 없어요.",
+            "변경된 제목이나 내용이 없어요.",
         )
     }
     if (issues.isNotEmpty()) return LibraryEditPreparation.Invalid(issues)
@@ -398,6 +405,11 @@ internal fun parseLibraryEditPatch(payloadJson: String): LibraryEditPatch {
         note = payload.nullableString("note"),
     )
 }
+
+internal fun LibraryEditPatch.applyToForm(baseline: LibraryEditForm) = LibraryEditForm(
+    title = if (changesTitle) title.orEmpty() else baseline.title,
+    note = if (changesNote) note.orEmpty() else baseline.note,
+)
 
 fun prepareLibraryCategoryEdit(
     ownerId: String,
@@ -562,6 +574,19 @@ data class LibraryItemDetail(
     val extractionMeta: LibraryExtractionMeta = LibraryExtractionMeta(),
     @SerialName("active_asset") val activeAsset: LibraryActiveAsset? = null,
 )
+
+fun LibraryItemDetail.editableTitle(): String =
+    userTitle?.takeUnless(String::isBlank) ?: compactLibraryTitle(displayTitle, url)
+
+fun LibraryItemDetail.displayedContent(): String? =
+    note?.takeUnless(String::isBlank)
+        ?: listOf(bodyText, description, sharedText).firstOrNull { text ->
+            !text.isNullOrBlank() && !text.trim().split(libraryContentWhitespace).all { part ->
+                part.startsWith("https://", ignoreCase = true) ||
+                    part.startsWith("http://", ignoreCase = true) ||
+                    part.startsWith("www.", ignoreCase = true)
+            }
+        }
 
 fun LibraryItemDetail.currentClassificationExplanations(
     category: LibraryCategoryRef,

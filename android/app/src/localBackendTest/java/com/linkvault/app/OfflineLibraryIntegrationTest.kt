@@ -161,9 +161,13 @@ class OfflineLibraryIntegrationTest {
             compose.onNodeWithText("카테고리 관리").assertDoesNotExist()
             compose.onNodeWithTag("detail-more").performScrollTo().performClick()
             compose.onNodeWithTag("detail-manage-categories").performClick()
-            awaitText("카테고리 관리")
-            compose.onNodeWithText("카테고리 관리").performScrollTo().performClick()
+            awaitTag("category-editor")
             awaitText("직접 선택 (", substring = true)
+            compose.onNodeWithTag("category-editor-close").performClick()
+            compose.waitUntil(30_000) {
+                compose.onAllNodes(hasTestTag("category-editor"), useUnmergedTree = true)
+                    .fetchSemanticsNodes().isEmpty()
+            }
             compose.onNodeWithTag("detail-back").performScrollTo().performClick()
             awaitTag("detail-${argument("fixtureItemId")}")
             compose.onNodeWithTag("detail-${argument("fixtureItemId")}").performScrollTo().performClick()
@@ -183,7 +187,7 @@ class OfflineLibraryIntegrationTest {
             assertTrue(rejected is com.linkvault.app.auth.AccountClientException)
             assertEquals(owner, app.accountClient.sessionUserId())
             compose.onNodeWithTag("detail-more").performScrollTo().performClick()
-            compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
+            compose.onNodeWithText("제목/내용 수정").performScrollTo().performClick()
             val current = app.accountClient.libraryRequest(owner, "/items/${argument("fixtureItemId")}")
             app.accountClient.libraryRequest(
                 expectedOwnerId = owner,
@@ -195,14 +199,14 @@ class OfflineLibraryIntegrationTest {
                     put("note", "외부에서 먼저 수정한 메모")
                 }.toString(),
             )
-            compose.onNodeWithText("메모 (선택 사항)").performScrollTo()
+            compose.onNodeWithTag("detail-edit-content").performScrollTo()
                 .performTextReplacement("재시작 후 편집 검증")
             compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
             awaitText("변경 충돌", substring = true)
             compose.onAllNodesWithText("최신 내용 확인")[0].performScrollTo().performClick()
             awaitText("외부에서 먼저 수정한 메모", substring = true)
             compose.onNodeWithText("다시 저장").performScrollTo().performClick()
-            awaitText("제목·메모를 저장했어요.")
+            awaitText("제목·내용을 저장했어요.")
             compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
             scenario.recreate()
             awaitText("재시작 후 편집 검증")

@@ -7,7 +7,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -19,7 +18,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ProvideTextStyle
@@ -30,11 +28,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,7 +41,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linkvault.app.auth.AccountClient
-import com.linkvault.app.library.LibraryActiveAsset
 import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
@@ -61,7 +55,6 @@ fun AttachmentControls(
     onRefreshItem: () -> Unit,
     incomingImageUri: Uri? = null,
     onIncomingImageConsumed: () -> Unit = {},
-    showEditor: Boolean = false,
 ) {
     val context = LocalContext.current
     val currentOnIncomingImageConsumed by rememberUpdatedState(onIncomingImageConsumed)
@@ -126,15 +119,7 @@ fun AttachmentControls(
         onDispose { attachmentViewModel.setVisible(false) }
     }
 
-    if (!showEditor) return
-
-    HorizontalDivider()
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text(
-            text = "이미지 첨부",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-        )
         if (!state.sessionValid) {
             Text(
                 text = "로그인이 바뀌어 첨부 자료를 화면에서 지웠어요.",
@@ -144,9 +129,7 @@ fun AttachmentControls(
             return@Column
         }
 
-        AttachmentStatusContent(state)
-        ActivePreview(state)
-        AttachmentButtons(
+        AttachmentImageContent(
             state = state,
             incomingImageUri = incomingImageUri,
             onImportShared = { incoming ->
@@ -162,8 +145,10 @@ fun AttachmentControls(
                 )
             },
             onDelete = attachmentViewModel::requestDelete,
-            onRetryOcr = { attachmentViewModel.retryOcr(context.applicationContext) },
-            onRetryMetadata = attachmentViewModel::retryMetadata,
+            onRetryCommand = attachmentViewModel::retryCommand,
+            onReviewCommand = attachmentViewModel::reviewCommandConflict,
+            onConfirmCommandAgain = attachmentViewModel::confirmCommandAgain,
+            onDiscardCommand = attachmentViewModel::discardCommand,
         )
 
         state.deleteConfirmation?.let {
@@ -186,209 +171,53 @@ fun AttachmentControls(
             )
         }
 
+    }
+}
+
+@Composable
+internal fun AttachmentImageContent(
+    state: AttachmentUiState,
+    incomingImageUri: Uri?,
+    onImportShared: (Uri) -> Unit,
+    onPick: () -> Unit,
+    onDelete: () -> Unit,
+    onRetryCommand: (String) -> Unit,
+    onReviewCommand: (String) -> Unit,
+    onConfirmCommandAgain: () -> Unit,
+    onDiscardCommand: (String) -> Unit,
+) {
+    if (!state.sessionValid) return
+    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        ActivePreview(state)
+        AttachmentButtons(
+            state = state,
+            incomingImageUri = incomingImageUri,
+            onImportShared = onImportShared,
+            onPick = onPick,
+            onDelete = onDelete,
+        )
+        if (state.localStage == AttachmentLocalStage.PREPARING ||
+            state.localStage == AttachmentLocalStage.OCR_RUNNING
+        ) {
+            StatusLine("이미지를 준비하고 있어요.", busy = true)
+        }
+        if (state.commandEntries.any { it.method != "DELETE" }) {
+            Text("이전 이미지 작업을 확인해 주세요")
+        }
         state.commandEntries.forEach { entry ->
             PendingCommandContent(
                 entry = entry,
                 review = state.commandReview?.takeIf { it.requestId == entry.requestId },
                 enabled = !state.actionRunning,
-                onRetry = { attachmentViewModel.retryCommand(entry.requestId) },
-                onReview = { attachmentViewModel.reviewCommandConflict(entry.requestId) },
-                onConfirmAgain = attachmentViewModel::confirmCommandAgain,
-                onDiscard = { attachmentViewModel.discardCommand(entry.requestId) },
+                onRetry = { onRetryCommand(entry.requestId) },
+                onReview = { onReviewCommand(entry.requestId) },
+                onConfirmAgain = onConfirmCommandAgain,
+                onDiscard = { onDiscardCommand(entry.requestId) },
             )
         }
-
-        state.message?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        state.actionError?.let { message ->
+            Text(message, color = MaterialTheme.colorScheme.error)
         }
-        state.actionError?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-    }
-}
-
-@Composable
-private fun AttachmentStatusContent(state: AttachmentUiState) {
-    var detailsExpanded by rememberSaveable(state.item.id) { mutableStateOf(false) }
-    val metadataNeedsAttention = when (state.item.metadataState) {
-        "ready", "unsupported" -> false
-        else -> true
-    }
-    val hasDetails = state.item.activeAsset != null ||
-        !metadataNeedsAttention ||
-        state.item.extractionMeta.hasTruncatedText
-
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        AttachmentInfoSection(
-            title = "이미지 상태",
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("attachment-queue-status"),
-        ) {
-            when {
-                state.item.activeAsset != null ->
-                    Text("서버에 저장된 활성 이미지가 있어요.")
-                state.localStage != AttachmentLocalStage.IDLE ||
-                    state.pendingAttachments.isNotEmpty() ->
-                    Text("새 이미지를 준비하거나 전송하고 있어요.")
-                state.attachmentQueueLoaded && state.outboxLoaded ->
-                    Text("첨부 이미지가 없어요.")
-            }
-            if (!state.attachmentQueueLoaded || !state.outboxLoaded) {
-                StatusLine("이 기기의 대기 작업을 확인하고 있어요.", busy = true)
-            }
-            when (state.localStage) {
-                AttachmentLocalStage.PREPARING -> StatusLine(
-                    message = "선택한 원본은 바꾸지 않고 기기 안에서 업로드 사본을 준비하고 있어요.",
-                    busy = true,
-                )
-                AttachmentLocalStage.OCR_RUNNING ->
-                    Text("업로드 사본을 기기에 준비했어요.")
-                AttachmentLocalStage.QUEUED -> Text("기기에 보관됨 · 전송 대기 중")
-                AttachmentLocalStage.FAILED -> Text(
-                    "기기에서 이미지를 준비하지 못했어요.",
-                    color = MaterialTheme.colorScheme.error,
-                )
-                AttachmentLocalStage.IDLE -> Unit
-            }
-            if (state.pendingAttachments.any { it.stage in ATTACHMENT_UPLOADING_STAGES }) {
-                StatusLine("서버로 이미지를 전송하고 있어요.", busy = true)
-            }
-            if (state.pendingAttachments.any { it.stage in ATTACHMENT_FAILED_STAGES }) {
-                Text(
-                    "완료하지 못한 이미지 작업이 있어요. 아래에서 검토하거나 다시 시도해 주세요.",
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-
-        AttachmentInfoSection(title = "텍스트 인식 (OCR)") {
-            when {
-                state.localStage == AttachmentLocalStage.OCR_RUNNING ->
-                    StatusLine("기기에서 OCR을 실행하고 있어요.", busy = true)
-                state.item.activeAsset != null -> Text(
-                    ocrStatusMessage(state.item),
-                    style = if (state.item.ocrState == "failed") {
-                        MaterialTheme.typography.bodyMedium
-                    } else {
-                        MaterialTheme.typography.bodySmall
-                    },
-                    color = if (state.item.ocrState == "failed") {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
-                state.localOcrFailed -> Text(
-                    "OCR은 실패했지만 이미지 준비나 업로드 실패를 뜻하지 않아요.",
-                    color = MaterialTheme.colorScheme.error,
-                )
-                else -> Text(
-                    "이미지를 첨부하면 글자를 인식해 검색 가능한 텍스트로 저장해요.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (state.localOcrFailed && state.item.activeAsset != null) {
-                Text(
-                    "OCR은 실패했지만 이미지 준비나 업로드 실패를 뜻하지 않아요.",
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
-
-        if (metadataNeedsAttention) {
-            AttachmentInfoSection(title = "링크 정보") {
-                if (state.item.isMetadataProcessing) {
-                    StatusLine(metadataStatusMessage(state.item), busy = true)
-                } else {
-                    Text(
-                        metadataStatusMessage(state.item),
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-            }
-        }
-
-        if (hasDetails) {
-            TextButton(
-                onClick = { detailsExpanded = !detailsExpanded },
-                shape = EditorialShape,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp),
-            ) {
-                Text(if (detailsExpanded) "세부 정보 숨기기" else "세부 정보 보기")
-            }
-        }
-
-        if (detailsExpanded && hasDetails) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-                ),
-                shape = EditorialShape,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text(
-                        text = "세부 정보",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
-                        state.item.activeAsset?.let { asset ->
-                            Text(activeAssetDescription(asset))
-                        }
-                        if (!metadataNeedsAttention) {
-                            Text(metadataStatusMessage(state.item))
-                        }
-                        if (state.item.extractionMeta.hasTruncatedText) {
-                            Text(
-                                "수집된 메타데이터 일부는 저장 길이 제한에 맞춰 잘렸어요.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun AttachmentInfoSection(
-    title: String,
-    modifier: Modifier = Modifier,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Column(modifier = modifier.fillMaxWidth()) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Column(
-            modifier = Modifier.padding(top = 8.dp, bottom = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            ProvideTextStyle(MaterialTheme.typography.bodyMedium) {
-                content()
-            }
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
@@ -427,16 +256,12 @@ private fun ActivePreview(state: AttachmentUiState) {
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(
-                text = "미리보기",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
             when {
                 state.preview != null -> Image(
                     bitmap = state.preview.asImageBitmap(),
                     contentDescription = "첨부 이미지 미리보기",
                     modifier = Modifier
+                        .testTag("attachment-image")
                         .fillMaxWidth()
                         .heightIn(max = 360.dp)
                         .clip(MaterialTheme.shapes.medium),
@@ -460,8 +285,6 @@ private fun AttachmentButtons(
     onImportShared: (Uri) -> Unit,
     onPick: () -> Unit,
     onDelete: () -> Unit,
-    onRetryOcr: () -> Unit,
-    onRetryMetadata: () -> Unit,
 ) {
     val hasActiveAsset = state.item.activeAsset != null
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -476,7 +299,7 @@ private fun AttachmentButtons(
                     .heightIn(min = 48.dp)
                     .testTag("attachment-import-shared"),
             ) {
-                Text("공유 이미지 첨부")
+                Text("공유 이미지 추가")
             }
         }
         Button(
@@ -488,7 +311,7 @@ private fun AttachmentButtons(
                 .heightIn(min = 48.dp)
                 .testTag(if (hasActiveAsset) "attachment-replace" else "attachment-pick"),
         ) {
-            Text(if (hasActiveAsset) "교체" else "이미지 첨부")
+            Text(if (hasActiveAsset) "이미지 변경" else "이미지 추가")
         }
         if (hasActiveAsset) {
             OutlinedButton(
@@ -503,33 +326,7 @@ private fun AttachmentButtons(
                     .heightIn(min = 48.dp)
                     .testTag("attachment-delete"),
             ) {
-                Text("삭제")
-            }
-        }
-        if (state.item.activeAsset != null && state.item.ocrState == "failed") {
-            OutlinedButton(
-                onClick = onRetryOcr,
-                enabled = state.canRetryOcr,
-                shape = EditorialShape,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .testTag("attachment-ocr-retry"),
-            ) {
-                Text("OCR 다시 시도")
-            }
-        }
-        if (state.supportsMetadataRetry) {
-            OutlinedButton(
-                onClick = onRetryMetadata,
-                enabled = state.canRetryMetadata,
-                shape = EditorialShape,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 48.dp)
-                    .testTag("metadata-retry"),
-            ) {
-                Text("메타데이터 다시 조회")
+                Text("이미지 삭제")
             }
         }
         if (state.item.version == null) {
@@ -634,16 +431,6 @@ private fun PendingAttachmentContent(
                     "이미지 첨부 · ${pending.stage.queueMessage()}",
                     fontWeight = FontWeight.SemiBold,
                 )
-                if (pending.ocrState == AttachmentOcrState.FAILED) {
-                    Text(
-                        "OCR은 실패했지만 이미지 업로드는 계속할 수 있어요.",
-                        color = if (needsAttention) {
-                            MaterialTheme.colorScheme.onErrorContainer
-                        } else {
-                            MaterialTheme.colorScheme.error
-                        },
-                    )
-                }
                 pending.errorCode?.let { errorCode ->
                     Text(
                         attachmentFailureMessage(errorCode),
@@ -780,7 +567,8 @@ private fun PendingCommandContent(
                 ),
             ) {
                 Text(
-                    "${entry.attachmentCommandLabel()} · ${entry.state.commandQueueMessage()}",
+                    "${if (entry.method == "DELETE") "이미지 삭제" else "이전 이미지 작업"} · " +
+                        entry.state.commandQueueMessage(),
                     fontWeight = FontWeight.SemiBold,
                 )
                 entry.errorCode?.let { errorCode ->
@@ -800,7 +588,9 @@ private fun PendingCommandContent(
                 }
                 when (entry.state) {
                     OutboxState.FAILED -> {
-                        if (entry.errorCode?.let(RETRYABLE_COMMAND_ERRORS::contains) == true) {
+                        if (entry.method == "DELETE" &&
+                            entry.errorCode?.let(RETRYABLE_COMMAND_ERRORS::contains) == true
+                        ) {
                             OutlinedButton(
                                 onClick = onRetry,
                                 enabled = enabled,
@@ -873,31 +663,6 @@ private fun PendingCommandContent(
     }
 }
 
-private fun activeAssetDescription(asset: LibraryActiveAsset): String =
-    "${asset.mimeType.removePrefix("image/").uppercase()} · ${asset.width}×${asset.height} · " +
-        formatBytes(asset.byteSize)
-
-private fun ocrStatusMessage(item: LibraryItemDetail): String = when (item.ocrState) {
-    "ready" -> if (item.activeAsset?.ocrTruncated == true) {
-        "OCR 텍스트를 저장 길이 제한에 맞춰 저장했어요."
-    } else {
-        "OCR 텍스트가 저장돼 있어요."
-    }
-    "failed" -> "OCR은 실패했지만 서버의 이미지는 정상적으로 유지돼요."
-    "not_requested" -> "저장된 OCR 텍스트가 없어요."
-    "pending" -> "OCR 상태를 확인하고 있어요."
-    else -> "OCR 상태를 확인할 수 없어요."
-}
-
-internal fun metadataStatusMessage(item: LibraryItemDetail): String = when (item.metadataState) {
-    "ready" -> "메타데이터 조회를 완료했어요. 페이지 전체 보존을 의미하지는 않아요."
-    "partial" -> "일부 메타데이터만 저장됐어요."
-    "unsupported" -> "링크 정보를 가져오지 못했어요. 다시 조회해 현재 지원 여부를 확인할 수 있어요."
-    "failed" -> "메타데이터 조회를 완료하지 못했어요."
-    "queued" -> "서버에서 메타데이터 조회를 기다리고 있어요."
-    "running" -> "서버에서 메타데이터를 조회하고 있어요."
-    else -> "메타데이터 상태를 확인할 수 없어요."
-}
 
 private fun AttachmentStage.queueMessage(): String = when (this) {
     AttachmentStage.RESERVE -> "서버 공간 예약 대기 중"
@@ -909,12 +674,6 @@ private fun AttachmentStage.queueMessage(): String = when (this) {
     AttachmentStage.CONFLICT -> "최신 버전과 충돌 · 확인 필요"
     AttachmentStage.EXPIRED -> "요청 만료 · 확인 필요"
     AttachmentStage.FAILED -> "이미지 전송 실패"
-}
-
-private fun OutboxEntry.attachmentCommandLabel(): String = when {
-    method == "DELETE" -> "이미지 삭제"
-    method == "PATCH" -> "OCR 저장"
-    else -> "메타데이터 다시 조회"
 }
 
 private fun OutboxState.commandQueueMessage(): String = when (this) {
@@ -945,16 +704,6 @@ internal fun commandFailureMessage(code: String): String = when (code) {
     else -> "서버 요청을 완료하지 못했어요."
 }
 
-private fun formatBytes(bytes: Long): String = when {
-    bytes >= 1_000_000L -> "%.1f MB".format(bytes / 1_000_000.0)
-    bytes >= 1_000L -> "%.1f KB".format(bytes / 1_000.0)
-    else -> "$bytes B"
-}
-
-private val ATTACHMENT_UPLOADING_STAGES = setOf(
-    AttachmentStage.UPLOAD,
-    AttachmentStage.COMPLETE,
-)
 private val ATTACHMENT_FAILED_STAGES = setOf(
     AttachmentStage.FAILED,
     AttachmentStage.CONFLICT,

@@ -399,10 +399,8 @@ class LibraryViewModel internal constructor(
                 expectedVersion = version,
                 originalTitle = detail.item.userTitle,
                 originalNote = detail.item.note,
-                form = LibraryEditForm(
-                    title = detail.item.userTitle.orEmpty(),
-                    note = detail.item.note.orEmpty(),
-                ),
+                form = detail.item.editForm(),
+                baselineForm = detail.item.editForm(),
             ),
         )
     }
@@ -577,6 +575,7 @@ class LibraryViewModel internal constructor(
             expectedVersion = edit.expectedVersion,
             originalTitle = edit.originalTitle,
             originalNote = edit.originalNote,
+            baselineForm = edit.baselineForm,
             form = edit.form,
         )
         when (preparation) {
@@ -629,7 +628,7 @@ class LibraryViewModel internal constructor(
                 ) {
                     state.copy(
                         detail = publication.toDetailState(),
-                        edit = currentEdit.copy(
+                        edit = currentEdit.withLatestForm(latest).copy(
                             status = LibraryEditStatus.ReadyToConfirm(
                                 requestId = blocked.requestId,
                                 reason = blocked.reason,
@@ -680,10 +679,11 @@ class LibraryViewModel internal constructor(
             expectedVersion = latestVersion,
             originalTitle = ready.latest.userTitle,
             originalNote = ready.latest.note,
+            baselineForm = ready.latest.editForm(),
             form = edit.form,
         )
         if (preparation is LibraryEditPreparation.Invalid) {
-            val noChange = preparation.issues.singleOrNull()?.message == "변경된 제목이나 메모가 없어요."
+            val noChange = preparation.issues.singleOrNull()?.message == "변경된 제목이나 내용이 없어요."
             if (!noChange) {
                 mutableUiState.value = mutableUiState.value.copy(
                     edit = edit.copy(status = LibraryEditStatus.Invalid(preparation.issues)),
@@ -726,7 +726,15 @@ class LibraryViewModel internal constructor(
                             } else {
                                 state.detail
                             },
-                            edit = edit.copy(status = LibraryEditStatus.Saved("최신 내용과 이미 같아요.")),
+                            edit = edit.copy(
+                                expectedVersion = latestVersion,
+                                originalTitle = ready.latest.userTitle,
+                                originalNote = ready.latest.note,
+                                form = ready.latest.editForm(),
+                                baselineForm = ready.latest.editForm(),
+                                submittedPatch = null,
+                                status = LibraryEditStatus.Saved("최신 내용과 이미 같아요."),
+                            ),
                         )
                     }
                     releaseEditRequestOwnership(boundOwner, ready.requestId)
@@ -788,6 +796,7 @@ class LibraryViewModel internal constructor(
                             expectedVersion = latestVersion,
                             originalTitle = ready.latest.userTitle,
                             originalNote = ready.latest.note,
+                            submittedPatch = parseLibraryEditPatch(operation.body),
                             status = LibraryEditStatus.Queued(operation.requestId),
                             latestError = null,
                         ),
@@ -942,7 +951,10 @@ class LibraryViewModel internal constructor(
         pendingEditRequestId = operation.requestId
         pendingEditItemId = operation.itemId
         mutableUiState.value = mutableUiState.value.copy(
-            edit = current.copy(status = LibraryEditStatus.Queuing),
+            edit = current.copy(
+                submittedPatch = parseLibraryEditPatch(operation.body),
+                status = LibraryEditStatus.Queuing,
+            ),
         )
         val job = viewModelScope.launch {
             try {
@@ -1640,10 +1652,8 @@ class LibraryViewModel internal constructor(
             return
         }
         val original = cached?.parseDetailOrNull()
-        val form = LibraryEditForm(
-            title = if (patch.changesTitle) patch.title.orEmpty() else original?.userTitle.orEmpty(),
-            note = if (patch.changesNote) patch.note.orEmpty() else original?.note.orEmpty(),
-        )
+        val baselineForm = original?.editForm() ?: LibraryEditForm("", "")
+        val form = patch.applyToForm(baselineForm)
         val reason = if (entry.state == OutboxState.CONFLICT) {
             LibraryEditBlockReason.VERSION_CONFLICT
         } else {
@@ -1660,6 +1670,8 @@ class LibraryViewModel internal constructor(
                 originalTitle = original?.userTitle,
                 originalNote = original?.note,
                 form = form,
+                baselineForm = baselineForm,
+                submittedPatch = patch,
                 status = LibraryEditStatus.Blocked(entry.requestId, reason),
             ),
         )
@@ -1804,11 +1816,10 @@ class LibraryViewModel internal constructor(
                             expectedVersion = publication.item.version ?: edit.expectedVersion,
                             originalTitle = publication.item.userTitle,
                             originalNote = publication.item.note,
-                            form = LibraryEditForm(
-                                title = publication.item.userTitle.orEmpty(),
-                                note = publication.item.note.orEmpty(),
-                            ),
-                            status = LibraryEditStatus.Saved("제목·메모를 저장했어요."),
+                            form = publication.item.editForm(),
+                            baselineForm = publication.item.editForm(),
+                            submittedPatch = null,
+                            status = LibraryEditStatus.Saved("제목·내용을 저장했어요."),
                         )
                     } else {
                         edit
@@ -2477,9 +2488,24 @@ data class LibraryEditUiState(
     val originalTitle: String?,
     val originalNote: String?,
     val form: LibraryEditForm,
+    val baselineForm: LibraryEditForm,
     val status: LibraryEditStatus = LibraryEditStatus.Idle,
     val latestError: String? = null,
+    val submittedPatch: LibraryEditPatch? = null,
 )
+
+internal fun LibraryEditUiState.withLatestForm(latest: LibraryItemDetail): LibraryEditUiState {
+    val latestForm = latest.editForm()
+    val changesTitle = submittedPatch?.changesTitle ?: (form.title != baselineForm.title)
+    val changesNote = submittedPatch?.changesNote ?: (form.note != baselineForm.note)
+    return copy(
+        form = LibraryEditForm(
+            title = if (changesTitle) form.title else latestForm.title,
+            note = if (changesNote) form.note else latestForm.note,
+        ),
+        baselineForm = latestForm,
+    )
+}
 
 data class LibraryDeleteUiState(
     val itemId: String,

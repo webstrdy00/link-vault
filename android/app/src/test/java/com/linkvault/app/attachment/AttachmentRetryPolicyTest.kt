@@ -161,25 +161,6 @@ class AttachmentRetryPolicyTest {
         assertFalse(item(metadataState = "pending").hasPendingEnrichment)
     }
 
-    @Test
-    fun metadataProgressAndFailureMessagesReflectServerStates() {
-        assertEquals(
-            "서버에서 메타데이터 조회를 기다리고 있어요.",
-            metadataStatusMessage(item(metadataState = "queued")),
-        )
-        assertEquals(
-            "서버에서 메타데이터를 조회하고 있어요.",
-            metadataStatusMessage(item(metadataState = "running")),
-        )
-        assertEquals(
-            "메타데이터 조회를 완료하지 못했어요.",
-            metadataStatusMessage(item(metadataState = "failed")),
-        )
-        assertEquals(
-            "링크 정보를 가져오지 못했어요. 다시 조회해 현재 지원 여부를 확인할 수 있어요.",
-            metadataStatusMessage(item(metadataState = "unsupported")),
-        )
-    }
 
     @Test
     fun legacyUnsupportedMetadataOffersExplicitRetryWithKnownVersion() {

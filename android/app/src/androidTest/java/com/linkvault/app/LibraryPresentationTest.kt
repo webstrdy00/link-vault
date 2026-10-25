@@ -1,6 +1,7 @@
 package com.linkvault.app
 
 import android.graphics.Bitmap
+import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -13,6 +14,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.asAndroidBitmap
@@ -23,11 +28,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
@@ -37,13 +46,23 @@ import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.test.platform.app.InstrumentationRegistry
+import com.linkvault.app.attachment.AttachmentImageContent
+import com.linkvault.app.attachment.AttachmentCommandKind
+import com.linkvault.app.attachment.AttachmentCommandReview
+import com.linkvault.app.attachment.AttachmentLocalStage
+import com.linkvault.app.attachment.AttachmentUiState
 import com.linkvault.app.library.DetailContent
+import com.linkvault.app.library.LibraryActiveAsset
 import com.linkvault.app.library.LibraryCategoryRef
 import com.linkvault.app.library.LibraryDetailState
+import com.linkvault.app.library.LibraryEditForm
+import com.linkvault.app.library.LibraryEditUiState
 import com.linkvault.app.library.LibraryItemCard
 import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.library.LibraryItemSummary
 import com.linkvault.app.library.LibraryRootHeader
+import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxState
 import com.linkvault.app.ui.VaultTheme
 import java.io.File
 import kotlin.math.abs
@@ -184,7 +203,6 @@ class LibraryPresentationTest {
                 sharedText = sharedText,
                 bodyText = body,
                 description = description,
-                note = "내가 따로 남긴 메모",
                 categoryRefs = listOf(LibraryCategoryRef(name = "여행")),
             ),
             onOpenOriginal = { openedUrl = it },
@@ -194,7 +212,6 @@ class LibraryPresentationTest {
         compose.onNodeWithText(title).assertDoesNotExist()
         compose.onNodeWithText(sharedText).assertDoesNotExist()
         compose.onNodeWithText("가져온 제목").assertDoesNotExist()
-        compose.onNodeWithText("내가 따로 남긴 메모").assertDoesNotExist()
         compose.onNodeWithText("여행").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("원문 열기").performScrollTo().performClick()
         compose.runOnIdle { assertEquals(url, openedUrl) }
@@ -238,12 +255,16 @@ class LibraryPresentationTest {
             ),
         )
 
-        compose.onNodeWithText("내가 정한 제목입니다.").assertIsDisplayed()
+        compose.onNodeWithTag("detail-title").assertTextEquals(userTitle)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertEquals(2, layouts.single().lineCount)
+                assertTrue(layouts.single().isLineEllipsized(1))
+            }
         compose.onNodeWithText("서버가 고른 제목입니다.").assertDoesNotExist()
-        compose.onNodeWithText(userTitle).assertDoesNotExist()
         compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
         compose.onNodeWithText(description).performScrollTo().assertTextEquals(description)
-        compose.onNodeWithText(userTitle).assertDoesNotExist()
         compose.onNodeWithText(displayTitle).assertDoesNotExist()
         compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
         compose.onNodeWithText("본문").assertDoesNotExist()
@@ -331,27 +352,265 @@ class LibraryPresentationTest {
     }
 
     @Test
-    fun imageAndCategoryEditorsRequireExplicitMoreActions() {
-        var imageActions = 0
+    fun categoryActionCallsTheEditorDirectlyWithoutImageOrOcrManagement() {
         var categoryActions = 0
+        var editActions = 0
         showDetail(
             publicTextDetail(),
-            onManageImages = { imageActions++ },
             onManageCategories = { categoryActions++ },
+            onBeginEdit = { editActions++ },
         )
 
         compose.onNodeWithTag("detail-manage-images").assertDoesNotExist()
         compose.onNodeWithTag("detail-manage-categories").assertDoesNotExist()
         assertNoDetailClutter()
         compose.onNodeWithTag("detail-more").performClick()
-        compose.onNodeWithTag("detail-manage-images").assertTextEquals("이미지 관리").performClick()
-        compose.runOnIdle {
-            assertEquals(1, imageActions)
-            assertEquals(0, categoryActions)
-        }
-        compose.onNodeWithTag("detail-more").performClick()
+        compose.onNodeWithText("이미지 관리").assertDoesNotExist()
+        compose.onNodeWithText("카테고리 관리").assertDoesNotExist()
+        compose.onNodeWithText("텍스트 인식 (OCR)").assertDoesNotExist()
         compose.onNodeWithTag("detail-manage-categories").assertTextEquals("분류 수정").performClick()
-        compose.runOnIdle { assertEquals(1, categoryActions) }
+        compose.runOnIdle {
+            assertEquals(1, categoryActions)
+            assertEquals(0, editActions)
+        }
+        compose.onNodeWithTag("detail-manage-categories").assertDoesNotExist()
+        compose.onNodeWithTag("detail-more").performClick()
+        compose.onNodeWithText("제목/내용 수정").performClick()
+        compose.runOnIdle { assertEquals(1, editActions) }
+    }
+
+    @Test
+    fun manualContentOverridesCollectedTextWithoutShowingBothVersions() {
+        val manual = "직접 수정한 첫 줄\n\n원래 줄바꿈과 마지막 줄을 그대로 보여요."
+        val item = publicTextDetail().copy(
+            note = manual,
+            sharedText = "공유받은 다른 원문",
+        )
+        showDetail(item)
+
+        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(manual)
+        compose.onAllNodesWithText(manual).assertCountEquals(1)
+        compose.onNodeWithText(publicText).assertDoesNotExist()
+        compose.onNodeWithText(item.sharedText!!).assertDoesNotExist()
+        assertNoDetailClutter()
+    }
+
+    @Test
+    fun editorShowsTheFullPrefilledTitleAndContentWithClearEmptyContentHint() {
+        val title = "내가 정한 전체 제목 " + "뒷부분도 수정할 수 있어요. ".repeat(8)
+        val content = "내가 수정한 내용\n두 번째 줄"
+        val form = LibraryEditForm(title = title, note = content)
+        val item = publicTextDetail().copy(userTitle = title, note = content)
+        showDetail(
+            item,
+            edit = LibraryEditUiState(
+                itemId = item.id,
+                expectedVersion = item.version!!,
+                originalTitle = title,
+                originalNote = content,
+                form = form,
+                baselineForm = form,
+            ),
+        )
+
+        compose.onNodeWithTag("detail-edit-title").assertTextContains(title)
+        compose.onNodeWithTag("detail-edit-content").performScrollTo().assertTextContains(content)
+        compose.onNodeWithText("제목").assertExists()
+        compose.onNodeWithText("내용").assertExists()
+        compose.onNodeWithText("내용을 비우면 수집한 내용을 다시 보여요.").assertExists()
+        compose.onNodeWithText("메모 (선택 사항)").assertDoesNotExist()
+    }
+
+    @Test
+    fun attachedImageIsInlineBelowTextAndKeepsConciseExplicitActions() {
+        val bitmap = Bitmap.createBitmap(24, 16, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.BLUE)
+        val item = publicTextDetail().copy(
+            bodyText = "이미지는 이 내용 아래에 바로 보여요.",
+            activeAsset = LibraryActiveAsset(
+                id = "presentation-image",
+                objectPath = "private-presentation-image",
+                mimeType = "image/png",
+                byteSize = 128,
+                width = 24,
+                height = 16,
+            ),
+        )
+        var imageState by mutableStateOf(
+            AttachmentUiState(
+                item = item,
+                attachmentQueueLoaded = true,
+                outboxLoaded = true,
+                previewLoading = true,
+            ),
+        )
+        var replacements = 0
+        var deletions = 0
+        showDetail(item, attachmentContent = {
+            AttachmentImageContent(
+                state = imageState,
+                incomingImageUri = null,
+                onImportShared = {},
+                onPick = { replacements++ },
+                onDelete = { deletions++ },
+                onRetryCommand = {},
+                onReviewCommand = {},
+                onConfirmCommandAgain = {},
+                onDiscardCommand = {},
+            )
+        })
+
+        compose.onNodeWithTag("attachment-preview").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("미리보기를 안전하게 여는 중이에요.").assertExists()
+        compose.onNodeWithTag("attachment-image").assertDoesNotExist()
+        compose.runOnIdle { imageState = imageState.copy(preview = bitmap, previewLoading = false) }
+        compose.onNodeWithTag("attachment-image").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithContentDescription("첨부 이미지 미리보기").assertExists()
+        val content = compose.onNodeWithTag("detail-content").getUnclippedBoundsInRoot()
+        val image = compose.onNodeWithTag("attachment-image").getUnclippedBoundsInRoot()
+        assertTrue(image.top >= content.bottom)
+        compose.onNodeWithTag("attachment-replace").performScrollTo().assertTextEquals("이미지 변경").performClick()
+        compose.onNodeWithTag("attachment-delete").performScrollTo().assertTextEquals("이미지 삭제").performClick()
+        compose.runOnIdle {
+            assertEquals(1, replacements)
+            assertEquals(1, deletions)
+            imageState = imageState.copy(actionError = "선택한 이미지를 읽을 수 없어요.")
+        }
+        compose.onNodeWithText("선택한 이미지를 읽을 수 없어요.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("attachment-image").assertExists()
+        assertNoDetailClutter()
+        compose.onNodeWithTag("attachment-ocr-retry").assertDoesNotExist()
+        compose.onNodeWithTag("metadata-retry").assertDoesNotExist()
+        compose.runOnIdle { imageState = imageState.copy(sessionValid = false) }
+        compose.onNodeWithTag("attachment-image").assertDoesNotExist()
+    }
+
+    @Test
+    fun emptyAttachmentShowsOnlyAddAndPreservesIncomingImageActionDuringPreparation() {
+        val incoming = Uri.parse("content://com.linkvault.test/incoming.png")
+        var imageState by mutableStateOf(
+            AttachmentUiState(
+                item = publicTextDetail(),
+                attachmentQueueLoaded = true,
+                outboxLoaded = true,
+            ),
+        )
+        var sharedImage by mutableStateOf<Uri?>(null)
+        var selected: Uri? = null
+        var picks = 0
+        showDetail(publicTextDetail(), attachmentContent = {
+            AttachmentImageContent(
+                state = imageState,
+                incomingImageUri = sharedImage,
+                onImportShared = { selected = it },
+                onPick = { picks++ },
+                onDelete = {},
+                onRetryCommand = {},
+                onReviewCommand = {},
+                onConfirmCommandAgain = {},
+                onDiscardCommand = {},
+            )
+        })
+
+        compose.onNodeWithTag("attachment-pick").performScrollTo().assertTextEquals("이미지 추가").performClick()
+        compose.onNodeWithTag("attachment-preview").assertDoesNotExist()
+        compose.onNodeWithTag("attachment-delete").assertDoesNotExist()
+        compose.onNodeWithTag("attachment-replace").assertDoesNotExist()
+        compose.onNodeWithTag("attachment-import-shared").assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(1, picks)
+            sharedImage = incoming
+        }
+        compose.onNodeWithTag("attachment-import-shared").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertEquals(incoming, selected)
+            imageState = imageState.copy(localStage = AttachmentLocalStage.OCR_RUNNING)
+        }
+        compose.onNodeWithText("이미지를 준비하고 있어요.").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("attachment-import-shared").assertIsNotEnabled()
+        compose.onNodeWithTag("attachment-pick").assertIsNotEnabled()
+        assertNoDetailClutter()
+    }
+
+    @Test
+    fun previousBackgroundImageRequestsCanBeReviewedOrDiscardedWithoutOcrControls() {
+        val item = publicTextDetail()
+        val entry = OutboxEntry(
+            requestId = "old-image-request",
+            ownerId = "test-owner",
+            method = "PATCH",
+            path = "/items/${item.id}/assets/previous-image/ocr",
+            payloadJson = "{}",
+            state = OutboxState.CONFLICT,
+            attemptCount = 1,
+            createdAt = 1,
+            expiresAt = Long.MAX_VALUE,
+            nextAttemptAt = 1,
+            errorCode = "VERSION_CONFLICT",
+        )
+        var imageState by mutableStateOf(
+            AttachmentUiState(
+                item = item,
+                attachmentQueueLoaded = true,
+                outboxLoaded = true,
+                commandEntries = listOf(entry),
+            ),
+        )
+        var reviewedRequest: String? = null
+        var confirmations = 0
+        var discardedRequest: String? = null
+        showDetail(item, attachmentContent = {
+            AttachmentImageContent(
+                state = imageState,
+                incomingImageUri = null,
+                onImportShared = {},
+                onPick = {},
+                onDelete = {},
+                onRetryCommand = { throw AssertionError("Hidden background requests have no retry action.") },
+                onReviewCommand = { requestId ->
+                    reviewedRequest = requestId
+                    imageState = imageState.copy(
+                        commandReview = AttachmentCommandReview(
+                            requestId = requestId,
+                            kind = AttachmentCommandKind.OCR,
+                            targetAssetId = "previous-image",
+                            reviewedVersion = 2,
+                            targetStillCurrent = true,
+                        ),
+                    )
+                },
+                onConfirmCommandAgain = {
+                    confirmations++
+                    imageState = imageState.copy(commandEntries = emptyList(), commandReview = null)
+                },
+                onDiscardCommand = { requestId ->
+                    discardedRequest = requestId
+                    imageState = imageState.copy(commandEntries = emptyList(), commandReview = null)
+                },
+            )
+        })
+
+        compose.onNodeWithText("이전 이미지 작업을 확인해 주세요").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("attachment-pick").assertIsNotEnabled()
+        compose.onNodeWithText("최신 내용 확인").performScrollTo().performClick()
+        compose.onNodeWithText("확인한 버전으로 새 요청").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertEquals(entry.requestId, reviewedRequest)
+            assertEquals(1, confirmations)
+        }
+        compose.onNodeWithTag("attachment-pick").assertIsEnabled()
+        compose.runOnIdle {
+            imageState = imageState.copy(
+                commandEntries = listOf(entry.copy(state = OutboxState.FAILED, errorCode = "NETWORK_ERROR")),
+            )
+        }
+        compose.onNodeWithTag("attachment-pick").assertIsNotEnabled()
+        compose.onNodeWithText("요청 다시 시도").assertDoesNotExist()
+        compose.onNodeWithText("요청 버리기").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(entry.requestId, discardedRequest) }
+        compose.onNodeWithTag("attachment-pick").assertIsEnabled()
+        compose.onNodeWithText("이전 이미지 작업을 확인해 주세요").assertDoesNotExist()
+        assertNoDetailClutter()
     }
 
     @Test
@@ -452,8 +711,10 @@ class LibraryPresentationTest {
         onOpenOriginal: (String) -> Unit = {},
         viewportWidth: Dp? = null,
         onBack: () -> Unit = {},
-        onManageImages: () -> Unit = {},
         onManageCategories: () -> Unit = {},
+        onBeginEdit: () -> Unit = {},
+        edit: LibraryEditUiState? = null,
+        attachmentContent: @Composable () -> Unit = {},
     ) {
         compose.setContent {
             VaultTheme {
@@ -470,11 +731,11 @@ class LibraryPresentationTest {
                     ) {
                         DetailContent(
                             detail = LibraryDetailState.Loaded(item),
-                            edit = null,
+                            edit = edit,
                             delete = null,
                             onBackToList = onBack,
                             onOpenOriginal = onOpenOriginal,
-                            onBeginEdit = {},
+                            onBeginEdit = onBeginEdit,
                             onEditTitleChange = {},
                             onEditNoteChange = {},
                             onSaveEdit = {},
@@ -482,9 +743,9 @@ class LibraryPresentationTest {
                             onLoadLatest = {},
                             onConfirmAgain = {},
                             onBeginDelete = {},
-                            onManageImages = onManageImages,
                             onManageCategories = onManageCategories,
                         )
+                        attachmentContent()
                     }
                     }
                 }

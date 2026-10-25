@@ -66,6 +66,89 @@ class AttachmentRetryPolicyTest {
     }
 
     @Test
+    fun stalePollResponseIsSkippedBeforeEnrichmentCompletes() {
+        val current = item(metadataState = "ready").copy(
+            version = 2L,
+            classificationState = "pending",
+        )
+        val stale = item(metadataState = "running").copy(version = 1L)
+        val completed = current.copy(version = 3L, classificationState = "automatic")
+
+        assertEquals(
+            AttachmentPollDecision.SKIP_STALE,
+            attachmentPollDecision(true, true, current.id, stale, current),
+        )
+        assertTrue(current.hasPendingEnrichment)
+        assertEquals(
+            AttachmentPollDecision.APPLY,
+            attachmentPollDecision(true, true, current.id, completed, current),
+        )
+        assertFalse(completed.hasPendingEnrichment)
+    }
+
+    @Test
+    fun pollResponseIsRecheckedAfterCurrentVersionAdvancesDuringCacheWrite() {
+        val current = item(metadataState = "queued").copy(version = 1L)
+        val response = current.copy(version = 2L, metadataState = "running")
+        assertEquals(
+            AttachmentPollDecision.APPLY,
+            attachmentPollDecision(true, true, current.id, response, current),
+        )
+
+        val advanced = current.copy(version = 3L, metadataState = "running")
+        assertEquals(
+            AttachmentPollDecision.SKIP_STALE,
+            attachmentPollDecision(true, true, current.id, response, advanced),
+        )
+        assertEquals(
+            AttachmentPollDecision.APPLY,
+            attachmentPollDecision(true, true, current.id, advanced, advanced),
+        )
+    }
+
+    @Test
+    fun wrongItemPollResponseStopsEvenWhenItsVersionIsStale() {
+        val current = item(metadataState = "running").copy(version = 2L)
+        listOf(1L, 2L, 3L).forEach { version ->
+            val wrongItem = current.copy(id = "item-b", version = version)
+            assertEquals(
+                AttachmentPollDecision.STOP,
+                attachmentPollDecision(true, true, current.id, wrongItem, current),
+            )
+        }
+    }
+
+    @Test
+    fun invalidIdentityOrHiddenScreenStopsPollingEvenWhenResponseIsStale() {
+        val current = item(metadataState = "running").copy(version = 2L)
+        listOf(1L, 2L, 3L).forEach { version ->
+            val response = current.copy(version = version)
+            assertEquals(
+                AttachmentPollDecision.STOP,
+                attachmentPollDecision(true, false, current.id, response, current),
+            )
+            assertEquals(
+                AttachmentPollDecision.STOP,
+                attachmentPollDecision(false, true, current.id, response, current),
+            )
+        }
+    }
+
+    @Test
+    fun pollResponseWithoutVersionCannotReplaceKnownVersion() {
+        val current = item(metadataState = "running").copy(version = 2L)
+        val unversioned = current.copy(version = null)
+        assertEquals(
+            AttachmentPollDecision.SKIP_STALE,
+            attachmentPollDecision(true, true, current.id, unversioned, current),
+        )
+        assertEquals(
+            AttachmentPollDecision.APPLY,
+            attachmentPollDecision(true, true, current.id, current, unversioned),
+        )
+    }
+
+    @Test
     fun terminalMetadataPollsOnlyForPendingClassification() {
         listOf("ready", "partial", "unsupported", "failed").forEach { metadata ->
             val terminalItem = item(metadataState = metadata)

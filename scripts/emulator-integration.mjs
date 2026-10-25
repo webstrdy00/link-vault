@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, execSync, spawnSync } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 const config = JSON.parse(execSync("npx --no-install supabase status -o json", {
@@ -13,12 +13,62 @@ assert.equal(
 );
 const fixtureEmail = `emulator-${randomUUID()}@example.test`;
 const fixturePassword = `Local-emulator-${randomUUID()}`;
-const fixtureUrl = `https://example.com/?capture-fixture=${randomUUID()}`;
+const fixtureKind = process.env.LINK_VAULT_TEST_FIXTURE ?? "generic";
+const fixtures = {
+  generic: {
+    url: `https://example.com/?capture-fixture=${randomUUID()}`,
+    title: "Example Domain",
+    metadata: "partial",
+    classification: "unclassified",
+  },
+  threads: {
+    url: "https://www.threads.com/@nasa/post/DdXJKzbkqPg",
+    title: "You've got mail: a postcard from Mars!",
+    metadata: "ready",
+    classification: "unclassified",
+  },
+  "instagram-travel": {
+    url: "https://www.instagram.com/visitjeju.kr/p/DPDtncZEueq/",
+    title: "가을에 제주여행 가고 싶은 사람",
+    metadata: "ready",
+    classification: "automatic",
+  },
+};
+assert.ok(Object.hasOwn(fixtures, fixtureKind), "Unknown device test fixture");
+const fixture = fixtures[fixtureKind];
+const fixtureUrl = fixture.url;
 let userId;
 let accessToken;
 const devices = execFileSync("adb", ["devices"], { encoding: "utf8" });
-const emulator = devices.match(/^(emulator-\d+)\s+device$/m)?.[1];
-assert.ok(emulator, "Start an Android emulator before this integration suite");
+// Physical-device testing is explicitly opt-in; never select a user's tablet
+// merely because it happens to be connected.
+const requestedSerial = process.env.LINK_VAULT_TEST_DEVICE_SERIAL;
+const serial = requestedSerial ??
+  devices.match(/^(emulator-\d+)\s+device$/m)?.[1];
+assert.ok(
+  serial,
+  "Start an emulator or explicitly set LINK_VAULT_TEST_DEVICE_SERIAL",
+);
+assert.ok(
+  devices.split(/\r?\n/).some((line) => {
+    const [id, state] = line.trim().split(/\s+/);
+    return id === serial && state === "device";
+  }),
+  "The selected test device must be connected and authorized",
+);
+const physicalDevice = !serial.startsWith("emulator-");
+if (physicalDevice) {
+  const mappings = execFileSync("adb", ["-s", serial, "reverse", "--list"], {
+    encoding: "utf8",
+  });
+  assert.ok(
+    mappings.split(/\r?\n/).some((line) => {
+      const fields = line.trim().split(/\s+/);
+      return fields[1] === "tcp:18021" && fields[2] === "tcp:18021";
+    }),
+    "Physical tests require an explicit adb reverse tcp:18021 tcp:18021 mapping",
+  );
+}
 
 async function api(
   route,
@@ -81,30 +131,143 @@ try {
     `-Pandroid.testInstrumentationRunnerArguments.fixtureEmail=${fixtureEmail}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixturePassword=${fixturePassword}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureUrl=${fixtureUrl}`,
+    `-Pandroid.testInstrumentationRunnerArguments.fixtureKind=${fixtureKind}`,
   ];
   const env = {
     ...process.env,
-    ANDROID_SERIAL: emulator,
-    SUPABASE_URL: "http://10.0.2.2:18021",
+    ANDROID_SERIAL: serial,
+    SUPABASE_URL: physicalDevice
+      ? "http://127.0.0.1:18021"
+      : "http://10.0.2.2:18021",
     SUPABASE_PUBLISHABLE_KEY: config.ANON_KEY,
     // No Google token is fabricated. This suite imports real local GoTrue sessions
     // via the test-only SDK client and does not exercise the Google provider.
     GOOGLE_WEB_CLIENT_ID: "local-instrumentation.apps.googleusercontent.com",
   };
-  const result = process.platform === "win32"
-    ? spawnSync(process.env.ComSpec || "cmd.exe", [
+  let diagnosticRequest;
+  let lastDiagnostic;
+  const diagnosticStarted = Date.now();
+  const inspectProgress = async () => {
+    try {
+      if (physicalDevice) {
+        const mappings = execFileSync("adb", [
+          "-s",
+          serial,
+          "reverse",
+          "--list",
+        ], {
+          encoding: "utf8",
+          timeout: 5000,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        if (
+          !mappings.split(/\r?\n/).some((line) => {
+            const fields = line.trim().split(/\s+/);
+            return fields[1] === "tcp:18021" && fields[2] === "tcp:18021";
+          })
+        ) {
+          execFileSync("adb", [
+            "-s",
+            serial,
+            "reverse",
+            "tcp:18021",
+            "tcp:18021",
+          ], {
+            timeout: 5000,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+          console.log("DEVICE_FIXTURE_USB_TUNNEL_RESTORED");
+        }
+      }
+      if (process.env.LINK_VAULT_TEST_DIAGNOSTICS !== "1") return;
+      const items = await api("/functions/v1/library-api/v1/items", {
+        token: accessToken,
+      });
+      const states = [];
+      for (const item of items.data?.items ?? []) {
+        const detail = await api(
+          `/functions/v1/library-api/v1/items/${item.id}`,
+          {
+            token: accessToken,
+          },
+        );
+        states.push({
+          metadata: detail.data?.metadata_state,
+          classification: detail.data?.classification_state,
+          expectedTitlePresent:
+            detail.data?.fetched_title?.includes(fixture.title) ?? false,
+          error: detail.data?.extraction_meta?.error_code ?? null,
+        });
+      }
+      const snapshot = JSON.stringify({ status: items.status, states });
+      if (snapshot !== lastDiagnostic) {
+        console.log(
+          "DEVICE_FIXTURE_PROGRESS",
+          Date.now() - diagnosticStarted,
+          snapshot,
+        );
+        lastDiagnostic = snapshot;
+      }
+    } catch (error) {
+      console.error("DEVICE_FIXTURE_PROGRESS_UNAVAILABLE", error.name);
+    }
+  };
+  const monitor =
+    physicalDevice || process.env.LINK_VAULT_TEST_DIAGNOSTICS === "1"
+      ? setInterval(() => {
+        if (!diagnosticRequest) {
+          diagnosticRequest = inspectProgress().finally(() => {
+            diagnosticRequest = undefined;
+          });
+        }
+      }, 10000)
+      : null;
+  const child = process.platform === "win32"
+    ? spawn(process.env.ComSpec || "cmd.exe", [
       "/d",
       "/s",
       "/c",
       [gradle, ...args].join(" "),
     ], { env, stdio: "inherit" })
-    : spawnSync(gradle, args, { env, stdio: "inherit" });
-  assert.equal(result.status, 0, "emulator integration test must pass");
+    : spawn(gradle, args, { env, stdio: "inherit" });
+  let exitCode;
+  try {
+    exitCode = await new Promise((resolve, reject) => {
+      child.once(
+        "error",
+        () => reject(new Error("Device test process could not start")),
+      );
+      child.once("close", resolve);
+    });
+  } finally {
+    if (monitor) clearInterval(monitor);
+    await diagnosticRequest;
+  }
+  if (exitCode !== 0) {
+    const failedItems = await api("/functions/v1/library-api/v1/items", {
+      token: accessToken,
+    });
+    for (const item of failedItems.data?.items ?? []) {
+      const failedDetail = await api(
+        `/functions/v1/library-api/v1/items/${item.id}`,
+        { token: accessToken },
+      );
+      console.error(JSON.stringify({
+        case: fixtureKind,
+        metadataState: failedDetail.data?.metadata_state,
+        classificationState: failedDetail.data?.classification_state,
+        expectedTitlePresent:
+          failedDetail.data?.fetched_title?.includes(fixture.title) ?? false,
+        extractionError: failedDetail.data?.extraction_meta?.error_code ?? null,
+      }));
+    }
+  }
+  assert.equal(exitCode, 0, "device integration test must pass");
   const items = await api("/functions/v1/library-api/v1/items", {
     token: accessToken,
   });
   assert.equal(items.status, 200);
-  assert.equal(items.data.items.length, 1, "emulator created exactly one item");
+  assert.equal(items.data.items.length, 1, "device created exactly one item");
   const detail = await api(
     `/functions/v1/library-api/v1/items/${items.data.items[0].id}`,
     { token: accessToken },
@@ -121,23 +284,27 @@ try {
     null,
     "URL-only UI save requires no manual title",
   );
-  assert.equal(
-    detail.data.fetched_title,
-    "Example Domain",
+  assert.ok(
+    detail.data.fetched_title?.includes(fixture.title),
     "public title reached the saved item",
   );
   assert.equal(
     detail.data.metadata_state,
-    "partial",
-    "title-only pages remain explicitly partial",
+    fixture.metadata,
+    "metadata completeness matches the public fixture",
   );
-  assert.notEqual(
+  assert.equal(
     detail.data.classification_state,
-    "pending",
+    fixture.classification,
     "automatic classification settled",
   );
+  if (fixtureKind === "instagram-travel") {
+    assert.ok(
+      detail.data.category_refs.some((category) => category.name === "여행"),
+    );
+  }
   console.log(
-    "PASS emulator UI -> real Auth session -> Edge API -> PostgreSQL -> reload",
+    "PASS device UI -> real Auth session -> Edge API -> PostgreSQL -> reload",
   );
   console.log(
     "Google Credential Manager/provider exchange remains a separate verification.",

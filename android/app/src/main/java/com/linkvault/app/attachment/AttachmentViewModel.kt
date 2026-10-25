@@ -126,6 +126,30 @@ internal val LibraryItemDetail.isMetadataProcessing: Boolean
 internal val LibraryItemDetail.hasPendingEnrichment: Boolean
     get() = isMetadataProcessing || classificationState == "pending"
 
+internal enum class AttachmentPollDecision {
+    APPLY,
+    SKIP_STALE,
+    STOP,
+}
+
+internal fun attachmentPollDecision(
+    visible: Boolean,
+    identityMatches: Boolean,
+    itemId: String,
+    latest: LibraryItemDetail,
+    current: LibraryItemDetail,
+): AttachmentPollDecision = when {
+    !visible || !identityMatches || latest.id != itemId -> AttachmentPollDecision.STOP
+    !isAtLeastVersion(latest, current) -> AttachmentPollDecision.SKIP_STALE
+    else -> AttachmentPollDecision.APPLY
+}
+
+private fun isAtLeastVersion(candidate: LibraryItemDetail, current: LibraryItemDetail): Boolean {
+    val currentVersion = current.version ?: return true
+    val candidateVersion = candidate.version ?: return false
+    return candidateVersion >= currentVersion
+}
+
 internal class AttachmentViewModel(
     private val client: AccountClient,
     private val outbox: OutboxRepository,
@@ -905,13 +929,29 @@ internal class AttachmentViewModel(
                         client.libraryRequest(boundOwner, "/items/$itemId")
                     } ?: break
                     val latest = parseLibraryDetailResponse(response)
-                    if (!visible || !identityMatches() || latest.id != itemId ||
-                        !isAtLeastVersion(latest, mutableUiState.value.item)
-                    ) {
-                        return@launch
+                    when (attachmentPollDecision(
+                        visible = visible,
+                        identityMatches = identityMatches(),
+                        itemId = itemId,
+                        latest = latest,
+                        current = mutableUiState.value.item,
+                    )) {
+                        AttachmentPollDecision.STOP -> return@launch
+                        AttachmentPollDecision.SKIP_STALE -> continue
+                        AttachmentPollDecision.APPLY -> Unit
                     }
                     outbox.cacheDetail(boundOwner, response)
-                    if (!visible || !identityMatches()) return@launch
+                    when (attachmentPollDecision(
+                        visible = visible,
+                        identityMatches = identityMatches(),
+                        itemId = itemId,
+                        latest = latest,
+                        current = mutableUiState.value.item,
+                    )) {
+                        AttachmentPollDecision.STOP -> return@launch
+                        AttachmentPollDecision.SKIP_STALE -> continue
+                        AttachmentPollDecision.APPLY -> Unit
+                    }
                     val previousItem = mutableUiState.value.item
                     updateItem(latest)
                     if (mutableUiState.value.item != previousItem) {
@@ -1048,12 +1088,6 @@ internal class AttachmentViewModel(
         val session = client.sessionState.value
         return !ownerId.isNullOrBlank() && session.ownerId == ownerId &&
             session.generation == sessionGeneration
-    }
-
-    private fun isAtLeastVersion(candidate: LibraryItemDetail, current: LibraryItemDetail): Boolean {
-        val currentVersion = current.version ?: return true
-        val candidateVersion = candidate.version ?: return false
-        return candidateVersion >= currentVersion
     }
 
     private fun isNewerVersion(candidate: Long?, baseline: Long?): Boolean =

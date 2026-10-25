@@ -110,6 +110,18 @@ APK: `android/app/build/outputs/apk/debug/app-debug.apk`
 **설정 없이도 빌드는 되지만 로그인·서버 보관함은 사용할 수 없습니다.**
 Gradle은 루트 `.env`를 자동으로 읽지 않습니다. 앱에는 서버 비밀키를 넣지 마세요.
 
+실기기 로컬 통합 검사는 테스트 전용 기기에서만 실행합니다. 앱을 설치하고 기존 앱 세션에서
+로그아웃하므로 개인 사용 세션에는 실행하지 마세요. 로컬 서버·작업 실행기가 준비되어 있어야 하며,
+화면 잠금을 해제한 상태에서 `adb -s <serial> reverse tcp:18021 tcp:18021`로 연결합니다.
+`LINK_VAULT_TEST_DEVICE_SERIAL=<serial>`을 명시해 `npm run test:emulator-integration`을 실행하면
+에뮬레이터 대신 지정한 기기를 사용합니다. Debug에서만 `http://127.0.0.1:18021`을 허용하며
+Release의 HTTPS 정책은 유지합니다. 종료 후에는 해당 reverse 연결을 해제하세요.
+`LINK_VAULT_TEST_FIXTURE`는 기본 `generic`(example.com), `threads`, `instagram-travel` 중
+선택하며, 마지막 항목은 실제 한국어 게시물의 여행 분류도 검사합니다.
+실행 중 USB 재연결로 reverse 연결이 사라지면 지정한 테스트 포트만 재설정합니다.
+`LINK_VAULT_TEST_DIAGNOSTICS=1`은 생성한 테스트 항목의 처리 상태·제목 확보 여부와 경과 시간을
+출력합니다. 계정 토큰·비밀번호·원문 내용은 진단 로그에 출력하지 않습니다.
+
 ## 지원 범위와 제한
 
 | 구분           | 현재 범위                                                                                         |

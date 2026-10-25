@@ -58,11 +58,21 @@ class LocalLibraryIntegrationTest {
 
     @Test
     fun realAuthenticatedSessionSavesAndReloadsOriginal(): Unit = runBlocking {
-        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL == "http://10.0.2.2:18021")
+        check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL in setOf(
+            "http://10.0.2.2:18021",
+            "http://127.0.0.1:18021",
+        ))
         val arguments = InstrumentationRegistry.getArguments()
         val email = checkNotNull(arguments.getString("fixtureEmail"))
         val password = checkNotNull(arguments.getString("fixturePassword"))
         val fixtureUrl = checkNotNull(arguments.getString("fixtureUrl"))
+        val fixtureKind = arguments.getString("fixtureKind") ?: "generic"
+        val expectedTitle = when (fixtureKind) {
+            "generic" -> "Example Domain"
+            "threads" -> "You've got mail: a postcard from Mars!"
+            "instagram-travel" -> "가을에 제주여행 가고 싶은 사람"
+            else -> error("Unknown device test fixture")
+        }
         val sessionClient = createSupabaseClient(
             BuildConfig.SUPABASE_URL, BuildConfig.SUPABASE_PUBLISHABLE_KEY,
         ) {
@@ -76,14 +86,20 @@ class LocalLibraryIntegrationTest {
                 this.email = email
                 this.password = password
             }
+            ApplicationProvider.getApplicationContext<LinkVaultApplication>().accountClient.restoreAccount()
             val intent = Intent(ApplicationProvider.getApplicationContext(), MainActivity::class.java).apply {
                 action = Intent.ACTION_MAIN
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
             ActivityScenario.launch<MainActivity>(intent).use {
                 clickRoot("root-account")
-                awaitText("베타 이용 승인 대기 중이에요")
-                compose.onNodeWithText("승인 상태 다시 확인").performScrollTo().performClick()
+                compose.waitUntil(timeoutMillis = 20_000) {
+                    compose.onAllNodesWithText("로그인했어요").fetchSemanticsNodes().isNotEmpty() ||
+                        compose.onAllNodesWithText("승인 상태 다시 확인").fetchSemanticsNodes().isNotEmpty()
+                }
+                if (compose.onAllNodesWithText("승인 상태 다시 확인").fetchSemanticsNodes().isNotEmpty()) {
+                    compose.onNodeWithText("승인 상태 다시 확인").performScrollTo().performClick()
+                }
                 awaitText("로그인했어요")
                 clickRoot("root-capture")
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo()
@@ -99,10 +115,15 @@ class LocalLibraryIntegrationTest {
                 awaitText("처리 정보 보기")
                 compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
                 awaitText("처리 정보")
-                awaitText("Example Domain", timeoutMillis = 180_000)
-                awaitText("링크 정보 · 일부만 가져옴")
+                awaitText(expectedTitle, substring = true, timeoutMillis = 180_000)
+                awaitText(if (fixtureKind == "generic") "링크 정보 · 일부만 가져옴" else "링크 정보 · 완료")
+                val classificationLabel = if (fixtureKind == "instagram-travel") {
+                    "자동 분류 · 자동 정리됨"
+                } else {
+                    "자동 분류 · 분류 없음"
+                }
                 compose.waitUntil(timeoutMillis = 180_000) {
-                    compose.onAllNodesWithText("자동 분류 · 분류 없음").fetchSemanticsNodes().isNotEmpty()
+                    compose.onAllNodesWithText(classificationLabel).fetchSemanticsNodes().isNotEmpty()
                 }
             }
         } finally {

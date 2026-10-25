@@ -490,9 +490,20 @@ function reportNetworkFailure(phase: "DNS" | "HTTP", error: unknown): void {
     "ERR_NOT_IMPLEMENTED",
     "CERT_HAS_EXPIRED",
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "ERR_TLS_HANDSHAKE_TIMEOUT",
+    "ERR_STREAM_PREMATURE_CLOSE",
+    "ERR_HTTP2_ERROR",
+    "EPROTO",
   ]);
   const reason = typeof code === "string" && knownCodes.has(code)
     ? code
+    : /module|package|specifier|resolve.*import/i.test(message)
+    ? "MODULE_RESOLUTION"
     : /not implemented|not supported|unsupported/i.test(message)
     ? "UNSUPPORTED_RUNTIME"
     : /permission/i.test(message)

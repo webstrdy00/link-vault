@@ -417,6 +417,30 @@ class AccountConfigTest {
     }
 
     @Test
+    fun `USB reverse loopback is allowed only for the debug local backend port`() {
+        val allowed = validateAccountConfig(
+            url = "http://127.0.0.1:18021",
+            key = "publishable-key",
+            googleWebClientId = "web-client-id",
+            debug = true,
+        )
+        assertTrue(allowed is AccountConfigValidation.Configured)
+        for ((url, debug) in listOf(
+            "http://127.0.0.1:18021" to false,
+            "http://127.0.0.1:8000" to true,
+            "http://127.0.0.2:18021" to true,
+            "http://192.168.1.2:18021" to true,
+        )) {
+            assertIssue(AccountConfigIssue.INSECURE_URL, validateAccountConfig(
+                url = url,
+                key = "publishable-key",
+                googleWebClientId = "web-client-id",
+                debug = debug,
+            ))
+        }
+    }
+
+    @Test
     fun `other http origins are rejected even in debug`() {
         val wrongHost = validateAccountConfig(
             url = "http://localhost:18021",

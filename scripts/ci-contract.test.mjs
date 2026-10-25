@@ -29,6 +29,22 @@ const backupWorkflow = readFileSync(
 ).replace(/\r\n/g, "\n");
 const BACKUP_NOTIFY_TODAY = "2030-01-15";
 
+test("signed APK builds retain protection and allow only approved branches", () => {
+  const release = readFileSync(
+    new URL("../.github/workflows/android-release.yml", import.meta.url), "utf8",
+  ).replace(/\r\n/g, "\n");
+  assert.match(release, /^  workflow_dispatch:$/m);
+  assert.doesNotMatch(release, /^  (push|pull_request|pull_request_target):/m);
+  assert.match(release, /^    needs: verify$/m);
+  assert.match(release, /^    environment: android-release$/m);
+  assert.match(
+    release,
+    /^    if: github\.ref == 'refs\/heads\/main' \|\| github\.ref == 'refs\/heads\/feature\/library-network-recovery'$/m,
+  );
+  assert.match(release, /-PrequireReleaseSigning=true/);
+  assert.match(release, /name: signed-android-\$\{\{ github\.sha \}\}/);
+});
+
 test("backup and deployment wrappers accommodate bounded integrity phases", () => {
   const installer = readFileSync(
     new URL("./install-server-automation.py", import.meta.url), "utf8",

@@ -40,7 +40,10 @@ OWNED_NAME = re.compile(r"^link-vault-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}\.tar\.age$
 AGE_HEADER = b"age-encryption.org/v1\n"
 TOTAL_SECONDS, RESTART_RESERVE = 600, 180
 RECOVERY_DAYS, RETAIN_COUNT = 30, 7
-VERIFICATION_SECONDS, MAX_SNAPSHOT_BYTES, MAX_BACKUP_ENTRIES = 60, 64 * 1024 ** 3, 10000
+MAX_SNAPSHOT_BYTES, MAX_BACKUP_ENTRIES = 64 * 1024 ** 3, 10000
+# Each full digest gets its own budget: 64 GiB at 128 MiB/s takes 512s,
+# leaving 88s for overhead. Slower I/O still fails closed, never skips hashing.
+VERIFICATION_SECONDS, LOCK_SECONDS, ROTATION_SECONDS = 600, 60, 60
 RECEIPT_NAME = ".recovery-verification.json"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RESTORE = (
@@ -293,6 +296,9 @@ class Filesystem:
         destination = os.path.join(backups, RECEIPT_NAME)
         previous = self.private_check(destination) if self.exists(destination) else None
         self.recovery_receipt(backups, deadline, now)
+        deadline.remaining()
+        # Validating the old receipt must not spend the candidate's hash budget.
+        deadline = Deadline(deadline.clock() + VERIFICATION_SECONDS, deadline.clock)
         captured = snapshot_time(name)
         if captured > now or not isinstance(digest, str) or not SHA256.fullmatch(digest):
             raise BackupError()
@@ -329,9 +335,11 @@ class Filesystem:
         return value
 
     def rotate(self, backups, receipt, deadline, now):
+        deadline.remaining()
         self.private_check(backups, directory=True)
         # Revalidate immediately before pruning, not just before capture.
         current = self.recovery_receipt(backups, deadline, now)
+        deadline.remaining()
         if current != receipt:
             raise BackupError()
         if receipt is None:
@@ -339,6 +347,8 @@ class Filesystem:
             # may be the only recoverable copy. No receipt is not permission
             # to discard them, and must never invent a verified exception.
             return
+        # Full revalidation is independent of the bounded pruning scan.
+        deadline = Deadline(deadline.clock() + ROTATION_SECONDS, deadline.clock)
         protected = receipt["snapshot"]
         completed = []
         with os.scandir(backups) as entries:
@@ -601,11 +611,13 @@ class Backup:
         return receipt
 
     def attest(self, name, digest, error_output):
-        deadline = Deadline(self.clock() + VERIFICATION_SECONDS, self.clock)
+        # At most three full hashes (old, candidate, postwrite) plus locks: 1,860s.
+        deadline = Deadline(self.clock() + LOCK_SECONDS, self.clock)
         with self.fs.lock(self.config.root + "/deploy.lock", deadline):
             with self.fs.lock(self.config.root + "/backup.lock", deadline):
-                self.fs.attest(self.config.backups, name, digest, deadline, self.wallclock())
-                self.recovery_status(error_output, deadline, self.wallclock())
+                self.fs.attest(self.config.backups, name, digest,
+                               Deadline(self.clock() + VERIFICATION_SECONDS, self.clock), self.wallclock())
+                self.recovery_status(error_output, Deadline(self.clock() + VERIFICATION_SECONDS, self.clock), self.wallclock())
 
     @contextlib.contextmanager
     def expiry_warning(self, receipt, checked_at, error_output):
@@ -621,17 +633,18 @@ class Backup:
 
     def execute(self, output, stream=False, error_output=None):
         error_output = sys.stderr if error_output is None else error_output
-        total = Deadline(self.clock() + TOTAL_SECONDS, self.clock)
-        # Reserve restart/cleanup time inside our 600s bound, before the
-        # deployment receiver's longer 900s subprocess timeout can terminate us.
-        work = Deadline(total.end - RESTART_RESERVE, self.clock)
+        deadline = Deadline(self.clock() + LOCK_SECONDS, self.clock)
         with contextlib.ExitStack() as locks:
             if stream:
-                locks.enter_context(self.fs.lock(self.config.root + "/deploy.lock", work))
-            locks.enter_context(self.fs.lock(self.config.root + "/backup.lock", work))
+                locks.enter_context(self.fs.lock(self.config.root + "/deploy.lock", deadline))
+            locks.enter_context(self.fs.lock(self.config.root + "/backup.lock", deadline))
             checked_at = self.wallclock()
-            receipt = self.recovery_status(error_output, Deadline(min(work.end, self.clock() + VERIFICATION_SECONDS), self.clock), checked_at)
+            receipt = self.recovery_status(error_output, Deadline(self.clock() + VERIFICATION_SECONDS, self.clock), checked_at)
             locks.enter_context(self.expiry_warning(receipt, checked_at, error_output))
+            # Integrity checks run with services live, outside the capture's
+            # 600s budget and its unchanged restart/cleanup reserve.
+            total = Deadline(self.clock() + TOTAL_SECONDS, self.clock)
+            work = Deadline(total.end - RESTART_RESERVE, self.clock)
             self.fs.prepare(self.config)
             # lexists also rejects a dangling symlink. An unresolved migration
             # backend may still be writing: reconciliation must precede capture.
@@ -652,7 +665,8 @@ class Backup:
             total.remaining()
             # Only after restart, cleanup and transfer succeed. A newly captured
             # age file never replaces independent verification evidence.
-            self.fs.rotate(self.config.backups, receipt, Deadline(min(total.end, self.clock() + VERIFICATION_SECONDS), self.clock), self.wallclock())
+            # Overall bound: locks + two full hashes + capture + pruning = 1,920s.
+            self.fs.rotate(self.config.backups, receipt, Deadline(self.clock() + VERIFICATION_SECONDS, self.clock), self.wallclock())
             if not stream:
                 output.write((name + "\n").encode("ascii"))
             return name

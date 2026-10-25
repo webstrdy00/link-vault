@@ -68,7 +68,8 @@ def main():
         compile(data, 'server-' + name + '.py', 'exec')
         write_atomic(BIN / ('link-vault-' + name), data, 0o700)
         suffix = '' if name == 'deploy' else ' --stream'
-        entry = ('#!/bin/sh\nexec /usr/bin/timeout --signal=TERM --kill-after=180s 1500 '
+        limit = '5400' if name == 'deploy' else '3600'
+        entry = ('#!/bin/sh\nexec /usr/bin/timeout --signal=TERM --kill-after=180s ' + limit + ' '
                  '/usr/local/sbin/link-vault-' + name + suffix + '\n')
         write_atomic(BIN / ('link-vault-' + name + '-entry'), entry.encode(), 0o700)
         user = 'linkvault-' + name
@@ -113,7 +114,7 @@ def main():
     service = ('[Unit]\nDescription=Encrypted Link Vault recovery snapshot\nAfter=docker.service\n'
                'Requires=docker.service\n\n[Service]\nType=oneshot\nUser=root\nUMask=0077\n'
                'ExecStart=/usr/bin/flock -w 60 /opt/link-vault/deploy.lock /usr/local/sbin/link-vault-backup\n'
-               'TimeoutStartSec=900\nTimeoutStopSec=180\n')
+               'TimeoutStartSec=3600\nTimeoutStopSec=180\n')
     timer = ('[Unit]\nDescription=Daily Link Vault encrypted snapshot\n\n[Timer]\n'
              'OnCalendar=*-*-* 18:00:00 UTC\nPersistent=true\nRandomizedDelaySec=300\n'
              '\n[Install]\nWantedBy=timers.target\n')

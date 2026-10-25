@@ -122,6 +122,42 @@ Release의 HTTPS 정책은 유지합니다. 종료 후에는 해당 reverse 연�
 `LINK_VAULT_TEST_DIAGNOSTICS=1`은 생성한 테스트 항목의 처리 상태·제목 확보 여부와 경과 시간을
 출력합니다. 계정 토큰·비밀번호·원문 내용은 진단 로그에 출력하지 않습니다.
 
+### 정적 사이트의 웹 계정 탈퇴 설정
+
+`website/`는 별도 정적 사이트 배포 대상입니다. API·DB 배포 워크플로
+(`.github/workflows/deploy.yml`)는 사이트나 웹 설정을 생성·배포하지 않습니다.
+`/account-deletion/config.json`이 없거나 유효하지 않으면 웹 계정 탈퇴·상태 조회는
+기본적으로 비활성화되며, 설정 생성만으로 운영 배포나 공개 출시가 승인되지는 않습니다.
+
+배포 시 `website/` 내용을 **저장소 밖의 별도 staging 디렉터리**에 먼저 준비하고,
+배포 환경에 다음 값을 제공한 뒤 공개 설정을 생성합니다. 루트 `.env`는 자동으로 읽지 않습니다.
+
+- `SUPABASE_URL`: 정확히 `https://api.linkfilebox.com` (끝의 `/` 없이).
+- `SUPABASE_PUBLISHABLE_KEY`: 해당 서버의 `sb_publishable_…` 공개 키 또는 역할이 `anon`인
+  기존 JWT 공개 키. `sb_secret_…`·`service_role` 키와 서버 비밀키는 넣지 마세요.
+- `GOOGLE_WEB_CLIENT_ID`: 아래 고정값으로, 웹 모듈의 `GOOGLE_CLIENT_ID`와 같아야 합니다.
+
+```powershell
+# 공개 키는 배포 환경에서 SUPABASE_PUBLISHABLE_KEY로 사전 제공합니다.
+# staging의 account-deletion 디렉터리는 이미 존재해야 합니다.
+$env:SUPABASE_URL = "https://api.linkfilebox.com"
+$env:GOOGLE_WEB_CLIENT_ID = "486032328491-4sv6bg4ukablou6d2btfnhon30e10rsb.apps.googleusercontent.com"
+npm run build:web-account-config -- --output C:\deploy\linkfilebox-static\account-deletion\config.json
+```
+
+출력 경로는 `--output`으로 반드시 지정해야 하며, 심볼릭 링크를 해석한 부모 디렉터리가
+저장소 안이면 거부합니다. 생성기는 웹 모듈의 기존 공개 설정 검증을 재사용하여 주소·Client ID와
+공개 키 형식을 검사합니다. 이는 키의 서버 소속이나 JWT 서명 검증은 아니므로 배포자가 확인해야 합니다.
+키·설정 내용·출력 경로는 로그에 표시하지 않으며, 같은 디렉터리의 임시 파일을 완성한 뒤
+지정한 출력 파일만 원자적으로 교체하므로 같은 명령을 다시 실행할 수 있습니다.
+생성 파일은 POSIX에서 소유자만 읽고 쓰는 권한(`0600`)을 사용합니다. Windows에서는 staging의
+ACL을 별도로 제한하고, 게시할 때 필요한 웹 서버 계정의 읽기 권한을 배포 과정에서 부여하세요.
+
+생성한 파일은 공개 정보만 담으며, 정적 사이트와 함께
+`https://linkfilebox.com/account-deletion/config.json`으로 게시해야 합니다.
+키가 들어 있는 생성 파일을 저장소에 추가하거나 설정을 로그에 출력하지 마세요.
+이 명령은 로컬 파일만 생성하며 서버·OAuth 설정 변경이나 사이트 게시를 수행하지 않습니다.
+
 ## 지원 범위와 제한
 
 | 구분           | 현재 범위                                                                                         |

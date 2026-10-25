@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   API_BASE,
@@ -122,6 +123,44 @@ function assertPost(call, action, body) {
   assert.match(call.headers["X-Request-Id"], /^[0-9a-f-]{36}$/);
   assert.deepEqual(JSON.parse(call.body), body);
 }
+
+test("deletion accessibility styling is page-scoped in the CSP-approved external stylesheet", () => {
+  const html = readFileSync(
+    new URL("../website/account-deletion/index.html", import.meta.url),
+    "utf8",
+  );
+  const css = readFileSync(
+    new URL("../website/site.css", import.meta.url),
+    "utf8",
+  );
+  assert.match(html, /<link\b[^>]*rel="stylesheet"[^>]*href="\.\.\/site\.css"/);
+  assert.match(html, /<body\b[^>]*class="account-deletion"/);
+  assert.doesNotMatch(html, /<style\b|\bstyle\s*=/i);
+  assert.match(
+    css,
+    /\.account-deletion \.account-controls button\s*\{[^}]*padding: 12px 16px;[^}]*font: inherit;/,
+  );
+  assert.match(
+    css,
+    /\.account-deletion \.account-controls button:disabled\s*\{[^}]*cursor: not-allowed;[^}]*opacity: \.6;/,
+  );
+  assert.match(
+    css,
+    /\.account-deletion \.account-controls button:focus-visible,\s*\.account-deletion \.account-controls input:focus-visible\s*\{[^}]*outline: 3px solid #075c48;[^}]*outline-offset: 4px;/,
+  );
+  assert.match(
+    css,
+    /\.account-deletion \.account-controls input\s*\{[^}]*width: 20px;[^}]*height: 20px;/,
+  );
+  assert.match(
+    css,
+    /\.account-deletion #account-message\s*\{[^}]*white-space: pre-line;/,
+  );
+  assert.match(
+    css,
+    /\.account-deletion #account-message\[data-error="true"\]\s*\{[^}]*border-left-color: #9b2424;/,
+  );
+});
 
 test("live origin, API and Google web client are pinned; GIS is not loaded by the controller", async () => {
   assert.equal(APPROVED_ORIGIN, "https://linkfilebox.com");

@@ -23,7 +23,7 @@ jobs:
     needs: [verify, verify-database]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 100
     environment: production
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

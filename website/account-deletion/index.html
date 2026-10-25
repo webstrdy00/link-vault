@@ -6,49 +6,9 @@
     <meta name="robots" content="noindex,nofollow">
     <title>계정과 자료 삭제 | LinkFileBox</title>
     <link rel="stylesheet" href="../site.css">
-    <style>
-    .account-controls button {
-      padding: 12px 16px;
-      border: 1px solid #075c48;
-      border-radius: 8px;
-      background: white;
-      color: #142b3d;
-      font: inherit;
-      cursor: pointer;
-    }
-    .account-controls button:disabled {
-      cursor: not-allowed;
-      opacity: .6;
-    }
-    .account-controls button:focus-visible,
-    .account-controls input:focus-visible {
-      outline: 3px solid #075c48;
-      outline-offset: 4px;
-    }
-    .account-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-block: 16px;
-    }
-    .account-controls label {
-      display: block;
-    }
-    .account-controls input {
-      width: 20px;
-      height: 20px;
-      vertical-align: middle;
-    }
-    #account-message {
-      white-space: pre-line;
-    }
-    #account-message[data-error="true"] {
-      border-left-color: #9b2424;
-    }
-    </style>
     <script type="module" src="./account-deletion.js"></script>
   </head>
-  <body>
+  <body class="account-deletion">
     <a class="skip" href="#main">본문으로</a>
     <header>
       <a class="brand" href="../">LinkFileBox</a>

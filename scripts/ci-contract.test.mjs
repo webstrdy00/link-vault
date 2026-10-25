@@ -29,6 +29,21 @@ const backupWorkflow = readFileSync(
 ).replace(/\r\n/g, "\n");
 const BACKUP_NOTIFY_TODAY = "2030-01-15";
 
+test("backup and deployment wrappers accommodate bounded integrity phases", () => {
+  const installer = readFileSync(
+    new URL("./install-server-automation.py", import.meta.url), "utf8",
+  );
+  const deployment = readFileSync(
+    new URL("../.github/workflows/deploy.yml", import.meta.url), "utf8",
+  );
+  assert.match(installer, /limit = '5400' if name == 'deploy' else '3600'/);
+  assert.match(installer, /TimeoutStartSec=3600/);
+  assert.match(backupWorkflow, /stderr=errors, timeout=3600/);
+  assert.match(backupWorkflow, /timeout-minutes: 70/);
+  assert.match(deployment, /timeout-minutes: 100/);
+
+});
+
 test("browser deletion origin is rejected before the generic API proxy", () => {
   const caddy = readFileSync(
     new URL("../deployment/Caddyfile", import.meta.url),
@@ -306,7 +321,7 @@ def fixture_run(command, stdout, stderr, timeout):
     assert command[-1] == 'fixture-user@fixture-host'
     assert 'StrictHostKeyChecking=yes' in command
     assert 'BatchMode=yes' in command
-    assert timeout == 900
+    assert timeout == 3600
     stdout.write(os.environ['FIXTURE_CIPHERTEXT'].encode('ascii'))
     stderr.write(os.environ['FIXTURE_DIAGNOSTIC'].encode('ascii'))
     if os.environ['FIXTURE_RETURN'] == 'timeout':

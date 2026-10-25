@@ -19,6 +19,25 @@ function sectionText(html, heading) {
   assert.ok(section, `Missing section: ${heading}`);
   return textContent(section[1]);
 }
+function assertApprovedExternalUrls(source) {
+  const approved = new Set([
+    "https://linkfilebox.com",
+    "https://api.linkfilebox.com/functions/v1/library-api/v1/web-account",
+    "https://accounts.google.com/gsi/client",
+  ].map((value) => new URL(value).href));
+  const urls = [...source.matchAll(/["'`](https?:\/\/[^"'`]*)["'`]/g)]
+    .map((match) => match[1]);
+  assert.ok(urls.length > 0);
+  for (const value of urls) {
+    const url = new URL(value);
+    assert.equal(url.username, "", `Unexpected URL credentials: ${value}`);
+    assert.equal(url.password, "", `Unexpected URL credentials: ${value}`);
+    assert.ok(
+      approved.has(url.href),
+      `Unexpected external dependency: ${value}`,
+    );
+  }
+}
 test("offline app notice preserves the canonical deletion and recovery limitations", () => {
   const xml = readFileSync(
     new URL("../android/app/src/main/res/values/strings.xml", import.meta.url),
@@ -106,20 +125,7 @@ test("account deletion module allows only the user-triggered Google authenticati
     resolve(root, "account-deletion/account-deletion.js"),
     "utf8",
   );
-  const externalUrls = [...source.matchAll(/https:\/\/[A-Za-z0-9._/-]+/g)].map((
-    match,
-  ) => match[0]);
-  assert.ok(externalUrls.length > 0);
-  for (const url of externalUrls) {
-    assert.ok(
-      [
-        "https://linkfilebox.com",
-        "https://api.linkfilebox.com/functions/v1/library-api/v1/web-account",
-        "https://accounts.google.com/gsi/client",
-      ].includes(url),
-      `Unexpected external dependency: ${url}`,
-    );
-  }
+  assertApprovedExternalUrls(source);
   assert.equal([...source.matchAll(/createElement\("script"\)/g)].length, 1);
   assert.match(source, /script\.src = GIS_URL;/);
   assert.match(
@@ -131,6 +137,27 @@ test("account deletion module allows only the user-triggered Google authenticati
     /\b(?:localStorage|sessionStorage|indexedDB|sendBeacon)\b|document\.cookie|console\.|googletagmanager|google-analytics|gtag\(/i,
   );
   assert.doesNotMatch(source, /\bimport\b|eval\s*\(|new Function\b/);
+});
+test("external URL checks reject credentials, unapproved origins and modified resource URLs", () => {
+  for (
+    const url of [
+      "https://linkfilebox.com@tracker.example/collect",
+      "https://user:password@linkfilebox.com/",
+      "https://:password@linkfilebox.com/",
+      "https://linkfilebox.com.evil.test/collect",
+      "https://linkfilebox.com。tracker.example/collect",
+      "https://linkfilebox.com:444/",
+      "http://linkfilebox.com/",
+      "https://api.linkfilebox.com/functions/v1/library-api/v1/web-account/collect",
+      "https://accounts.google.com/gsi/client?tracking=true",
+    ]
+  ) {
+    assert.throws(
+      () => assertApprovedExternalUrls(`fetch("${url}")`),
+      /Unexpected URL credentials|Unexpected external dependency/,
+      `Must reject the complete URL: ${url}`,
+    );
+  }
 });
 test("deletion notice requires authenticated intent, not an email or a new account", () => {
   const html = readFileSync(

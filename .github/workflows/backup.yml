@@ -20,7 +20,7 @@ concurrency:
 jobs:
   export:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 70
     outputs:
       recovery_status: ${{ steps.capture.outputs.recovery_status }}
     steps:
@@ -55,7 +55,7 @@ jobs:
                       '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
                       '-o', 'UserKnownHostsFile=' + str(work / 'known_hosts'), '-o', 'ConnectTimeout=20',
                       os.environ['BACKUP_USER'] + '@' + os.environ['BACKUP_HOST']],
-                      stdout=archive, stderr=errors, timeout=900).returncode
+                      stdout=archive, stderr=errors, timeout=3600).returncode
               except (OSError, subprocess.TimeoutExpired):
                   result = 1
           with (work / 'status').open('rb') as errors:

@@ -26,6 +26,28 @@ def file_info(inode=1, mode=stat.S_IFREG | 0o600, size=100, uid=0, links=1):
                            st_ino=inode, st_size=size, st_mtime_ns=1, st_ctime_ns=1)
 
 
+@contextlib.contextmanager
+def hashing_time(clock, seconds):
+    """Hash real small fixture bytes while charging deterministic time per pass."""
+    sha256, hashed = hashlib.sha256, []
+
+    class TimedDigest:
+        def __init__(self):
+            self.digest, self.content = sha256(), bytearray()
+            hashed.append(self.content)
+
+        def update(self, chunk):
+            self.digest.update(chunk)
+            self.content.extend(chunk)
+            clock.return_value += seconds
+
+        def hexdigest(self):
+            return self.digest.hexdigest()
+
+    with mock.patch.object(BACKUP.hashlib, "sha256", side_effect=TimedDigest):
+        yield hashed
+
+
 class VerificationDisk:
     """In-memory POSIX fixtures exercising the real receipt/hash/prune code."""
     def __init__(self):
@@ -542,6 +564,50 @@ class SnapshotTests(unittest.TestCase):
         self.assertIs(filesystem.receipt, receipt)
         self.assertTrue(any(event[0] == "rotate" for event in filesystem.events))
 
+    def test_full_hashes_do_not_spend_capture_or_pruning_budgets(self):
+        filesystem, runner, backup = self.fixture()
+        disk, fs = VerificationDisk(), BACKUP.Filesystem()
+        name = "link-vault-20300131T120000Z-aaaaaaaaaaaaaaaa.tar.age"
+        path = disk.add(name, BACKUP.AGE_HEADER + b"verified ciphertext")
+        obsolete = disk.add("link-vault-20290101T120000Z-bbbbbbbbbbbbbbbb.tar.age", BACKUP.AGE_HEADER + b"old")
+        now = datetime.datetime(2030, 1, 31, 12)
+        clock = mock.Mock(return_value=100)
+        backup.clock, backup.wallclock = clock, lambda: now
+        filesystem.recovery_receipt, filesystem.rotate = fs.recovery_receipt, fs.rotate
+        original_run, original_scandir = runner.run, disk.scandir
+        capture_seconds = BACKUP.TOTAL_SECONDS - BACKUP.RESTART_RESERVE - 10
+        hash_seconds, scan_seconds = BACKUP.VERIFICATION_SECONDS - 1, BACKUP.ROTATION_SECONDS - 1
+
+        def capture_work(command, **kwargs):
+            result = original_run(command, **kwargs)
+            if command[0] == "tar":
+                clock.return_value += capture_seconds
+            return result
+
+        @contextlib.contextmanager
+        def pruning_scan(directory):
+            clock.return_value += scan_seconds
+            with original_scandir(directory) as entries:
+                yield entries
+
+        runner.run = capture_work
+        output, errors = io.BytesIO(), io.StringIO()
+        with disk.patched():
+            fs.attest(BACKUP.Config.backups, name, hashlib.sha256(disk.files[path]).hexdigest(),
+                      BACKUP.Deadline(100, lambda: 0), now)
+            disk.removed.clear()
+            with hashing_time(clock, hash_seconds) as hashed, \
+                    mock.patch.object(BACKUP.os, "scandir", side_effect=pruning_scan):
+                self.assertEqual(BACKUP.main([], backup, output, errors, lambda: 0), 0)
+        self.assertEqual(hashed, [disk.files[path], disk.files[path]])
+        self.assertEqual(clock.return_value, 100 + 2 * hash_seconds + capture_seconds + scan_seconds)
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_VERIFIED\nBACKUP_OK\n")
+        self.assertTrue(BACKUP.OWNED_NAME.fullmatch(output.getvalue().decode("ascii").strip()))
+        self.assertEqual(next(timeout for command, unused, timeout in runner.calls if command[0] == BACKUP.Config.age), 10)
+        self.assertEqual(disk.removed, [obsolete])
+        self.assertIn(path, disk.files)
+        self.assert_clean(filesystem)
+
     def test_operator_attestation_locks_deploy_then_backup_without_capture(self):
         filesystem, runner, backup = self.fixture()
         now = datetime.datetime(2030, 1, 31, 12)
@@ -606,6 +672,40 @@ class VerificationTests(unittest.TestCase):
         self.assertTrue(all(size <= 1024 * 1024 for size in disk.read_sizes))
         self.assertEqual(disk.infos[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME].st_mode, stat.S_IFREG | 0o600)
         self.assertFalse(any(".verification-" in path for path in disk.files))
+
+    def test_old_candidate_and_postwrite_full_hashes_have_independent_budgets(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        fresh_name = "link-vault-20300131T120000Z-bbbbbbbbbbbbbbbb.tar.age"
+        fresh_path = disk.add(fresh_name, BACKUP.AGE_HEADER + b"fresh ciphertext")
+        fresh_digest = hashlib.sha256(disk.files[fresh_path]).hexdigest()
+        clock, locks = mock.Mock(return_value=100), FakeFilesystem()
+        backup = BACKUP.Backup(filesystem=fs, clock=clock, wallclock=lambda: now)
+        errors = io.StringIO()
+        with disk.patched():
+            fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            with hashing_time(clock, BACKUP.VERIFICATION_SECONDS - 1) as hashed, \
+                    mock.patch.object(fs, "lock", side_effect=locks.lock):
+                backup.attest(fresh_name, fresh_digest, errors)
+        self.assertEqual(hashed, [disk.files[path], disk.files[fresh_path], disk.files[fresh_path]])
+        self.assertEqual(clock.return_value, 100 + 3 * (BACKUP.VERIFICATION_SECONDS - 1))
+        self.assertEqual(errors.getvalue(), "BACKUP_RECOVERY_VERIFIED\n")
+        self.assertEqual(json.loads(disk.files[BACKUP.Config.backups + "/" + BACKUP.RECEIPT_NAME])["sha256"], fresh_digest)
+        self.assertFalse(any(".verification-" in candidate for candidate in disk.files))
+
+    def test_over_budget_hash_fails_closed_preserving_receipt_and_snapshots(self):
+        disk, fs, name, path, digest, now = self.fixture()
+        clock = mock.Mock(return_value=100)
+        with disk.patched():
+            fs.attest(BACKUP.Config.backups, name, digest, self.deadline(), now)
+            before = dict(disk.files)
+            disk.removed.clear()
+            with hashing_time(clock, BACKUP.VERIFICATION_SECONDS + 1) as hashed:
+                with self.assertRaises(BACKUP.BackupError):
+                    fs.attest(BACKUP.Config.backups, name, digest,
+                              BACKUP.Deadline(clock() + BACKUP.VERIFICATION_SECONDS, clock), now)
+        self.assertEqual(hashed, [disk.files[path]])
+        self.assertEqual(disk.files, before)
+        self.assertEqual(disk.removed, [])
 
     def test_replacing_receipt_requires_new_explicit_attestation_not_new_capture(self):
         disk, fs, name, path, digest, now = self.fixture()

@@ -91,6 +91,8 @@ fun DiscoveryScreen(
     outbox: OutboxRepository,
     onBack: () -> Unit,
     onOpenItem: (String) -> Unit,
+    initialSource: DiscoverySource? = null,
+    onInitialSourceApplied: () -> Unit = {},
 ) {
     val sessionState by client.sessionState.collectAsState()
     LaunchedEffect(client, client.isConfigured, sessionState.initialized) {
@@ -143,6 +145,16 @@ fun DiscoveryScreen(
             discoveryViewModel.setVisible(false)
         }
     }
+    LaunchedEffect(discoveryViewModel, sessionState, state.availability, initialSource) {
+        if (
+            sessionState.initialized &&
+            state.availability is DiscoveryAvailability.Ready &&
+            initialSource != null &&
+            discoveryViewModel.browseSource(initialSource)
+        ) {
+            onInitialSourceApplied()
+        }
+    }
     var showCategoryManagement by rememberSaveable { mutableStateOf(false) }
     BackHandler(onBack = onBack)
 
@@ -160,7 +172,9 @@ fun DiscoveryScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                text = "검색",
+                text = state.appliedQuery?.takeIf {
+                    it.query == null && it.source != DiscoverySource.ALL
+                }?.let { "${it.source.displayName} 보관함" } ?: "검색",
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
             )

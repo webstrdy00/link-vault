@@ -141,6 +141,46 @@ class LocalLibraryIntegrationTest {
         awaitText("여행")
     }
 
+    private fun verifySourceBrowsing(ids: Map<String, String>) {
+        val resultCard = androidx.compose.ui.test.SemanticsMatcher("source search result") { node ->
+            node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("search-item-") == true
+        }
+        fun awaitResults(expected: Set<String>) {
+            compose.waitUntil(timeoutMillis = 30_000) {
+                compose.onAllNodes(resultCard, useUnmergedTree = true).fetchSemanticsNodes()
+                    .mapNotNull { it.config.getOrNull(SemanticsProperties.TestTag)?.removePrefix("search-item-") }
+                    .toSet() == expected
+            }
+            assertEquals("", compose.onNodeWithTag("search-query").fetchSemanticsNode()
+                .config.getOrNull(SemanticsProperties.EditableText)?.text)
+        }
+        clickRoot("root-discovery")
+        compose.waitUntil(timeoutMillis = 20_000) {
+            compose.onAllNodes(hasTestTag("search-query")).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag("search-query").performScrollTo()
+            .performTextReplacement("분명히없는검색어")
+        compose.onNodeWithTag("search-submit").performClick()
+
+        ids.forEach { (source, id) ->
+            clickRoot("root-library")
+            compose.onNodeWithTag("library-source-$source").performScrollTo().performClick()
+            awaitResults(setOf(id))
+        }
+        clickRoot("root-library")
+        compose.onNodeWithTag("library-source-instagram").performScrollTo().performClick()
+        val instagramId = ids.getValue("instagram")
+        awaitResults(setOf(instagramId))
+        compose.onNodeWithTag("search-item-$instagramId").performScrollTo().performClick()
+        awaitText("원문 열기")
+        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        awaitResults(setOf(instagramId))
+
+        clickRoot("root-library")
+        compose.onNodeWithTag("library-source-all").performScrollTo().performClick()
+        awaitResults(ids.values.toSet())
+    }
+
     @Test
     fun realAuthenticatedSessionSavesAndReloadsOriginal(): Unit = runBlocking {
         check(BuildConfig.DEBUG && BuildConfig.SUPABASE_URL in setOf(
@@ -188,6 +228,14 @@ class LocalLibraryIntegrationTest {
                 awaitText("로그인했어요")
                 val app = ApplicationProvider.getApplicationContext<LinkVaultApplication>()
                 val owner = checkNotNull(app.accountClient.sessionUserId())
+                val sourceIds = arguments.getString("fixtureSourceIds").orEmpty()
+                if (sourceIds.isNotBlank()) {
+                    verifySourceBrowsing(sourceIds.split(",").associate {
+                        val (source, id) = it.split(":", limit = 2)
+                        source to id
+                    })
+                    return@use
+                }
                 val seededItemId = arguments.getString("fixtureSeededItemId").orEmpty()
                 if (arguments.getString("fixtureDetailEdit") == "true") {
                     check(seededItemId.isNotBlank())

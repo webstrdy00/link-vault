@@ -183,6 +183,24 @@ class DiscoveryViewModel internal constructor(
 
     fun selectSource(source: DiscoverySource) = updateFilters { it.copy(source = source) }
 
+    fun browseSource(source: DiscoverySource): Boolean {
+        if (
+            !isVisible ||
+            !client.sessionState.value.initialized ||
+            mutableUiState.value.availability !is DiscoveryAvailability.Ready
+        ) {
+            return false
+        }
+        if (!identityMatches()) {
+            invalidateIdentity()
+            return false
+        }
+        val filters = DiscoveryFilterInput(source = source)
+        mutableUiState.value = mutableUiState.value.copy(filters = filters, filterIssues = emptyList())
+        applyFilterIntent(filters)
+        return true
+    }
+
     fun updateDateFrom(date: String) = updateFilters { it.copy(dateFrom = date) }
 
     fun updateDateTo(date: String) = updateFilters { it.copy(dateTo = date) }

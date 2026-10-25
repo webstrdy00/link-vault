@@ -16,9 +16,12 @@ const fixturePassword = `Local-emulator-${randomUUID()}`;
 const fixtureKind = process.env.LINK_VAULT_TEST_FIXTURE ?? "generic";
 const verifyListDeletion = process.env.LINK_VAULT_TEST_DELETE === "1";
 const verifyDetailEditing = process.env.LINK_VAULT_TEST_DETAIL_EDIT === "1";
+const verifySourceBrowsing = process.env.LINK_VAULT_TEST_SOURCE_BROWSE === "1";
 assert.ok(
-  !(verifyDetailEditing && verifyListDeletion),
-  "Choose one mutation scenario",
+  [verifyDetailEditing, verifyListDeletion, verifySourceBrowsing].filter(
+    Boolean,
+  ).length <= 1,
+  "Choose one device scenario",
 );
 const verifyUncachedDeletion =
   process.env.LINK_VAULT_TEST_DELETE_UNCACHED === "1";
@@ -175,6 +178,35 @@ try {
     assert.notEqual(stable.data.classification_state, "pending");
   }
 
+  const sourceFixtureIds = {};
+  if (verifySourceBrowsing) {
+    const bootstrap = await api("/functions/v1/library-api/v1/bootstrap", {
+      token: accessToken,
+      method: "POST",
+      body: {},
+      headers: { "X-Request-Id": randomUUID() },
+    });
+    assert.equal(bootstrap.status, 200);
+    const sourceUrls = {
+      instagram: `https://www.instagram.com/p/${randomUUID()}/`,
+      threads: `https://www.threads.com/@source_fixture/post/${randomUUID()}`,
+      naver_blog:
+        `https://blog.naver.com/source_fixture/223000000000?case=${randomUUID()}`,
+      other: `https://source-fixture.invalid/${randomUUID()}`,
+    };
+    for (const [source, url] of Object.entries(sourceUrls)) {
+      const created = await api("/functions/v1/library-api/v1/items", {
+        token: accessToken,
+        method: "POST",
+        headers: { "X-Request-Id": randomUUID() },
+        body: { url, title: `출처 검증 ${source}` },
+      });
+      assert.equal(created.status, 201);
+      assert.equal(created.data.item.source, source);
+      sourceFixtureIds[source] = created.data.item.id;
+    }
+  }
+
   const gradle = process.platform === "win32"
     ? "android\\gradlew.bat"
     : "./android/gradlew";
@@ -192,6 +224,10 @@ try {
     `-Pandroid.testInstrumentationRunnerArguments.fixtureKind=${fixtureKind}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureDelete=${verifyListDeletion}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureDetailEdit=${verifyDetailEditing}`,
+    `-Pandroid.testInstrumentationRunnerArguments.fixtureSourceIds=${
+      Object.entries(sourceFixtureIds).map(([source, id]) => `${source}:${id}`)
+        .join(",")
+    }`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureSeededItemId=${seededItemId}`,
   ];
   const env = {
@@ -328,7 +364,20 @@ try {
     token: accessToken,
   });
   assert.equal(items.status, 200);
-  if (verifyDetailEditing) {
+  if (verifySourceBrowsing) {
+    assert.equal(items.data.items.length, 4);
+    for (const [source, id] of Object.entries(sourceFixtureIds)) {
+      const filtered = await api(
+        `/functions/v1/library-api/v1/items?source=${source}`,
+        { token: accessToken },
+      );
+      assert.equal(filtered.status, 200);
+      assert.deepEqual(filtered.data.items.map((item) => item.id), [id]);
+    }
+    console.log(
+      "PASS library source shortcuts -> server-filtered results, repeat navigation, and all-source reset",
+    );
+  } else if (verifyDetailEditing) {
     assert.equal(items.data.items.length, 1);
     const edited = await api(
       `/functions/v1/library-api/v1/items/${seededItemId}`,

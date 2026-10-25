@@ -14,6 +14,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -23,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.test.assertCountEquals
@@ -30,6 +33,7 @@ import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.captureToImage
@@ -51,6 +55,7 @@ import com.linkvault.app.attachment.AttachmentCommandKind
 import com.linkvault.app.attachment.AttachmentCommandReview
 import com.linkvault.app.attachment.AttachmentLocalStage
 import com.linkvault.app.attachment.AttachmentUiState
+import com.linkvault.app.discovery.DiscoverySource
 import com.linkvault.app.library.DetailContent
 import com.linkvault.app.library.LibraryActiveAsset
 import com.linkvault.app.library.LibraryCategoryRef
@@ -75,6 +80,105 @@ import org.junit.Test
 class LibraryPresentationTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun everySourceShortcutScrollsIntoNarrowHeaderAndInvokesOnlyItsBrowseCallbackOnce() {
+        val browsedSources = mutableListOf<DiscoverySource>()
+        var discoverCalls = 0
+        compose.setContent {
+            VaultTheme {
+                Surface(modifier = Modifier.width(220.dp)) {
+                    LibraryRootHeader(
+                        canRefresh = true,
+                        onAdd = {},
+                        onRefresh = {},
+                        onDiscover = { discoverCalls++ },
+                        onBrowseSource = { browsedSources += it },
+                    )
+                }
+            }
+        }
+
+        val shortcuts = compose.onNodeWithTag("library-source-shortcuts").getUnclippedBoundsInRoot()
+        val search = compose.onNodeWithTag("library-search").getUnclippedBoundsInRoot()
+        assertTrue(shortcuts.top >= search.bottom)
+        compose.onNodeWithTag("library-source-other").assertIsNotDisplayed()
+        DiscoverySource.entries.forEachIndexed { index, source ->
+            val chip = compose.onNodeWithTag("library-source-${source.apiValue ?: "all"}")
+            chip.performScrollTo()
+                .assertIsDisplayed()
+                .assertHasClickAction()
+                .assertTextEquals(source.displayName)
+            assertFalse(chip.fetchSemanticsNode().config.contains(SemanticsProperties.Selected))
+            val bounds = chip.getUnclippedBoundsInRoot()
+            assertTrue(bounds.left >= shortcuts.left - 1.dp && bounds.right <= shortcuts.right + 1.dp)
+            assertTrue(bounds.bottom - bounds.top >= 48.dp)
+            chip.performClick()
+            compose.runOnIdle {
+                assertEquals(DiscoverySource.entries.take(index + 1), browsedSources)
+                assertEquals(0, discoverCalls)
+            }
+        }
+
+        compose.onNodeWithTag("library-search").performClick()
+        compose.runOnIdle {
+            assertEquals(1, discoverCalls)
+            assertEquals(DiscoverySource.entries, browsedSources)
+        }
+    }
+
+    @Test
+    fun sourceBadgesKeepNamesMonogramsAndTravelCategorySeparateInLightTheme() {
+        assertSourceBadgePresentation(darkTheme = false)
+    }
+
+    @Test
+    fun sourceBadgesKeepNamesMonogramsAndTravelCategorySeparateInDarkTheme() {
+        assertSourceBadgePresentation(darkTheme = true)
+    }
+
+    @Test
+    fun sourceBadgePreservesIndependentListDeleteAndWholeCardClick() {
+        val item = LibraryItemSummary(
+            id = "source-delete-item",
+            version = 1,
+            url = "https://example.com/source-delete",
+            displayTitle = "직접 정한 제목",
+            source = "instagram",
+            noteExcerpt = "직접 쓴 내용도 그대로 유지합니다.",
+            categoryRefs = listOf(LibraryCategoryRef(name = "여행")),
+        )
+        val deleted = mutableListOf<String>()
+        val opened = mutableListOf<String>()
+        var deleteEnabled by mutableStateOf(true)
+        compose.setContent {
+            VaultTheme {
+                Surface(modifier = Modifier.width(260.dp)) {
+                    LibraryItemCard(
+                        item = item,
+                        onOpenDetail = { opened += it },
+                        onDelete = { deleted += it },
+                        deleteEnabled = deleteEnabled,
+                    )
+                }
+            }
+        }
+
+        compose.onNodeWithText(item.displayTitle!!).assertIsDisplayed()
+        compose.onNodeWithText(item.noteExcerpt!!).assertIsDisplayed()
+        compose.onNodeWithTag("list-delete-${item.id}").assertIsEnabled().performClick()
+        compose.runOnIdle {
+            assertEquals(listOf(item.id), deleted)
+            assertTrue(opened.isEmpty())
+            deleteEnabled = false
+        }
+        compose.onNodeWithTag("list-delete-${item.id}").assertIsNotEnabled()
+        compose.onNodeWithTag("detail-${item.id}").assertHasClickAction().performClick()
+        compose.runOnIdle {
+            assertEquals(listOf(item.id), opened)
+            assertEquals(listOf(item.id), deleted)
+        }
+    }
 
     @Test
     fun editorialRowCompactsLongTitleToTwoLinesAndWholeRowOpensDetail() {
@@ -644,6 +748,60 @@ class LibraryPresentationTest {
         assertNoDetailClutter()
     }
 
+    private fun assertSourceBadgePresentation(darkTheme: Boolean) {
+        val sources = listOf(
+            Triple("instagram", "Instagram", "Ig"),
+            Triple("threads", "Threads", "Th"),
+            Triple("naver_blog", "네이버 블로그", "N"),
+            Triple("other", "기타", "기"),
+            Triple("example.com", "example.com", "E"),
+        )
+        val summaries = sources.map { (source, _, _) ->
+            LibraryItemSummary(
+                id = source,
+                url = "https://example.com/$source",
+                displayTitle = "여행 자료 $source",
+                source = source,
+                categoryRefs = listOf(LibraryCategoryRef(name = "여행")),
+            )
+        } + listOf(
+            LibraryItemSummary(id = "null-source", url = "https://example.com/null-source"),
+            LibraryItemSummary(id = "blank-source", url = "https://example.com/blank-source", source = "  "),
+        )
+        compose.setContent {
+            VaultTheme {
+                MaterialTheme(colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()) {
+                    Surface(modifier = Modifier.fillMaxSize()) {
+                        Column(
+                            modifier = Modifier
+                                .width(260.dp)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            summaries.forEach { LibraryItemCard(item = it, onOpenDetail = {}) }
+                        }
+                    }
+                }
+            }
+        }
+
+        sources.forEach { (source, label, monogram) ->
+            compose.onNodeWithTag("detail-$source").performScrollTo()
+                .assertTextContains(label)
+                .assertTextContains(monogram)
+                .assertTextContains("여행")
+            compose.onNodeWithTag("library-source-label-$source", useUnmergedTree = true)
+                .assertIsDisplayed().assertTextEquals(label)
+            compose.onNodeWithTag("library-source-monogram-$source", useUnmergedTree = true)
+                .assertIsDisplayed().assertTextEquals(monogram)
+        }
+        listOf("null-source", "blank-source").forEach { id ->
+            compose.onNodeWithTag("detail-$id").performScrollTo()
+            compose.onNodeWithTag("library-source-label-$id", useUnmergedTree = true).assertDoesNotExist()
+            compose.onNodeWithTag("library-source-monogram-$id", useUnmergedTree = true).assertDoesNotExist()
+            compose.onNodeWithText("https://example.com/$id").assertIsDisplayed()
+        }
+    }
+
     private fun assertDetailGeometry() {
         val viewport = compose.onNodeWithTag("detail-viewport").getUnclippedBoundsInRoot()
         val frame = compose.onNodeWithTag("detail-frame").getUnclippedBoundsInRoot()
@@ -821,9 +979,9 @@ class LibraryPresentationTest {
         summaries.forEach { item ->
             compose.onNodeWithText(item.displayTitle!!).assertExists()
         }
-        compose.onNodeWithText("네이버 블로그").assertExists()
-        compose.onNodeWithText("Threads").assertExists()
-        compose.onNodeWithText("Instagram").assertExists()
+        compose.onAllNodesWithText("네이버 블로그").assertCountEquals(2)
+        compose.onAllNodesWithText("Threads").assertCountEquals(2)
+        compose.onAllNodesWithText("Instagram").assertCountEquals(2)
 
         val targetContext = InstrumentationRegistry.getInstrumentation().targetContext
         val evidence = File(targetContext.cacheDir, "design-v2-populated.png")
@@ -832,5 +990,10 @@ class LibraryPresentationTest {
             assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
         }
         assertTrue(evidence.isFile && evidence.length() > 0L)
+        val sourceEvidence = File(targetContext.cacheDir, "source-shortcuts.png")
+        sourceEvidence.outputStream().use { output ->
+            assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+        }
+        assertTrue(sourceEvidence.isFile && sourceEvidence.length() > 0L)
     }
 }

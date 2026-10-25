@@ -71,6 +71,7 @@ import com.linkvault.app.auth.AccountScreen
 import com.linkvault.app.capture.CaptureInput
 import com.linkvault.app.capture.InvalidUrlReason
 import com.linkvault.app.discovery.DiscoveryScreen
+import com.linkvault.app.discovery.DiscoverySource
 import com.linkvault.app.library.LibraryScreen
 import com.linkvault.app.privacy.PrivacyScreen
 import com.linkvault.app.ui.VaultTheme
@@ -198,12 +199,16 @@ class MainActivity : ComponentActivity() {
             privateSessionStoreViewModel.storeOwnerFor(privateSessionIdentity)
         var routedSessionGeneration by rememberSaveable { mutableStateOf<Long?>(null) }
         var routedSessionOwner by rememberSaveable { mutableStateOf<String?>(null) }
+        var pendingDiscoverySource by rememberSaveable(privateSessionIdentity) {
+            mutableStateOf<DiscoverySource?>(null)
+        }
 
         fun openRoot(destination: RootDestination) {
             showCapture = false
             saveFlowActive = false
             showPrivacy = false
             discoveryItemId = null
+            pendingDiscoverySource = null
             selectedRootOrdinal = destination.ordinal
         }
 
@@ -211,6 +216,7 @@ class MainActivity : ComponentActivity() {
             val returnToCapture = saveFlowActive
             saveFlowActive = false
             discoveryItemId = null
+            pendingDiscoverySource = null
             saveUrl = null
             saveSharedText = ""
             rootLibraryEntryId = UUID.randomUUID().toString()
@@ -270,6 +276,7 @@ class MainActivity : ComponentActivity() {
                     saveFlowActive = false
                     showPrivacy = false
                     discoveryItemId = null
+                    pendingDiscoverySource = null
                     showCapture = true
                 }
             }
@@ -312,6 +319,7 @@ class MainActivity : ComponentActivity() {
             showCapture = false
             showPrivacy = false
             discoveryItemId = null
+            pendingDiscoverySource = null
             saveFlowActive = true
         }
 
@@ -319,6 +327,7 @@ class MainActivity : ComponentActivity() {
             saveFlowActive = false
             showPrivacy = false
             discoveryItemId = null
+            pendingDiscoverySource = null
             showCapture = true
         }
         Scaffold(
@@ -498,6 +507,10 @@ class MainActivity : ComponentActivity() {
                                 onBack = {},
                                 onSignIn = { openRoot(RootDestination.ACCOUNT) },
                                 onDiscover = { openRoot(RootDestination.DISCOVERY) },
+                                onBrowseSource = { source ->
+                                    openRoot(RootDestination.DISCOVERY)
+                                    pendingDiscoverySource = source
+                                },
                                 onOpenOriginal = openFromLibrary,
                             )
                         }
@@ -507,6 +520,11 @@ class MainActivity : ComponentActivity() {
                             DiscoveryScreen(
                                 client = app.accountClient,
                                 outbox = app.outboxRepository,
+                                initialSource = pendingDiscoverySource.takeIf {
+                                    routedSessionGeneration == privateSessionIdentity.generation &&
+                                        routedSessionOwner == privateSessionIdentity.ownerId
+                                },
+                                onInitialSourceApplied = { pendingDiscoverySource = null },
                                 onBack = { openRoot(RootDestination.LIBRARY) },
                                 onOpenItem = { itemId ->
                                     discoveryEntryId = UUID.randomUUID().toString()

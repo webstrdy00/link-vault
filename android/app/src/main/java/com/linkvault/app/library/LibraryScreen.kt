@@ -9,6 +9,7 @@ import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
@@ -30,6 +32,7 @@ import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -60,6 +63,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
@@ -101,6 +105,7 @@ fun LibraryScreen(
     onOpenOriginal: (String) -> Unit,
     initialItemId: String? = null,
     onDiscover: () -> Unit = {},
+    onBrowseSource: (DiscoverySource) -> Unit = {},
     incomingImageUri: Uri? = null,
     onIncomingImageConsumed: () -> Unit = {},
     onAdd: (() -> Unit)? = null,
@@ -176,6 +181,7 @@ fun LibraryScreen(
                 onAdd = onAdd,
                 onRefresh = libraryViewModel::refresh,
                 onDiscover = onDiscover,
+                onBrowseSource = onBrowseSource,
             )
         } else if (state.detail is LibraryDetailState.None) {
             Row(
@@ -440,6 +446,7 @@ internal fun LibraryRootHeader(
     onAdd: () -> Unit,
     onRefresh: () -> Unit,
     onDiscover: () -> Unit,
+    onBrowseSource: (DiscoverySource) -> Unit = {},
 ) {
     Column {
         Row(
@@ -532,6 +539,31 @@ internal fun LibraryRootHeader(
                     fontSize = 14.sp,
                 )
             }
+        }
+        SourceFilterShortcuts(onBrowseSource = onBrowseSource)
+    }
+}
+
+@Composable
+internal fun SourceFilterShortcuts(onBrowseSource: (DiscoverySource) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp)
+            .testTag("library-source-shortcuts")
+            .horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        DiscoverySource.entries.forEach { source ->
+            AssistChip(
+                onClick = { onBrowseSource(source) },
+                label = { Text(source.displayName, maxLines = 1, softWrap = false) },
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("library-source-${source.apiValue ?: "all"}"),
+                shape = MaterialTheme.shapes.small,
+            )
         }
     }
 }
@@ -1017,27 +1049,10 @@ internal fun LibraryItemCard(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         source?.let { value ->
-                            Surface(
-                                modifier = Modifier.size(22.dp),
-                                shape = MaterialTheme.shapes.small,
-                                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                border = BorderStroke(
-                                    1.dp,
-                                    MaterialTheme.colorScheme.outlineVariant,
-                                ),
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Text(
-                                        text = sourceMonogram(value),
-                                        fontSize = 10.sp,
-                                        lineHeight = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                    )
-                                }
-                            }
+                            LibrarySourceBadge(source = value, itemId = item.id)
                             Text(
                                 text = value,
+                                modifier = Modifier.testTag("library-source-label-${item.id}"),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp,
                                 lineHeight = 16.sp,
@@ -1119,6 +1134,54 @@ internal fun LibraryItemCard(
             }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    }
+}
+
+@Composable
+private fun LibrarySourceBadge(source: String, itemId: String) {
+    val colors = MaterialTheme.colorScheme
+    val darkBackground = colors.surface.luminance() < 0.5f
+    val background = when (source) {
+        DiscoverySource.INSTAGRAM.displayName ->
+            if (darkBackground) Color(0xFF4D203F) else Color(0xFFFCE0ED)
+        DiscoverySource.THREADS.displayName -> colors.inverseSurface
+        DiscoverySource.NAVER_BLOG.displayName ->
+            if (darkBackground) Color(0xFF173D26) else Color(0xFFDCF5DF)
+        else -> colors.surfaceContainerLow
+    }
+    val foreground = when (source) {
+        DiscoverySource.INSTAGRAM.displayName ->
+            if (darkBackground) Color(0xFFFFD8EC) else Color(0xFF6E1746)
+        DiscoverySource.THREADS.displayName -> colors.inverseOnSurface
+        DiscoverySource.NAVER_BLOG.displayName ->
+            if (darkBackground) Color(0xFFBAEDC8) else Color(0xFF14562A)
+        else -> colors.onSurfaceVariant
+    }
+    Surface(
+        modifier = Modifier.size(22.dp).testTag("library-source-badge-$itemId"),
+        shape = MaterialTheme.shapes.small,
+        color = background,
+        contentColor = foreground,
+        border = BorderStroke(
+            1.dp,
+            when (source) {
+                DiscoverySource.INSTAGRAM.displayName,
+                DiscoverySource.THREADS.displayName,
+                DiscoverySource.NAVER_BLOG.displayName,
+                -> foreground.copy(alpha = 0.35f)
+                else -> colors.outlineVariant
+            },
+        ),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = sourceMonogram(source),
+                modifier = Modifier.testTag("library-source-monogram-$itemId"),
+                fontSize = 10.sp,
+                lineHeight = 12.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
     }
 }
 

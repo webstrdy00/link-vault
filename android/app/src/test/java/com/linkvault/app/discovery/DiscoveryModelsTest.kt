@@ -54,6 +54,26 @@ class DiscoveryModelsTest {
     }
 
     @Test
+    fun sourceOnlyBrowse_preservesServerFilterAcrossPagesWithoutRequiringSearchText() {
+        for (source in DiscoverySource.entries) {
+            val snapshot = validSnapshot(
+                DiscoveryFilterInput(source = source),
+                ZoneId.of("UTC"),
+            )
+            val sourceParameter = source.apiValue?.let { "source=$it&" }.orEmpty()
+
+            assertEquals(
+                "/items?${sourceParameter}aliases=true&needs_cues=false&limit=20&offset=0",
+                snapshot.itemsPath(),
+            )
+            assertEquals(
+                "/items?${sourceParameter}aliases=true&needs_cues=false&limit=20&offset=20",
+                snapshot.itemsPath(offset = 20),
+            )
+        }
+    }
+
+    @Test
     fun dates_useLocalStartOfDayAndExclusiveDayAfterUpperBound() {
         val snapshot = validSnapshot(
             DiscoveryFilterInput(

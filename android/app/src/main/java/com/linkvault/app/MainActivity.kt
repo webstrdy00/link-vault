@@ -72,6 +72,7 @@ import com.linkvault.app.capture.CaptureInput
 import com.linkvault.app.capture.InvalidUrlReason
 import com.linkvault.app.discovery.DiscoveryScreen
 import com.linkvault.app.library.LibraryScreen
+import com.linkvault.app.privacy.PrivacyScreen
 import com.linkvault.app.ui.VaultTheme
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -166,6 +167,7 @@ class MainActivity : ComponentActivity() {
         val selectedRoot = RootDestination.entries[selectedRootOrdinal]
         var showCapture by rememberSaveable { mutableStateOf(capture.isExternalShare) }
         var saveFlowActive by rememberSaveable { mutableStateOf(false) }
+        var showPrivacy by rememberSaveable { mutableStateOf(false) }
         var discoveryItemId by rememberSaveable { mutableStateOf<String?>(null) }
         var rootLibraryEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
         var saveEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
@@ -200,6 +202,7 @@ class MainActivity : ComponentActivity() {
         fun openRoot(destination: RootDestination) {
             showCapture = false
             saveFlowActive = false
+            showPrivacy = false
             discoveryItemId = null
             selectedRootOrdinal = destination.ordinal
         }
@@ -265,6 +268,7 @@ class MainActivity : ComponentActivity() {
                 selectedSharedImageIndex = if (capture.imageUris.size == 1) 0 else null
                 if (capture.isExternalShare) {
                     saveFlowActive = false
+                    showPrivacy = false
                     discoveryItemId = null
                     showCapture = true
                 }
@@ -306,18 +310,20 @@ class MainActivity : ComponentActivity() {
             saveUrl = url
             saveSharedText = sharedText
             showCapture = false
+            showPrivacy = false
             discoveryItemId = null
             saveFlowActive = true
         }
 
         val openCapture: () -> Unit = {
             saveFlowActive = false
+            showPrivacy = false
             discoveryItemId = null
             showCapture = true
         }
         Scaffold(
             floatingActionButton = {
-                if (!showCapture && !saveFlowActive && discoveryItemId == null &&
+                if (!showCapture && !saveFlowActive && !showPrivacy && discoveryItemId == null &&
                     selectedRoot != RootDestination.LIBRARY
                 ) {
                     FloatingActionButton(
@@ -333,7 +339,9 @@ class MainActivity : ComponentActivity() {
             },
             bottomBar = {
                 Column {
-                    if (!showCapture && !saveFlowActive && discoveryItemId == null && hasCaptureDraft) {
+                    if (!showCapture && !saveFlowActive && !showPrivacy &&
+                        discoveryItemId == null && hasCaptureDraft
+                    ) {
                         DraftResumeBar(onResume = { showCapture = true })
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -507,11 +515,19 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
-                    else -> AccountScreen(
-                        client = app.accountClient,
-                        outbox = app.outboxRepository,
-                        onBack = { openRoot(RootDestination.LIBRARY) },
-                    )
+                    else -> if (showPrivacy) {
+                        PrivacyScreen(
+                            onBack = { showPrivacy = false },
+                            onOpenExternalUrl = openFromLibrary,
+                        )
+                    } else {
+                        AccountScreen(
+                            client = app.accountClient,
+                            outbox = app.outboxRepository,
+                            onBack = { openRoot(RootDestination.LIBRARY) },
+                            onOpenPrivacy = { showPrivacy = true },
+                        )
+                    }
                 }
             }
         }
@@ -578,6 +594,10 @@ class MainActivity : ComponentActivity() {
                 },
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = "제목·메모 없이 링크부터 보관하세요. 저장 후 공개 정보를 자동으로 가져오며, 사이트에 따라 제한될 수 있어요.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             TextButton(onClick = onToggleHelp) {
                 Text(if (showHelp) "저장 방법 닫기" else "저장 방법 보기")
@@ -924,8 +944,18 @@ class MainActivity : ComponentActivity() {
         val mimeType = intent.type.orEmpty()
         val isImageShare = mimeType.startsWith("image/", ignoreCase = true)
         val sharedText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString().orEmpty()
+        val subject = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim().orEmpty()
+        val whitespace = Regex("\\s+")
+        val subjectAlreadyIncluded = " ${sharedText.replace(whitespace, " ")} ".contains(
+            " ${subject.replace(whitespace, " ")} ",
+        )
+        val receivedText = when {
+            subject.isBlank() || subjectAlreadyIncluded -> sharedText
+            sharedText.isBlank() -> subject
+            else -> "$subject\n$sharedText"
+        }
         return IncomingCapture(
-            text = sharedText,
+            text = receivedText,
             imageUris = if (isImageShare) readSharedImageUris(intent) else emptyList(),
             isImageShare = isImageShare,
             isExternalShare = true,

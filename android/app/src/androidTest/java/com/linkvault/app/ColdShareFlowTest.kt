@@ -4,6 +4,7 @@ import android.content.Intent
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -17,6 +18,44 @@ import org.junit.Test
 class ColdShareFlowTest {
     @get:Rule
     val compose = createEmptyComposeRule()
+
+    @Test
+    fun coldSharedSubjectAndSingleUrlSurviveRecreationWithoutSaving() {
+        val url = "https://example.com/cold-article"
+        val intent = Intent(ApplicationProvider.getApplicationContext(), MainActivity::class.java).apply {
+            action = Intent.ACTION_SEND
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, url)
+            putExtra(Intent.EXTRA_SUBJECT, "공유한 기사 제목")
+        }
+        ActivityScenario.launch<MainActivity>(intent).use { scenario ->
+            compose.onNodeWithTag("capture-screen").assertIsDisplayed()
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL")
+                .assertTextContains("공유한 기사 제목\n$url")
+            compose.onNodeWithText("선택한 링크 보관").performScrollTo().assertIsEnabled()
+            scenario.recreate()
+            compose.onNodeWithTag("capture-screen").assertIsDisplayed()
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL")
+                .assertTextContains("공유한 기사 제목\n$url")
+            compose.onNodeWithText("URL 후보 1개").assertExists()
+            compose.onNodeWithText("선택한 링크 보관").performScrollTo().assertIsEnabled()
+        }
+    }
+
+    @Test
+    fun coldSubjectOnlyShareStillExtractsUrl() {
+        val url = "https://example.com/subject-only"
+        val intent = Intent(ApplicationProvider.getApplicationContext(), MainActivity::class.java).apply {
+            action = Intent.ACTION_SEND
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, url)
+        }
+        ActivityScenario.launch<MainActivity>(intent).use {
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertTextContains(url)
+            compose.onNodeWithText("URL 후보 1개").assertExists()
+            compose.onNodeWithText("원문 열기").performScrollTo().assertIsEnabled()
+        }
+    }
 
     @Test
     fun initialShareAndSelectedLinkSurviveRecreation() {

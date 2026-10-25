@@ -1872,11 +1872,11 @@ internal fun validateAccountConfig(
 
     val scheme = uri.scheme?.lowercase()
     val isHttps = scheme == "https"
-    val isDebugEmulator = debug &&
+    val isDebugLocalBackend = debug &&
         scheme == "http" &&
-        uri.host == "10.0.2.2" &&
+        (uri.host == "10.0.2.2" || uri.host == "127.0.0.1") &&
         uri.port == 18021
-    if (!isHttps && !isDebugEmulator) {
+    if (!isHttps && !isDebugLocalBackend) {
         val issue = if (scheme == "http") {
             AccountConfigIssue.INSECURE_URL
         } else {

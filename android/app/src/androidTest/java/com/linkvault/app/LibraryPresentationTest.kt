@@ -165,7 +165,7 @@ class LibraryPresentationTest {
             }
         }
 
-        compose.onNodeWithText("link vault").assertExists()
+        compose.onNodeWithText("LinkFileBox").assertExists()
         compose.onNodeWithText("내 보관함").assertExists()
         compose.onNodeWithText("최근 보관한 링크").assertExists()
         summaries.forEach { item ->

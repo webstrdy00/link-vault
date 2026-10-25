@@ -1,6 +1,11 @@
 package com.linkvault.app.library
 
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
@@ -38,6 +43,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -53,13 +59,19 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.linkvault.app.R
 import com.linkvault.app.attachment.AttachmentControls
 import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.auth.AccountClient
@@ -90,16 +102,22 @@ fun LibraryScreen(
     onIncomingImageConsumed: () -> Unit = {},
     onAdd: (() -> Unit)? = null,
 ) {
-    val ownerId = client.sessionUserId()
-    val viewModelKey = remember(client, ownerId, entryId) {
-        "library:${System.identityHashCode(client)}:${ownerId ?: "signed-out"}:$entryId"
+    val sessionState by client.sessionState.collectAsState()
+    val ownerId = sessionState.ownerId
+    val viewModelKey = remember(client, ownerId, sessionState.generation, entryId) {
+        "library:${System.identityHashCode(client)}:${ownerId ?: "signed-out"}:" +
+            "${sessionState.generation}:$entryId"
     }
-    val factory = remember(client, outbox, attachments, ownerId, initialUrl, sharedText, initialItemId) {
+    val factory = remember(
+        client, outbox, attachments, ownerId, sessionState.generation,
+        initialUrl, sharedText, initialItemId,
+    ) {
         LibraryViewModel.factory(
             client = client,
             outbox = outbox,
             attachments = attachments,
             ownerId = ownerId,
+            sessionGeneration = sessionState.generation,
             initialUrl = initialUrl,
             sharedText = sharedText,
             initialItemId = initialItemId,
@@ -110,6 +128,10 @@ fun LibraryScreen(
         factory = factory,
     )
     val state by libraryViewModel.uiState.collectAsState()
+    LibraryRecoveryEffect(
+        libraryViewModel = libraryViewModel,
+        authenticated = state.availability is LibraryAvailability.Ready,
+    )
     val onBackFromDetail =
         if (initialItemId != null) onBack else libraryViewModel::closeDetail
     val navigateBack: () -> Unit = {
@@ -211,6 +233,9 @@ fun LibraryScreen(
             )
 
             LibraryAvailability.Ready -> {
+                state.queueError?.let { message ->
+                    Text(message, color = MaterialTheme.colorScheme.error)
+                }
                 if (state.outboxEntries.isNotEmpty()) {
                     OutboxContent(
                         entries = state.outboxEntries,
@@ -312,6 +337,82 @@ fun LibraryScreen(
 }
 
 @Composable
+private fun LibraryRecoveryEffect(
+    libraryViewModel: LibraryViewModel,
+    authenticated: Boolean,
+) {
+    val context = LocalContext.current.applicationContext
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val connectivity = remember(context) {
+        checkNotNull(context.getSystemService(ConnectivityManager::class.java))
+    }
+    DisposableEffect(libraryViewModel, authenticated, lifecycleOwner, connectivity) {
+        val lifecycle = lifecycleOwner.lifecycle
+        val handler = Handler(Looper.getMainLooper())
+        var registeredCallback: ConnectivityManager.NetworkCallback? = null
+
+        fun stopMonitoring() {
+            val callback = registeredCallback
+            registeredCallback = null
+            libraryViewModel.setRecoveryEnvironment(false, false)
+            if (callback != null) connectivity.unregisterNetworkCallback(callback)
+        }
+
+        fun syncVisibility() {
+            if (!authenticated || !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                stopMonitoring()
+                return
+            }
+            if (registeredCallback != null) return
+            var defaultNetwork = connectivity.activeNetwork
+            val initialCapabilities = defaultNetwork?.let(connectivity::getNetworkCapabilities)
+            val callback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (registeredCallback !== this || network == defaultNetwork) return
+                    defaultNetwork = network
+                    libraryViewModel.setRecoveryEnvironment(true, false)
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    capabilities: NetworkCapabilities,
+                ) {
+                    if (registeredCallback !== this || network != defaultNetwork) return
+                    libraryViewModel.setRecoveryEnvironment(
+                        true,
+                        capabilities.isValidatedInternet(),
+                    )
+                }
+
+                override fun onLost(network: Network) {
+                    if (registeredCallback !== this || network != defaultNetwork) return
+                    defaultNetwork = null
+                    libraryViewModel.setRecoveryEnvironment(true, false)
+                }
+            }
+            registeredCallback = callback
+            connectivity.registerDefaultNetworkCallback(callback, handler)
+            libraryViewModel.setRecoveryEnvironment(
+                true,
+                initialCapabilities?.isValidatedInternet() == true,
+            )
+        }
+
+        val observer = LifecycleEventObserver { _, _ -> syncVisibility() }
+        lifecycle.addObserver(observer)
+        syncVisibility()
+        onDispose {
+            lifecycle.removeObserver(observer)
+            stopMonitoring()
+        }
+    }
+}
+
+private fun NetworkCapabilities.isValidatedInternet(): Boolean =
+    hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+        hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+
+@Composable
 internal fun LibraryRootHeader(
     canRefresh: Boolean,
     onAdd: () -> Unit,
@@ -334,7 +435,7 @@ internal fun LibraryRootHeader(
                     modifier = Modifier.size(18.dp),
                 )
                 Text(
-                    text = "link vault",
+                    text = stringResource(R.string.app_name),
                     fontSize = 13.sp,
                     lineHeight = 18.sp,
                     fontWeight = FontWeight.Bold,
@@ -436,7 +537,7 @@ private fun SignInRequiredContent(
 }
 
 @Composable
-private fun SaveFormContent(
+internal fun SaveFormContent(
     state: LibraryUiState,
     onTitleChange: (String) -> Unit,
     onNoteChange: (String) -> Unit,
@@ -447,6 +548,16 @@ private fun SaveFormContent(
 ) {
     val form = state.form
     val validationIssues = remember(form) { validateLibrarySaveForm(form) }
+    var showOptionalDetails by rememberSaveable(form.initialUrl, form.sharedText) {
+        mutableStateOf(false)
+    }
+    val hasOptionalDetailsError = validationIssues.any {
+        it.field == LibraryFormField.TITLE || it.field == LibraryFormField.NOTE
+    }
+    LaunchedEffect(form.initialUrl, form.sharedText, hasOptionalDetailsError) {
+        if (hasOptionalDetailsError) showOptionalDetails = true
+    }
+    val optionalDetailsExpanded = showOptionalDetails || hasOptionalDetailsError
     val saveStatus = state.saveStatus
     val fieldsEnabled = when (saveStatus) {
         LibrarySaveStatus.Idle,
@@ -474,31 +585,45 @@ private fun SaveFormContent(
             )
         }
 
-        OutlinedTextField(
-            value = form.title,
-            onValueChange = onTitleChange,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = fieldsEnabled,
-            label = { Text("제목 (선택 사항)") },
-            isError = validationIssues.any { it.field == LibraryFormField.TITLE },
-            supportingText = {
-                Text("${form.title.codePointLength()} / $LIBRARY_TITLE_MAX_CODE_POINTS")
-            },
-            singleLine = true,
+        Text(
+            text = "저장 후 공개 페이지의 제목·설명 등을 자동으로 가져와요. 정보를 가져오지 못해도 링크는 보관돼요.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        OutlinedTextField(
-            value = form.note,
-            onValueChange = onNoteChange,
-            modifier = Modifier.fillMaxWidth(),
-            enabled = fieldsEnabled,
-            label = { Text("메모 (선택 사항)") },
-            isError = validationIssues.any { it.field == LibraryFormField.NOTE },
-            supportingText = {
-                Text("${form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS")
-            },
-            minLines = 3,
-            maxLines = 7,
-        )
+        TextButton(
+            onClick = { showOptionalDetails = !optionalDetailsExpanded },
+            enabled = !hasOptionalDetailsError,
+            modifier = Modifier.testTag("capture-optional-details"),
+        ) {
+            Text(if (optionalDetailsExpanded) "제목·메모 접기" else "제목·메모 직접 입력 (선택)")
+        }
+        if (optionalDetailsExpanded) {
+            OutlinedTextField(
+                value = form.title,
+                onValueChange = onTitleChange,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = fieldsEnabled,
+                label = { Text("제목 (선택 사항)") },
+                isError = validationIssues.any { it.field == LibraryFormField.TITLE },
+                supportingText = {
+                    Text("${form.title.codePointLength()} / $LIBRARY_TITLE_MAX_CODE_POINTS")
+                },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                value = form.note,
+                onValueChange = onNoteChange,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = fieldsEnabled,
+                label = { Text("메모 (선택 사항)") },
+                isError = validationIssues.any { it.field == LibraryFormField.NOTE },
+                supportingText = {
+                    Text("${form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS")
+                },
+                minLines = 3,
+                maxLines = 7,
+            )
+        }
 
         if (form.sharedText.isNotBlank()) {
             val sharedCount = form.sharedText.codePointLength()
@@ -771,8 +896,11 @@ private fun LibraryListContent(
 
         if (state.isListLoading && state.items.isEmpty()) {
             LoadingMessage("보관함을 불러오고 있어요.")
+            state.listError?.let { message ->
+                ListFailure(message = message, onRetry = onRetry, canRetry = false)
+            }
         } else if (state.listError != null && state.items.isEmpty()) {
-            ListFailure(message = state.listError, onRetry = onRetry)
+            ListFailure(message = state.listError, onRetry = onRetry, canRetry = true)
         } else {
             if (state.items.isEmpty()) {
                 EmptyLibraryContent(
@@ -798,7 +926,11 @@ private fun LibraryListContent(
 
             state.listError?.let { message ->
                 Box(modifier = Modifier.padding(top = 12.dp)) {
-                    ListFailure(message = message, onRetry = onRetry)
+                    ListFailure(
+                        message = message,
+                        onRetry = onRetry,
+                        canRetry = !state.isListLoading,
+                    )
                 }
             }
 
@@ -1052,11 +1184,13 @@ private val BookmarkOutlineIcon = ImageVector.Builder(
 private fun ListFailure(
     message: String,
     onRetry: () -> Unit,
+    canRetry: Boolean,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(message, color = MaterialTheme.colorScheme.error)
         Button(
             onClick = onRetry,
+            enabled = canRetry,
             modifier = Modifier.fillMaxWidth(),
             shape = MaterialTheme.shapes.small,
         ) {

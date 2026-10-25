@@ -109,12 +109,45 @@ internal data class AttachmentUiState(
         get() = canMutateActiveAsset && item.activeAsset != null && item.ocrState == "failed"
 
     val supportsMetadataRetry: Boolean
-        get() = item.version != null &&
-            (item.metadataState == "partial" || item.metadataState == "failed") &&
-            item.extractionMeta.errorCode?.let(RETRYABLE_METADATA_ERRORS::contains) == true
+        get() = item.version != null && when (item.metadataState) {
+            "unsupported" -> true
+            "partial", "failed" ->
+                item.extractionMeta.errorCode?.let(RETRYABLE_METADATA_ERRORS::contains) == true
+            else -> false
+        }
 
     val canRetryMetadata: Boolean
         get() = canMutateActiveAsset && supportsMetadataRetry
+}
+
+internal val LibraryItemDetail.isMetadataProcessing: Boolean
+    get() = metadataState == "queued" || metadataState == "running"
+
+internal val LibraryItemDetail.hasPendingEnrichment: Boolean
+    get() = isMetadataProcessing || classificationState == "pending"
+
+internal enum class AttachmentPollDecision {
+    APPLY,
+    SKIP_STALE,
+    STOP,
+}
+
+internal fun attachmentPollDecision(
+    visible: Boolean,
+    identityMatches: Boolean,
+    itemId: String,
+    latest: LibraryItemDetail,
+    current: LibraryItemDetail,
+): AttachmentPollDecision = when {
+    !visible || !identityMatches || latest.id != itemId -> AttachmentPollDecision.STOP
+    !isAtLeastVersion(latest, current) -> AttachmentPollDecision.SKIP_STALE
+    else -> AttachmentPollDecision.APPLY
+}
+
+private fun isAtLeastVersion(candidate: LibraryItemDetail, current: LibraryItemDetail): Boolean {
+    val currentVersion = current.version ?: return true
+    val candidateVersion = candidate.version ?: return false
+    return candidateVersion >= currentVersion
 }
 
 internal class AttachmentViewModel(
@@ -211,7 +244,7 @@ internal class AttachmentViewModel(
         if (awaitingDeletedAssetId != null && activeId != awaitingDeletedAssetId) {
             awaitingDeletedAssetId = null
         }
-        if (awaitingMetadata && item.metadataState != "pending") awaitingMetadata = false
+        if (awaitingMetadata && !item.isMetadataProcessing) awaitingMetadata = false
         val deleteConfirmation = mutableUiState.value.deleteConfirmation?.takeIf {
             activeId == it.assetId
         }
@@ -896,14 +929,36 @@ internal class AttachmentViewModel(
                         client.libraryRequest(boundOwner, "/items/$itemId")
                     } ?: break
                     val latest = parseLibraryDetailResponse(response)
-                    if (!visible || !identityMatches() || latest.id != itemId ||
-                        !isAtLeastVersion(latest, mutableUiState.value.item)
-                    ) {
-                        return@launch
+                    when (attachmentPollDecision(
+                        visible = visible,
+                        identityMatches = identityMatches(),
+                        itemId = itemId,
+                        latest = latest,
+                        current = mutableUiState.value.item,
+                    )) {
+                        AttachmentPollDecision.STOP -> return@launch
+                        AttachmentPollDecision.SKIP_STALE -> continue
+                        AttachmentPollDecision.APPLY -> Unit
                     }
                     outbox.cacheDetail(boundOwner, response)
-                    if (!visible || !identityMatches()) return@launch
+                    when (attachmentPollDecision(
+                        visible = visible,
+                        identityMatches = identityMatches(),
+                        itemId = itemId,
+                        latest = latest,
+                        current = mutableUiState.value.item,
+                    )) {
+                        AttachmentPollDecision.STOP -> return@launch
+                        AttachmentPollDecision.SKIP_STALE -> continue
+                        AttachmentPollDecision.APPLY -> Unit
+                    }
+                    val previousItem = mutableUiState.value.item
                     updateItem(latest)
+                    if (mutableUiState.value.item != previousItem) {
+                        mutableUiState.value = mutableUiState.value.copy(
+                            refreshGeneration = mutableUiState.value.refreshGeneration + 1L,
+                        )
+                    }
                 } catch (error: CancellationException) {
                     throw error
                 } catch (_: AccountAuthenticationRequiredException) {
@@ -921,7 +976,7 @@ internal class AttachmentViewModel(
         }
     }
 
-    private fun shouldPoll(): Boolean = mutableUiState.value.item.metadataState == "pending" ||
+    private fun shouldPoll(): Boolean = mutableUiState.value.item.hasPendingEnrichment ||
         awaitingMetadata || awaitingAssetId != null || awaitingDeletedAssetId != null
 
     private fun loadPreviewIfNeeded() {
@@ -1035,12 +1090,6 @@ internal class AttachmentViewModel(
             session.generation == sessionGeneration
     }
 
-    private fun isAtLeastVersion(candidate: LibraryItemDetail, current: LibraryItemDetail): Boolean {
-        val currentVersion = current.version ?: return true
-        val candidateVersion = candidate.version ?: return false
-        return candidateVersion >= currentVersion
-    }
-
     private fun isNewerVersion(candidate: Long?, baseline: Long?): Boolean =
         candidate != null && baseline != null && candidate > baseline
 
@@ -1053,7 +1102,7 @@ internal class AttachmentViewModel(
 
     companion object {
         private const val POLL_INTERVAL_MILLIS = 5_000L
-        private const val POLL_DURATION_MILLIS = 60_000L
+        private const val POLL_DURATION_MILLIS = 180_000L
         private const val NANOS_PER_MILLISECOND = 1_000_000L
 
         fun factory(

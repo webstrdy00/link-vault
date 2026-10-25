@@ -32,6 +32,8 @@ jobs:
         run: npm ci
       - name: CI safety contract
         run: npm run test:ci
+      - name: Public website review checks
+        run: npm run test:website
       - name: Restricted deployment and recovery tests
         run: |
           python3 scripts/server-deploy.test.py

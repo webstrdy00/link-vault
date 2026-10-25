@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "test:ci": "node --test scripts/ci-contract.test.mjs",
+    "test:website": "node --test scripts/website.test.mjs scripts/web-account-deletion.test.mjs scripts/build-web-account-config.test.mjs",
+    "build:web-account-config": "node scripts/build-web-account-config.mjs",
     "beta:check": "node scripts/beta-acceptance.mjs",
     "beta:templates": "node scripts/beta-templates.mjs",
     "test:beta": "node --test scripts/beta-acceptance.test.mjs scripts/beta-templates.test.mjs",
@@ -19,6 +21,7 @@
     "test:backup-integration": "node scripts/backup-integration.mjs",
     "test:db": "supabase test db",
     "test:api": "deno test --allow-read=supabase/functions/library-api/webp_dec.wasm --allow-env=NODE_V8_COVERAGE,UNDICI_NO_FG,JEST_WORKER_ID --config supabase/functions/library-api/deno.json supabase/functions/library-api",
+    "test:metadata-live": "deno run --allow-net --allow-env=NODE_V8_COVERAGE,UNDICI_NO_FG,JEST_WORKER_ID --config supabase/functions/library-api/deno.json scripts/metadata-live-check.ts",
     "test:integration": "node scripts/member-integration.mjs",
     "test:discovery-integration": "node scripts/discovery-integration.mjs",
     "test:discovery-emulator-integration": "node scripts/discovery-emulator-integration.mjs",

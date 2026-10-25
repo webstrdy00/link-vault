@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="robots" content="noindex,nofollow">
+    <title>계정과 자료 삭제 | LinkFileBox</title>
+    <link rel="stylesheet" href="../site.css">
+    <script type="module" src="./account-deletion.js"></script>
+  </head>
+  <body class="account-deletion">
+    <a class="skip" href="#main">본문으로</a>
+    <header>
+      <a class="brand" href="../">LinkFileBox</a>
+      <nav
+        aria-label="주요 메뉴"><a href="../privacy/">개인정보 안내</a><a href="./" aria-current="page">탈퇴 안내</a></nav>
+    </header>
+    <aside
+      class="draft">개인정보 안내 검토본 · 문의 응대와 최종 보관·파기 기준은 확정 전입니다.</aside>
+    <main id="main" class="policy">
+      <article class="policy-card" aria-labelledby="policy-title">
+        <div class="policy-heading">
+          <h1 id="policy-title">계정과 보관 자료 삭제</h1>
+          <p>LinkFileBox 계정 탈퇴와 보관 자료 삭제 방법을 안내합니다.</p>
+        </div>
+        <div class="policy-content">
+          <p><strong>탈퇴는 되돌릴 수 없습니다.</strong> LinkFileBox 계정과 보관 자료를 삭제하며 Google 계정 자체를 삭제하는 절차는 아닙니다.</p>
+          <section>
+            <h2>1. 앱에서 탈퇴하기</h2>
+            <ol>
+              <li>LinkFileBox에 로그인하고 하단 <strong>설정</strong>에서 계정 화면을 엽니다.</li>
+              <li><strong>계정과 서버 자료 삭제</strong>를 선택합니다.</li>
+              <li>삭제 안내를 읽고 현재 계정으로 Google 재인증을 진행합니다.</li>
+              <li>삭제 요청 결과와 진행 상태를 확인합니다. 오류나 대기는 삭제 완료가 아닙니다.</li>
+            </ol>
+            <p>로그아웃이나 앱 제거만으로 서버 계정·보관함이 삭제되지는 않습니다.</p>
+          </section>
+          <section>
+            <h2>2. 삭제 범위와 소요 시간</h2>
+            <p>탈퇴 처리 대상은 LinkFileBox의 인증 계정·프로필·회원 승인 정보·보관 항목·첨부 이미지와 인식 결과 등 계정에 연결된 서비스 자료입니다. 기기 자료 정리에 실패했다는 경고가 나오면 서버 삭제와 별개로 기기 정리를 확인해야 합니다.</p>
+            <p>운영 자료 정리는 <strong>72시간 이내를 목표</strong>로 하지만 완료 시간을 보장하지 않습니다. 삭제 작업·감사 기록은 활성 계정 자료와 구분되며 최종 보관·파기 기준은 확정 전입니다.</p>
+            <p>운영 백업의 <strong>30일 순환 목표</strong>는 모든 사본의 최대 보관 기간이 아닙니다. 서버 밖 독립 복원 검증이 확인되어야 최근 7개·30일 기준으로 정리하며, 현재 검증 증거가 없어 기존 서버 스냅샷을 모두 보존합니다. 마지막 검증 복구본의 예외 보존과 복원 시 삭제 요청 재적용 등 자세한 기준은 <a href="../privacy/">개인정보 안내</a>를 확인하세요.</p>
+          </section>
+          <section>
+            <h2>3. 앱에 접근할 수 없을 때</h2>
+            <p>아래에서 <strong>Google 재인증으로 웹 탈퇴·진행 상태 조회</strong>를 이용할 수 있습니다. 가입할 때 사용한 Google 계정을 선택하세요. 신규 가입이나 LinkFileBox 로그인 세션은 만들지 않습니다.</p>
+            <p>삭제 동의와 Google 인증 후 <strong>최종 삭제 요청 보내기</strong>를 눌러야 요청이 전송됩니다. 진행 상태는 이 화면에서 조회하며 결과 이메일은 보내지 않습니다.</p>
+            <p>이메일 발신 주소만으로 본인을 판단하지 않으며 메일 발송만으로 계정을 자동 삭제하지 않습니다. <strong>비밀번호·인증 코드·세션 토큰·신분증 사본은 보내지 마세요.</strong></p>
+            <div id="web-account" class="account-controls"
+              aria-labelledby="web-account-title">
+              <h3 id="web-account-title">웹에서 본인 확인 및 삭제 요청</h3>
+              <p
+                id="account-consent-note"><strong>삭제 요청은 되돌릴 수 없습니다.</strong> 위의 삭제 범위와 백업·기기 자료 제한을 확인하세요. 상태 조회만 할 때는 삭제 동의가 필요하지 않습니다.</p>
+              <label><input id="account-consent" type="checkbox" aria-describedby="account-consent-note"> LinkFileBox 계정과 서버 자료의 되돌릴 수 없는 삭제에 동의합니다.</label>
+              <div class="account-actions">
+                <button id="account-start-delete" type="button"
+                  disabled>삭제 요청을 위한 Google 인증 시작</button>
+                <button id="account-start-status" type="button"
+                  disabled>진행 상태 조회를 위한 Google 인증 시작</button>
+              </div>
+              <div id="account-google-area" hidden>
+                <p id="account-google-purpose"></p>
+                <div id="account-google-button"></div>
+              </div>
+              <div class="account-actions">
+                <button id="account-send" type="button" hidden
+                  disabled>최종 삭제 요청 보내기</button>
+                <button id="account-retry" type="button" hidden
+                  disabled>동일 요청 다시 전송</button>
+                <button id="account-cancel" type="button"
+                  hidden>취소하고 인증 정보 지우기</button>
+              </div>
+              <p id="account-message" class="notice" role="status"
+                aria-live="polite"
+                aria-atomic="true">웹 요청과 진행 상태 조회에는 자바스크립트가 필요합니다.</p>
+              <div id="account-result" hidden>
+                <h3>인증된 진행 상태</h3>
+                <p id="account-result-state"></p>
+                <dl id="account-result-times"></dl>
+              </div>
+              <p>응답이 끊기면 요청이 접수되었을 수도 있습니다. 오류·접수·처리 중은 삭제 완료가 아니므로 새 Google 인증으로 진행 상태를 조회하세요. 전송 후 취소는 이 화면의 인증 정보만 지우며 접수된 삭제 요청을 철회하지 않습니다.</p>
+              <noscript><p>웹 요청과 상태 조회에는 자바스크립트가 필요합니다. 앱 내 탈퇴 절차를 이용할 수 있습니다.</p></noscript>
+            </div>
+          </section>
+          <section class="policy-contact">
+            <h2>4. 문의처</h2>
+            <p>공개 운영자명: <strong>LinkFileBox 운영자</strong></p>
+            <p>문의 주소: <a href="mailto:support@linkfilebox.com">support@linkfilebox.com</a></p>
+          </section>
+        </div>
+      </article>
+      <p class="policy-back"><a href="../">소개 페이지로 돌아가기</a></p>
+    </main>
+    <footer><a href="../">소개</a> · <a href="../privacy/">개인정보 안내</a> · LinkFileBox 운영자</footer>
+  </body>
+</html>

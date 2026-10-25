@@ -2,7 +2,30 @@
 	admin off
 }
 
+linkfilebox.com {
+	root * /srv/website
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		Cross-Origin-Opener-Policy same-origin-allow-popups
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' https://accounts.google.com/gsi/style; frame-src https://accounts.google.com/gsi/; connect-src 'self' https://api.linkfilebox.com https://accounts.google.com/gsi/; img-src 'self' data: https://lh3.googleusercontent.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	}
+	@account path /account-deletion /account-deletion/*
+	header @account Cache-Control "no-store"
+	file_server
+}
+
 api.linkfilebox.com {
+	@webAccountWrongOrigin {
+		path /functions/v1/library-api/v1/web-account /functions/v1/library-api/v1/web-account/*
+		not header Origin https://linkfilebox.com
+	}
+	handle @webAccountWrongOrigin {
+		header Cache-Control no-store
+		header Vary Origin
+		respond 403
+	}
 	@internal path /functions/v1/library-api/v1/internal /functions/v1/library-api/v1/internal/*
 	handle @internal {
 		respond 404

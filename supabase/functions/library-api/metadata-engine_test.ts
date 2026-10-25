@@ -19,6 +19,7 @@ import {
   prepareEnrichedSnapshot,
   prepareItem,
 } from "./item-preparation.ts";
+import { isMetadataUrlEligible } from "./metadata-url.ts";
 
 const CHECKED_AT = new Date("2026-09-15T12:00:00.000Z");
 const PUBLIC_V4: ResolvedAddress = { address: "223.130.200.104", family: 4 };
@@ -31,6 +32,10 @@ class FakeDns implements MetadataDnsResolver {
     private readonly answers: Record<string, ResolvedAddress[] | Error> = {
       "blog.naver.com": [PUBLIC_V4],
       "m.blog.naver.com": [PUBLIC_V4],
+      "example.com": [PUBLIC_V4],
+      "www.example.com": [PUBLIC_V4],
+      "threads.net": [PUBLIC_V4],
+      "www.threads.com": [PUBLIC_V4],
     },
   ) {}
 
@@ -121,30 +126,33 @@ async function metadataFailure(
   throw new Error("Expected metadata fetch to fail.");
 }
 
-Deno.test("production metadata DNS and pinned HTTPS transport adapters exist", () => {
+Deno.test("production metadata DNS and pinned HTTP/HTTPS transport adapters exist", () => {
   assert(typeof productionMetadataDnsResolver.resolve === "function");
   assert(typeof productionMetadataTransport.request === "function");
 });
 
 Deno.test("production pinned transport validates addresses and owns body lifetime", async () => {
-  for (
-    const addresses of [
-      [],
-      [{ address: "127.0.0.1", family: 4 as const }],
-      [{ address: "fc00::1", family: 6 as const }],
-    ]
-  ) {
-    let rejected = false;
-    try {
-      await productionMetadataTransport.request({
-        url: new URL("https://blog.naver.com/post"),
-        addresses,
-        signal: new AbortController().signal,
-      });
-    } catch (error) {
-      rejected = error instanceof TypeError;
+  for (const protocol of ["http:", "https:"]) {
+    for (
+      const addresses of [
+        [],
+        [{ address: "127.0.0.1", family: 4 as const }],
+        [{ address: "fc00::1", family: 6 as const }],
+        [PUBLIC_V4, { address: "10.0.0.1", family: 4 as const }],
+      ]
+    ) {
+      let rejected = false;
+      try {
+        await productionMetadataTransport.request({
+          url: new URL(`${protocol}//example.com/post`),
+          addresses,
+          signal: new AbortController().signal,
+        });
+      } catch (error) {
+        rejected = error instanceof TypeError;
+      }
+      assertEquals(rejected, true);
     }
-    assertEquals(rejected, true);
   }
 
   const cancelledBody = new Readable({ read() {} });
@@ -213,7 +221,7 @@ Deno.test("Naver parser decodes entities and prefers real OG metadata", async ()
     body_text: null,
     metadata_state: "ready",
     extraction_meta: {
-      adapter_version: "naver-metadata-v1",
+      adapter_version: "public-page-metadata-v1",
       final_url:
         "https://blog.naver.com/PostView.naver?blogId=sample&logNo=1#original",
       title_truncated: false,
@@ -225,6 +233,236 @@ Deno.test("Naver parser decodes entities and prefers real OG metadata", async ()
   });
   assertEquals(transport.calls.length, 1);
   assertEquals(transport.calls[0].addresses, [PUBLIC_V4]);
+});
+
+Deno.test("Threads document title excludes navigation SVG titles and later body titles", async () => {
+  const result = await fetchMetadataWithAdapters(
+    "https://www.threads.com/@nasa/post/sample",
+    fakeAdapters(
+      new FakeTransport([htmlResponse(`<!doctype html><html><head>
+      <title>A postcard from Mars!</title>
+      <meta property="og:title" content="NASA (@nasa) on Threads">
+      <meta property="og:description" content="A postcard from Mars! A rover panorama.">
+    </head><body>
+      <svg><g><title>Home</title><path /></g></svg>
+      <svg><title>Search</title></svg>
+      <math><title>Notifications</title></math>
+      <title>Profile</title>
+    </body></html>`)]),
+    ),
+  );
+  assertEquals(result.fetched_title, "A postcard from Mars!");
+  assertEquals(result.description, "A postcard from Mars! A rover panorama.");
+  assertEquals(result.metadata_state, "ready");
+});
+
+Deno.test("icon-only titles never override descriptions or contaminate headings", async () => {
+  for (
+    const heading of [
+      "",
+      "<h1>A useful heading<svg><title>Share</title></svg></h1>",
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`<html><head>
+        <meta name="description" content="A useful description">
+      </head><body><svg><title>Home</title></svg>${heading}</body></html>`)]),
+      ),
+    );
+    assertEquals(
+      result.fetched_title,
+      heading ? "A useful heading" : "A useful description",
+    );
+    assertEquals(result.metadata_state, "ready");
+  }
+});
+
+Deno.test("only the first document title is used", async () => {
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(
+      new FakeTransport([htmlResponse(
+        '<title>Article title</title><title>Another title</title><meta name="description" content="Article description">',
+      )]),
+    ),
+  );
+  assertEquals(result.fetched_title, "Article title");
+  assertEquals(result.description, "Article description");
+});
+
+Deno.test("generic public HTTP and HTTPS pages prefer OG over Twitter and HTML metadata", async () => {
+  for (
+    const url of [
+      "http://example.com:80/article?ref=shared#section",
+      "https://www.example.com:443/article?ref=shared#section",
+    ]
+  ) {
+    const transport = new FakeTransport([htmlResponse(`<!doctype html>
+      <title>HTML article title</title>
+      <meta name="twitter:title" content="Twitter article title">
+      <meta property="og:title" content="Public research &amp; notes">
+      <meta name="description" content="HTML description">
+      <meta name="twitter:description" content="Twitter description">
+      <meta property="og:description" content="Useful public article description">
+      <article><p>Body text must not be extracted.</p></article>`)]);
+    const dns = new FakeDns();
+    const result = await fetchMetadataWithAdapters(
+      url,
+      fakeAdapters(transport, dns),
+    );
+
+    assertEquals(result.fetched_title, "Public research & notes");
+    assertEquals(result.description, "Useful public article description");
+    assertEquals(result.body_text, null);
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.extraction_meta.final_url, new URL(url).href);
+    assertEquals(dns.calls, [new URL(url).hostname]);
+    assertEquals(transport.calls[0].url.protocol, new URL(url).protocol);
+    assertEquals(transport.calls[0].addresses, [PUBLIC_V4]);
+  }
+});
+
+Deno.test("meaningful Twitter and HTML metadata replace generic higher-priority fields", async () => {
+  const cases = [
+    {
+      html: `<title>HTML fallback title</title>
+        <meta property="og:title" content="Home">
+        <meta name="twitter:title" content="Twitter research title">
+        <meta property="og:description" content="Login">
+        <meta name="twitter:description" content="Twitter research description">`,
+      title: "Twitter research title",
+      description: "Twitter research description",
+    },
+    {
+      html: `<title>HTML research title &amp; notes</title>
+        <meta property="og:site_name" content="Publication">
+        <meta property="og:title" content="Publication">
+        <meta name="description" content="HTML research description">`,
+      title: "HTML research title & notes",
+      description: "HTML research description",
+    },
+  ];
+  for (const testCase of cases) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/research",
+      fakeAdapters(new FakeTransport([htmlResponse(testCase.html)])),
+    );
+    assertEquals(result.fetched_title, testCase.title);
+    assertEquals(result.description, testCase.description);
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.body_text, null);
+  }
+});
+
+Deno.test("Threads generic site and account titles use a bounded meaningful description first line", async () => {
+  const firstLine = "여행😀".repeat(41);
+  for (
+    const title of [
+      "Threads",
+      "Threads • Say more",
+      "Threads.net",
+      "Writer (@writer) on Threads",
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://www.threads.com/@writer/post/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <title>${title}</title>
+        <meta property="og:description" content="${firstLine}&#10;Second line must not enter the display title.">`)]),
+      ),
+    );
+    assertEquals(result.fetched_title, [...firstLine].slice(0, 120).join(""));
+    assertEquals([...result.fetched_title!].length, 120);
+    assertEquals(
+      result.description,
+      `${firstLine} Second line must not enter the display title.`,
+    );
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.extraction_meta.title_truncated, true);
+    assertEquals(result.body_text, null);
+  }
+});
+
+Deno.test("Threads service descriptions and generic first lines do not manufacture titles", async () => {
+  for (
+    const description of [
+      "Join Threads to share ideas and connect with others.",
+      "Say more with Threads — a place to share your thoughts.",
+      "Threads",
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://threads.net/@writer/post/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <title>Threads</title><meta name="description" content="${description}">`)]),
+      ),
+    );
+    assertEquals(result.fetched_title, null);
+    assertEquals(result.description, null);
+    assertEquals(result.metadata_state, "partial");
+    assertEquals(result.extraction_meta.error_code, "INVALID_RESULT");
+  }
+
+  const result = await fetchMetadataWithAdapters(
+    "https://threads.net/@writer/post/123",
+    fakeAdapters(
+      new FakeTransport([htmlResponse(`
+      <title>Threads</title><meta name="description" content="Threads&#10;Actual public information follows.">`)]),
+    ),
+  );
+  assertEquals(result.fetched_title, null);
+  assertEquals(
+    result.description,
+    "Threads Actual public information follows.",
+  );
+  assertEquals(result.metadata_state, "partial");
+});
+
+Deno.test("partial title-only metadata and missing metadata never invent descriptions or body text", async () => {
+  for (
+    const testCase of [
+      {
+        html: "<title>A useful public article</title>",
+        title: "A useful public article",
+      },
+      {
+        html: "<article><p>Visible prose is not metadata.</p></article>",
+        title: null,
+      },
+      {
+        html: '<title>Home</title><meta name="description" content="Home">',
+        title: null,
+      },
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(new FakeTransport([htmlResponse(testCase.html)])),
+    );
+    assertEquals(result.fetched_title, testCase.title);
+    assertEquals(result.description, null);
+    assertEquals(result.body_text, null);
+    assertEquals(result.metadata_state, "partial");
+    assertEquals(result.extraction_meta.error_code, "INVALID_RESULT");
+  }
+});
+
+Deno.test("description-only HTML metadata supplies an untruncated first-line display title", async () => {
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(
+      new FakeTransport([htmlResponse(`
+      <meta name="description" content="  Public &amp; useful first line&#13;&#10;A second line.  ">`)]),
+    ),
+  );
+  assertEquals(result.fetched_title, "Public & useful first line");
+  assertEquals(result.description, "Public & useful first line A second line.");
+  assertEquals(result.extraction_meta.title_truncated, false);
+  assertEquals(result.metadata_state, "ready");
 });
 
 Deno.test("semantic heading fallback handles nested entity text without treating login prose as a wall", async () => {
@@ -279,6 +517,208 @@ Deno.test("missing, generic, login, and doctype challenge pages never become rea
   }
 });
 
+Deno.test("login, challenge, and soft-error documents cannot expose otherwise useful OG metadata", async () => {
+  const usefulMetadata =
+    `<meta property="og:title" content="An attractive public article">
+    <meta property="og:description" content="A useful article description">`;
+  for (
+    const testCase of [
+      {
+        html: "<title>Sign in | Publication</title>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<title>Publication • Log in</title>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<h1>Log in to Threads</h1>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: '<form action="/signin"><input type="password"></form>',
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<title>Just a moment...</title>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: '<form id="challenge-form"></form>',
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: '<div class="cf-chl-widget">Verification required</div>',
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<h1>Verify you are human</h1>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<title>CAPTCHA</title>",
+        code: "ACCESS_DENIED",
+        state: "partial",
+      },
+      {
+        html: "<title>404 Not Found</title>",
+        code: "INVALID_CONTENT",
+        state: "failed",
+      },
+      {
+        html: "<h1>Page not found • Publication</h1>",
+        code: "INVALID_CONTENT",
+        state: "failed",
+      },
+      {
+        html: "<h1>Sorry, this page isn't available.</h1>",
+        code: "INVALID_CONTENT",
+        state: "failed",
+      },
+      {
+        html: "<title>Service unavailable</title>",
+        code: "INVALID_CONTENT",
+        state: "failed",
+      },
+      {
+        html: "<title>Something went wrong</title>",
+        code: "INVALID_CONTENT",
+        state: "failed",
+      },
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`${usefulMetadata}${testCase.html}`)]),
+      ),
+    );
+    assertEquals(result.metadata_state, testCase.state, testCase.html);
+    assertEquals(
+      result.extraction_meta.error_code,
+      testCase.code,
+      testCase.html,
+    );
+    assertEquals(result.fetched_title, null, testCase.html);
+    assertEquals(result.description, null, testCase.html);
+    assertEquals(result.body_text, null, testCase.html);
+  }
+});
+
+Deno.test("login-related article titles, prose, and ordinary captcha widgets are not access walls", async () => {
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(
+      new FakeTransport([htmlResponse(`
+      <title>Login API implementation guide</title>
+      <meta name="description" content="How to implement sign in and handle errors safely.">
+      <h2>Login API example</h2>
+      <div class="g-recaptcha"></div>
+      <script>challenge-form access-denied</script>`)]),
+    ),
+  );
+  assertEquals(result.fetched_title, "Login API implementation guide");
+  assertEquals(result.metadata_state, "ready");
+});
+
+Deno.test("article error, login, and challenge subsections do not override document metadata", async () => {
+  for (const primaryHeading of ["", "<h1>HTTP authentication reference</h1>"]) {
+    for (
+      const heading of [
+        "404",
+        "Error",
+        "오류",
+        "Page not found",
+        "Login",
+        "로그인",
+        "Sign in",
+        "Access denied",
+        "Verify you are human",
+      ]
+    ) {
+      const result = await fetchMetadataWithAdapters(
+        "https://example.com/article",
+        fakeAdapters(
+          new FakeTransport([htmlResponse(`
+          <title>HTTP authentication reference</title>
+          <meta property="og:title" content="Public authentication guide">
+          <meta property="og:description" content="A public guide to authentication and HTTP failures.">
+          <article>${primaryHeading}<h2>${heading}</h2><p>An ordinary article subsection.</p></article>`)]),
+        ),
+      );
+      assertEquals(
+        result.fetched_title,
+        "Public authentication guide",
+        heading,
+      );
+      assertEquals(
+        result.description,
+        "A public guide to authentication and HTTP failures.",
+        heading,
+      );
+      assertEquals(result.metadata_state, "ready", heading);
+      assertEquals(result.extraction_meta.error_code, null, heading);
+    }
+  }
+});
+
+Deno.test("title-less error and access documents still recognize their primary heading", async () => {
+  for (const tag of ["h1", "h2"]) {
+    for (
+      const testCase of [
+        { heading: "404", code: "INVALID_CONTENT" },
+        { heading: "Error", code: "INVALID_CONTENT" },
+        { heading: "오류", code: "INVALID_CONTENT" },
+        { heading: "Login", code: "ACCESS_DENIED" },
+        { heading: "Verify you are human", code: "ACCESS_DENIED" },
+      ]
+    ) {
+      const result = await fetchMetadataWithAdapters(
+        "https://example.com/article",
+        fakeAdapters(
+          new FakeTransport([
+            htmlResponse(`<${tag}>${testCase.heading}</${tag}>`),
+          ]),
+        ),
+      );
+      assertEquals(result.extraction_meta.error_code, testCase.code);
+      assertEquals(result.fetched_title, null);
+      assertEquals(result.description, null);
+    }
+  }
+});
+
+Deno.test("login and JavaScript challenge description prompts are not public article metadata", async () => {
+  for (
+    const description of [
+      "Log in to view this post.",
+      "Please sign in to continue.",
+      "You must log in to see the content.",
+      "Enable JavaScript and cookies to continue.",
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <meta property="og:title" content="An attractive article title">
+        <meta property="og:description" content="${description}">`)]),
+      ),
+    );
+    assertEquals(result.fetched_title, null);
+    assertEquals(result.description, null);
+    assertEquals(result.extraction_meta.error_code, "ACCESS_DENIED");
+  }
+});
+
 Deno.test("access denial and non-HTML responses use fixed permanent result codes", async () => {
   const denied = await fetchMetadataWithAdapters(
     "https://blog.naver.com/private",
@@ -299,6 +739,62 @@ Deno.test("access denial and non-HTML responses use fixed permanent result codes
   );
   assertEquals(invalid.metadata_state, "failed");
   assertEquals(invalid.extraction_meta.error_code, "INVALID_CONTENT");
+});
+
+Deno.test("encoded bodies, unknown charsets, malformed lengths, and empty bodies do not manufacture metadata", async () => {
+  const invalidHeaders: Array<Record<string, string>> = [
+    { "content-type": "text/html", "content-encoding": "gzip" },
+    { "content-type": "text/html; charset=not-a-charset" },
+    { "content-type": "text/html", "content-length": "1.5" },
+    { "content-type": "text/html", "content-length": "-1" },
+    { "content-type": "text/html", "content-length": "99999999999999999999" },
+  ];
+  for (const headers of invalidHeaders) {
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(
+        new FakeTransport([
+          htmlResponse("<title>Useful title</title>", headers),
+        ]),
+      ),
+    );
+    assertEquals(result.metadata_state, "failed");
+    assertEquals(result.extraction_meta.error_code, "INVALID_CONTENT");
+    assertEquals(result.fetched_title, null);
+    assertEquals(result.description, null);
+  }
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(
+      new FakeTransport([{
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: null,
+      }]),
+    ),
+  );
+  assertEquals(result.fetched_title, null);
+  assertEquals(result.description, null);
+  assertEquals(result.metadata_state, "partial");
+});
+
+Deno.test("general HTML encodings can supply metadata within the same resource limits", async () => {
+  const prefix = encoder.encode("<title>Caf");
+  const suffix = encoder.encode(
+    ' guide</title><meta name="description" content="Public coffee guide">',
+  );
+  const bytes = new Uint8Array([...prefix, 0xe9, ...suffix]);
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(
+      new FakeTransport([response(200, [bytes], {
+        "content-type": "text/html; charset=windows-1252",
+      })]),
+    ),
+  );
+  assertEquals(result.fetched_title, "Café guide");
+  assertEquals(result.description, "Public coffee guide");
+  assertEquals(result.metadata_state, "ready");
 });
 
 Deno.test("content-length and streamed body enforce the decimal two MB boundary", async () => {
@@ -341,7 +837,7 @@ Deno.test("content-length and streamed body enforce the decimal two MB boundary"
 });
 
 Deno.test("UTF-8 chunk boundaries decode correctly and output cuts keep Unicode scalar values", async () => {
-  const longTitle = "😀".repeat(301);
+  const longTitle = "봄" + "😀".repeat(300);
   const longDescription = "가".repeat(4001);
   const html =
     `<meta property="og:title" content="${longTitle}"><meta property="og:description" content="${longDescription}">`;
@@ -367,15 +863,118 @@ Deno.test("UTF-8 chunk boundaries decode correctly and output cuts keep Unicode 
   assertEquals(result.extraction_meta.body_truncated, false);
 });
 
-Deno.test("unsupported schemes, ports, userinfo, hosts, and literal IPs never reach DNS", async () => {
+Deno.test("public URL eligibility accepts only matching lexical standard ports and DNS authorities", () => {
+  for (
+    const url of [
+      "http://example.com/article",
+      "http://example.com:80/article",
+      "HTTPS://EXAMPLE.COM:443/article",
+      "https://blog.naver.com/owner/post",
+      "https://www.threads.com/@writer/post/123",
+      "https://xn--9n2bp8q.com/article",
+      "https://public.local.example.com/article",
+      "https://example.com/article?next=http%3A%2F%2F127.0.0.1#section",
+      `https://example.com/${"a".repeat(4096 - "https://example.com/".length)}`,
+    ]
+  ) {
+    assertEquals(isMetadataUrlEligible(url), true, url);
+  }
+});
+
+Deno.test("Unicode URL scalar limits do not become encoded transport or provenance limits", async () => {
+  const prefix = "https://example.com/";
+  for (const character of ["가", "😀"]) {
+    const rawUrl = prefix + character.repeat(4096 - prefix.length);
+    assertEquals([...rawUrl].length, 4096);
+    assertEquals(isMetadataUrlEligible(rawUrl), true);
+    assertEquals(isMetadataUrlEligible(rawUrl + character), false);
+    const parsed = new URL(rawUrl);
+    assert(parsed.href.length > 4096);
+
+    let transportFailure: unknown;
+    try {
+      await productionMetadataTransport.request({
+        url: parsed,
+        addresses: [],
+        signal: new AbortController().signal,
+      });
+    } catch (error) {
+      transportFailure = error;
+    }
+    assert(transportFailure instanceof TypeError);
+    assertEquals(
+      transportFailure.message,
+      "Metadata transport requires validated addresses.",
+    );
+
+    const transport = new FakeTransport([htmlResponse(
+      '<title>A Unicode URL article</title><meta name="description" content="Public Unicode article description">',
+    )]);
+    const result = await fetchMetadataWithAdapters(
+      rawUrl,
+      fakeAdapters(transport),
+    );
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.fetched_title, "A Unicode URL article");
+    assertEquals(result.extraction_meta.final_url, null);
+    assertEquals(transport.calls[0].url.href, parsed.href);
+
+    const denied = await fetchMetadataWithAdapters(
+      rawUrl,
+      fakeAdapters(new FakeTransport([response(403)])),
+    );
+    assertEquals(denied.extraction_meta.error_code, "ACCESS_DENIED");
+    assertEquals(denied.extraction_meta.final_url, null);
+  }
+});
+
+Deno.test("unsupported schemes, ports, userinfo, local hosts, and literal IPs never reach DNS", async () => {
   const urls = [
-    "http://blog.naver.com/post",
+    "ftp://blog.naver.com/post",
     "https://blog.naver.com:444/post",
     "https://user:secret@blog.naver.com/post",
-    "https://example.com/post",
+    "https://@example.com/post",
+    "http://example.com:443/post",
+    "https://example.com:80/post",
+    "https://example.com:0443/post",
+    "http://example.com:080/post",
+    "https://example.com:/post",
+    "https://example.com./post",
+    "https://localhost/post",
+    "https://metadata.internal/post",
+    "https://metadata.local/post",
+    "https://metadata.localdomain/post",
+    "https://metadata.localhost/post",
+    "https://metadata.home/post",
+    "https://home.arpa/post",
+    "https://metadata.home.arpa/post",
+    "https://metadata.lan/post",
+    "https://metadata.test/post",
+    "https://metadata.invalid/post",
+    "https://metadata.example/post",
+    "https://metadata.onion/post",
+    "https://single-label/post",
+    "https://-invalid.example.com/post",
+    "https://example..com/post",
+    "https://example.0x/post",
+    "https://example.123/post",
+    "https://%65xample.com/post",
+    "https://예시.com/post",
+    "https://K.example.com/post",
     "https://127.0.0.1/post",
+    "https://8.8.8.8/post",
+    "https://2130706433/post",
+    "https://0x7f000001/post",
+    "https://127.1/post",
     "https://[::1]/post",
+    "https://[2606:4700:4700::1111]/post",
     " https://blog.naver.com/post",
+    "https://example.com/a b",
+    "https://example.com/\u0000",
+    "https://example.com/\u007f",
+    "https://example.com/\\private",
+    "https:example.com/post",
+    `https://example.com/${"a".repeat(4096)}`,
   ];
 
   for (const url of urls) {
@@ -389,16 +988,37 @@ Deno.test("unsupported schemes, ports, userinfo, hosts, and literal IPs never re
     assertEquals(result.extraction_meta.error_code, "INVALID_CONTENT", url);
     assertEquals(dns.calls, [], url);
     assertEquals(transport.calls, [], url);
+    assertEquals(isMetadataUrlEligible(url), false, url);
   }
 });
 
 Deno.test("private DNS answers are rejected before the pinned transport", async () => {
   for (
     const privateAddress of [
+      { address: "0.0.0.0", family: 4 as const },
       { address: "10.0.0.7", family: 4 as const },
+      { address: "100.64.0.1", family: 4 as const },
+      { address: "127.0.0.1", family: 4 as const },
       { address: "169.254.169.254", family: 4 as const },
+      { address: "172.16.0.1", family: 4 as const },
+      { address: "192.168.0.1", family: 4 as const },
+      { address: "192.0.0.1", family: 4 as const },
+      { address: "192.0.2.1", family: 4 as const },
+      { address: "198.18.0.1", family: 4 as const },
+      { address: "198.51.100.1", family: 4 as const },
+      { address: "203.0.113.1", family: 4 as const },
+      { address: "224.0.0.1", family: 4 as const },
+      { address: "255.255.255.255", family: 4 as const },
+      { address: "::1", family: 6 as const },
+      { address: "::ffff:127.0.0.1", family: 6 as const },
+      { address: "fe80::1", family: 6 as const },
       { address: "fc00::1", family: 6 as const },
+      { address: "2001::1", family: 6 as const },
+      { address: "2001:20::1", family: 6 as const },
       { address: "2001:db8::1", family: 6 as const },
+      { address: "2002:7f00:1::1", family: 6 as const },
+      { address: "3fff::1", family: 6 as const },
+      { address: "ff02::1", family: 6 as const },
     ]
   ) {
     const dns = new FakeDns({ "blog.naver.com": [privateAddress] });
@@ -410,6 +1030,43 @@ Deno.test("private DNS answers are rejected before the pinned transport", async 
     assertEquals(result.metadata_state, "unsupported", privateAddress.address);
     assertEquals(transport.calls, [], privateAddress.address);
   }
+});
+
+Deno.test("mixed public/private and malformed DNS answers fail closed for generic hosts", async () => {
+  for (
+    const answers of [
+      [PUBLIC_V4, { address: "10.0.0.1", family: 4 as const }],
+      [PUBLIC_V4, { address: "::1", family: 6 as const }],
+      [{ address: "223.130.200.104", family: 6 as const }],
+      [{ address: "not-an-address", family: 4 as const }],
+    ]
+  ) {
+    const transport = new FakeTransport([]);
+    const result = await fetchMetadataWithAdapters(
+      "http://example.com/article",
+      fakeAdapters(transport, new FakeDns({ "example.com": answers })),
+    );
+    assertEquals(result.metadata_state, "unsupported");
+    assertEquals(result.fetched_title, null);
+    assertEquals(result.description, null);
+    assertEquals(transport.calls, []);
+  }
+});
+
+Deno.test("public IPv6 DNS answers are handed to the pinned transport unchanged", async () => {
+  const address: ResolvedAddress = {
+    address: "2606:4700:4700::1111",
+    family: 6,
+  };
+  const transport = new FakeTransport([htmlResponse(
+    '<title>Public IPv6 article</title><meta name="description" content="A useful IPv6 article description">',
+  )]);
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(transport, new FakeDns({ "example.com": [address] })),
+  );
+  assertEquals(result.metadata_state, "ready");
+  assertEquals(transport.calls[0].addresses, [address]);
 });
 
 Deno.test("every redirect hop is revalidated against DNS before transport", async () => {
@@ -428,6 +1085,183 @@ Deno.test("every redirect hop is revalidated against DNS before transport", asyn
 
   assertEquals(result.metadata_state, "unsupported");
   assertEquals(dns.calls, ["blog.naver.com", "m.blog.naver.com"]);
+  assertEquals(transport.calls.length, 1);
+});
+
+Deno.test("raw URLs and redirects reject every C0 control, DEL, whitespace and backslash", async () => {
+  const forbidden = [
+    ...Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)),
+    String.fromCharCode(127),
+    " ",
+    "\u00a0",
+    "\u2028",
+    "\ufeff",
+    "\\",
+  ];
+  for (const character of forbidden) {
+    const label = `codepoint ${character.codePointAt(0)}`;
+    const path = `/before${character}after`;
+    const dns = new FakeDns();
+    const initialTransport = new FakeTransport([]);
+    const initial = await fetchMetadataWithAdapters(
+      `https://example.com${path}`,
+      fakeAdapters(initialTransport, dns),
+    );
+    assertEquals(initial.metadata_state, "unsupported", label);
+    assertEquals(dns.calls, [], label);
+    assertEquals(initialTransport.calls.length, 0, label);
+
+    const redirectTransport = new FakeTransport([
+      response(302, [], { location: path }),
+    ]);
+    const redirected = await fetchMetadataWithAdapters(
+      "https://example.com/start",
+      fakeAdapters(redirectTransport),
+    );
+    assertEquals(redirected.metadata_state, "unsupported", label);
+    assertEquals(redirectTransport.calls.length, 1, label);
+  }
+  assertEquals(isMetadataUrlEligible("https://example.com/한글😀?q=%20"), true);
+});
+
+Deno.test("three validated redirects may cross public hosts and HTTP/HTTPS boundaries", async () => {
+  const transport = new FakeTransport([
+    response(301, [], { location: "https://www.example.com:443/one" }),
+    response(302, [], { location: "//example.com/two" }),
+    response(307, [], { location: "http://example.com:80/article" }),
+    htmlResponse(
+      '<title>Redirected public article</title><meta name="description" content="A useful public description">',
+    ),
+  ]);
+  const dns = new FakeDns();
+  const result = await fetchMetadataWithAdapters(
+    "http://example.com/start",
+    fakeAdapters(transport, dns),
+  );
+  assertEquals(result.metadata_state, "ready");
+  assertEquals(result.extraction_meta.final_url, "http://example.com/article");
+  assertEquals(dns.calls, [
+    "example.com",
+    "www.example.com",
+    "example.com",
+    "example.com",
+  ]);
+  assertEquals(transport.calls.map((call) => call.url.protocol), [
+    "http:",
+    "https:",
+    "https:",
+    "http:",
+  ]);
+  assertEquals(transport.calls.length, 4);
+});
+
+Deno.test("redirect length budgets use raw Location scalars rather than expanded or prefixed URLs", async () => {
+  for (const prefix of ["https://example.com/", "//example.com/", "/"]) {
+    const location = prefix + "😀".repeat(4096 - prefix.length);
+    const transport = new FakeTransport([
+      response(302, [], { location }),
+      htmlResponse(
+        '<title>A redirected Unicode article</title><meta name="description" content="Public article description">',
+      ),
+    ]);
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/start",
+      fakeAdapters(transport),
+    );
+    assertEquals(result.metadata_state, "ready", prefix);
+    assertEquals(result.extraction_meta.final_url, null, prefix);
+    assertEquals(transport.calls.length, 2, prefix);
+    assert(transport.calls[1].url.href.length > 4096);
+
+    const tooLongTransport = new FakeTransport([
+      response(302, [], { location: location + "😀" }),
+    ]);
+    const rejected = await fetchMetadataWithAdapters(
+      "https://example.com/start",
+      fakeAdapters(tooLongTransport),
+    );
+    assertEquals(rejected.metadata_state, "unsupported", prefix);
+    assertEquals(tooLongTransport.calls.length, 1, prefix);
+  }
+});
+
+Deno.test("redirects cannot normalize unsafe authorities or leave the public URL policy", async () => {
+  for (
+    const location of [
+      "http://127.0.0.1/private",
+      "https://8.8.8.8/private",
+      "http://metadata.home.arpa/private",
+      "https://metadata.internal/private",
+      "http://example.com:443/private",
+      "https://example.com:0443/private",
+      "https://example.com:/private",
+      "https://example.com./private",
+      "https://user:secret@example.com/private",
+      "https://@example.com/private",
+      "https://%65xample.com/private",
+      "//example.com:0443/private",
+      "//metadata.local/private",
+      "https:example.com/private",
+      "ftp://example.com/private",
+      " https://example.com/private",
+      "https://example.com/\\private",
+    ]
+  ) {
+    let cancellations = 0;
+    const redirect = response(302, [], { location });
+    redirect.cancel = () => cancellations++;
+    const transport = new FakeTransport([redirect]);
+    const dns = new FakeDns();
+    const result = await fetchMetadataWithAdapters(
+      "https://example.com/start",
+      fakeAdapters(transport, dns),
+    );
+    assertEquals(result.metadata_state, "unsupported", location);
+    assertEquals(
+      result.extraction_meta.error_code,
+      "INVALID_CONTENT",
+      location,
+    );
+    assertEquals(result.fetched_title, null, location);
+    assertEquals(result.description, null, location);
+    assertEquals(dns.calls, ["example.com"], location);
+    assertEquals(transport.calls.length, 1, location);
+    assertEquals(cancellations, 1, location);
+  }
+});
+
+Deno.test("same-host redirects repeat DNS validation instead of reusing the first public answer", async () => {
+  const calls: string[] = [];
+  const dns: MetadataDnsResolver = {
+    resolve(hostname) {
+      calls.push(hostname);
+      return Promise.resolve(
+        calls.length === 1
+          ? [PUBLIC_V4]
+          : [{ address: "169.254.169.254", family: 4 }],
+      );
+    },
+  };
+  const transport = new FakeTransport([
+    response(302, [], { location: "/private" }),
+  ]);
+  const result = await fetchMetadataWithAdapters(
+    "http://example.com/start",
+    fakeAdapters(transport, dns),
+  );
+  assertEquals(result.metadata_state, "unsupported");
+  assertEquals(calls, ["example.com", "example.com"]);
+  assertEquals(transport.calls.length, 1);
+});
+
+Deno.test("redirect responses without a location fail without fetching another document", async () => {
+  const transport = new FakeTransport([response(302)]);
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/start",
+    fakeAdapters(transport),
+  );
+  assertEquals(result.metadata_state, "failed");
+  assertEquals(result.extraction_meta.error_code, "INVALID_CONTENT");
   assertEquals(transport.calls.length, 1);
 });
 
@@ -486,6 +1320,35 @@ Deno.test("DNS and upstream failures use the typed retryable network code", asyn
   assertEquals(transport.calls.length, 1);
 });
 
+Deno.test("generic transport and interrupted-body failures do not return partial unverified metadata", async () => {
+  let cancellations = 0;
+  async function* failingBody(): AsyncIterable<Uint8Array> {
+    yield encoder.encode(
+      '<title>Incomplete article</title><meta name="description" content="Unverified description">',
+    );
+    throw new Error("Interrupted response.");
+  }
+  const transports = [
+    new FakeTransport([() => Promise.reject(new Error("Connection reset."))]),
+    new FakeTransport([{
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: failingBody(),
+      cancel: () => cancellations++,
+    }]),
+  ];
+  for (const transport of transports) {
+    const error = await metadataFailure(fetchMetadataWithAdapters(
+      "http://example.com/article",
+      fakeAdapters(transport),
+    ));
+    assertEquals(error.code, "NETWORK_ERROR");
+    assertEquals(error.retryable, true);
+    assertEquals(transport.calls.length, 1);
+  }
+  assertEquals(cancellations, 1);
+});
+
 Deno.test("429 excessive Retry-After stops rather than retrying earlier than requested", async () => {
   const transport = new FakeTransport([
     response(429, [], { "retry-after": "9999999999" }),
@@ -530,7 +1393,7 @@ Deno.test("enriched preparation preserves user fields, active OCR, and owner cat
     body_text: null,
     metadata_state: "ready",
     extraction_meta: {
-      adapter_version: "naver-metadata-v1",
+      adapter_version: "public-page-metadata-v1",
       final_url: "https://m.blog.naver.com/owner/post",
       title_truncated: false,
       description_truncated: false,
@@ -578,18 +1441,24 @@ Deno.test("enriched preparation truncates only raw metadata and OCR patch fields
   assertEquals([...prepared.normalized_fields.fetched_title].length, 900);
 });
 
-Deno.test("automatic metadata eligibility is Naver-only without restricting ordinary URL saves", async () => {
+Deno.test("automatic metadata eligibility supports public HTTP/HTTPS without restricting ordinary URL saves", async () => {
   const naver = await prepareItem({ url: "https://blog.naver.com/owner/post" });
   const mobile = await prepareItem({
     url: "https://m.blog.naver.com/owner/post",
   });
   const instagram = await prepareItem({ url: "https://www.instagram.com/p/1" });
   const ordinary = await prepareItem({ url: "http://example.com/article" });
+  const privateUrl = await prepareItem({ url: "http://127.0.0.1/article" });
+  const nonstandardPort = await prepareItem({
+    url: "https://example.com:8443/article",
+  });
 
   assertEquals(naver.metadata_allowed, true);
   assertEquals(mobile.metadata_allowed, true);
-  assertEquals(instagram.metadata_allowed, false);
-  assertEquals(ordinary.metadata_allowed, false);
+  assertEquals(instagram.metadata_allowed, true);
+  assertEquals(ordinary.metadata_allowed, true);
+  assertEquals(privateUrl.metadata_allowed, false);
+  assertEquals(nonstandardPort.metadata_allowed, false);
   assertEquals(instagram.source, "instagram");
   assertEquals(ordinary.source, "other");
 });

@@ -38,9 +38,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.linkvault.app.R
 import com.linkvault.app.storage.OutboxRepository
 
 @Composable
@@ -48,6 +52,7 @@ fun AccountScreen(
     client: AccountClient,
     outbox: OutboxRepository,
     onBack: () -> Unit,
+    onOpenPrivacy: () -> Unit,
 ) {
     val factory = remember(client, outbox) { AccountViewModel.factory(client, outbox) }
     val accountViewModel: AccountViewModel = viewModel(factory = factory)
@@ -95,6 +100,7 @@ fun AccountScreen(
                 }
                 Text(
                     text = "계정",
+                    modifier = Modifier.semantics { heading() },
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                 )
@@ -118,6 +124,17 @@ fun AccountScreen(
             }
         }
         HorizontalDivider()
+
+        TextButton(
+            onClick = onOpenPrivacy,
+            shape = EditorialShape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .testTag("account-privacy"),
+        ) {
+            Text(stringResource(R.string.privacy_title))
+        }
 
         when (val currentState = state) {
             is AccountUiState.Loading -> LoadingContent(
@@ -284,7 +301,6 @@ private fun LoginContent(
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
         )
-        Text("서비스를 이용하려면 Google 로그인이 필요해요.")
         message?.let {
             Text(
                 text = it,
@@ -376,11 +392,6 @@ private fun ActiveContent(
             text = "로그인했어요",
             style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            text = "Google 계정으로 보관함을 사용하고 있어요.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
     SettingsGroup(title = "사용량") {
@@ -475,7 +486,6 @@ private fun UnconfiguredContent(message: String) {
             fontWeight = FontWeight.SemiBold,
         )
         Text(message, color = MaterialTheme.colorScheme.error)
-        Text("앱 빌드에 Supabase와 Google OAuth 설정을 추가해야 로그인할 수 있어요.")
     }
 }
 
@@ -566,7 +576,7 @@ private fun ConfirmAccountDeletionContent(
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         Text(
-            "로그아웃과 달리 계정 삭제를 접수하면 서버의 보관 항목, 첨부, 계정은 복구할 수 없어요.",
+            "계정 삭제를 접수하면 LinkFileBox 계정·보관 항목·첨부는 복구할 수 없어요. Google 계정은 삭제되지 않아요.",
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         Text(
@@ -574,11 +584,11 @@ private fun ConfirmAccountDeletionContent(
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         Text(
-            "운영 자료 정리는 72시간 이내를 목표로 하지만 완료 시간을 보장하지 않아요.",
+            stringResource(R.string.privacy_retention_targets),
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         Text(
-            "운영 백업은 최대 30일 순환을 목표로 하며, 복원 시 삭제 요청을 다시 적용해요.",
+            "새 검증 복구본이 없거나 별도 복사된 백업은 더 오래 보관될 수 있어요. 복원 시 삭제 요청을 다시 적용해요.",
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         state.message?.let { message ->
@@ -686,7 +696,7 @@ private fun DeletionAcceptedContent(
 private fun AccountDeletionGroup(onDeleteAccount: () -> Unit) {
     DangerSettingsGroup(title = "계정 삭제") {
         Text(
-            "계정과 서버에 보관된 모든 자료를 되돌릴 수 없게 삭제해요.",
+            "계정과 서버 보관 자료의 삭제를 요청해요. 접수 후에는 되돌릴 수 없어요.",
             color = MaterialTheme.colorScheme.onErrorContainer,
         )
         TextButton(

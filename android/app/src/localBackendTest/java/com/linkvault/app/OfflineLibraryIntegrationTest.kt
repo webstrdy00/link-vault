@@ -111,6 +111,7 @@ class OfflineLibraryIntegrationTest {
                     .performTextReplacement(argument("fixtureUrl"))
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
                 awaitOfflineSaveForm()
+                compose.onNodeWithTag("capture-optional-details").performScrollTo().performClick()
                 compose.onNodeWithText("메모 (선택 사항)").performScrollTo()
                     .performTextReplacement("오프라인 재시작 보관 검증")
                 compose.onNodeWithText("저장").performScrollTo().assertIsEnabled().performClick()

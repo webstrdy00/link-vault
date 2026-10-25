@@ -317,7 +317,8 @@ def mandatory_backup(stack):
             fail("MANDATORY_BACKUP_UNAVAILABLE")
     except OSError:
         fail("MANDATORY_BACKUP_UNAVAILABLE")
-    run_command([str(BACKUP)], stack, 900, "MANDATORY_BACKUP_FAILED")
+    # Two bounded 64-GiB integrity reads surround the independent capture budget.
+    run_command([str(BACKUP)], stack, 3600, "MANDATORY_BACKUP_FAILED")
 
 
 def postgres_command(application_name, seconds):

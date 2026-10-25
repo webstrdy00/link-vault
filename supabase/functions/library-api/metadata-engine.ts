@@ -2,15 +2,20 @@ import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { Parser } from "htmlparser2";
 import { genericTitle, norm } from "./item-preparation.ts";
+import {
+  hasInvalidMetadataUrlCharacters,
+  isMetadataParsedUrlEligible,
+  isMetadataUrlEligible,
+  parseMetadataUrl,
+} from "./metadata-url.ts";
 
-const ALLOWED_HOSTS = new Set(["blog.naver.com", "m.blog.naver.com"]);
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 3;
 const MAX_BODY_BYTES = 2_000_000;
 const REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_RETRY_AFTER_SECONDS = 60;
 const MAX_RETRY_AFTER_SECONDS = 86_400;
-const ADAPTER_VERSION = "naver-metadata-v1";
+const ADAPTER_VERSION = "public-page-metadata-v1";
 
 export type MetadataState = "ready" | "partial" | "unsupported" | "failed";
 
@@ -110,12 +115,10 @@ export const productionMetadataTransport: MetadataTransport = {
   async request(
     input: MetadataTransportRequest,
   ): Promise<MetadataTransportResponse> {
-    let validatedUrl: URL;
-    try {
-      validatedUrl = validateFetchUrl(input.url.href);
-    } catch {
+    if (!isMetadataParsedUrlEligible(input.url)) {
       throw new TypeError("Metadata transport requires an allowed URL.");
     }
+    const validatedUrl = input.url;
     const selected = input.addresses.find((entry) => entry.family === 4) ??
       input.addresses[0];
     if (
@@ -130,7 +133,7 @@ export const productionMetadataTransport: MetadataTransport = {
 
     // Ordinary API requests must not initialize the metadata-only HTTP client.
     const { buildConnector, Client } = await import("undici");
-    const tlsConnector = buildConnector({
+    const connector = buildConnector({
       rejectUnauthorized: true,
       timeout: REQUEST_TIMEOUT_MS,
       maxCachedSessions: 0,
@@ -139,12 +142,15 @@ export const productionMetadataTransport: MetadataTransport = {
       `${validatedUrl.protocol}//${validatedUrl.host}`,
       {
         connect(options, callback) {
-          return tlsConnector({
+          return connector({
             ...options,
             hostname: selected.address,
             host: selected.address,
-            port: "443",
-            servername: validatedUrl.hostname,
+            protocol: validatedUrl.protocol,
+            port: validatedUrl.protocol === "https:" ? "443" : "80",
+            servername: validatedUrl.protocol === "https:"
+              ? validatedUrl.hostname
+              : undefined,
           }, callback);
         },
         pipelining: 0,
@@ -236,7 +242,21 @@ export async function fetchMetadataWithAdapters(
         }
         let next: URL;
         try {
-          next = validateFetchUrl(new URL(location, current).href);
+          if (
+            [...location].length > 4096 ||
+            hasInvalidMetadataUrlCharacters(location)
+          ) {
+            throw new Error("Unsupported metadata redirect.");
+          }
+          const parsed = /^[a-z][a-z0-9+.-]*:/iu.test(location)
+            ? parseMetadataUrl(location)
+            : location.startsWith("//")
+            ? parseMetadataUrl(`${current.protocol}${location}`)
+            : new URL(location, current);
+          if (parsed === null || !isMetadataParsedUrlEligible(parsed)) {
+            throw new Error("Unsupported metadata redirect.");
+          }
+          next = parsed;
         } catch {
           return emptyResult(
             "unsupported",
@@ -355,7 +375,7 @@ export async function fetchMetadataWithAdapters(
           now(),
         );
       }
-      const result = extractNaverMetadata(html, current.href, now());
+      const result = extractPageMetadata(html, current.href, now());
       if (performance.now() > deadline) {
         throw timeoutFailure;
       }
@@ -397,30 +417,10 @@ export function parseRetryAfter(
 }
 
 function validateFetchUrl(rawUrl: string): URL {
-  if (
-    rawUrl !== rawUrl.trim() || rawUrl.length === 0 || /\s/u.test(rawUrl) ||
-    rawUrl.includes("\\")
-  ) {
+  if (!isMetadataUrlEligible(rawUrl)) {
     throw new Error("Unsupported metadata URL.");
   }
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    throw new Error("Unsupported metadata URL.");
-  }
-  const literalHostname = parsed.hostname.startsWith("[") &&
-      parsed.hostname.endsWith("]")
-    ? parsed.hostname.slice(1, -1)
-    : parsed.hostname;
-  if (
-    parsed.protocol !== "https:" || parsed.port !== "" ||
-    parsed.username !== "" || parsed.password !== "" ||
-    isIP(literalHostname) !== 0 || !ALLOWED_HOSTS.has(parsed.hostname)
-  ) {
-    throw new Error("Unsupported metadata URL.");
-  }
-  return parsed;
+  return new URL(rawUrl);
 }
 
 async function resolvePublicAddresses(
@@ -469,12 +469,12 @@ async function requestOnce(
     if (error instanceof MetadataFetchFailure) {
       throw error;
     }
-    reportNetworkFailure("HTTPS", error);
+    reportNetworkFailure("HTTP", error);
     throw new MetadataFetchFailure("NETWORK_ERROR", null, error);
   }
 }
 
-function reportNetworkFailure(phase: "DNS" | "HTTPS", error: unknown): void {
+function reportNetworkFailure(phase: "DNS" | "HTTP", error: unknown): void {
   const message = error instanceof Error ? error.message : "";
   const code = typeof error === "object" && error !== null && "code" in error
     ? error.code
@@ -490,9 +490,20 @@ function reportNetworkFailure(phase: "DNS" | "HTTPS", error: unknown): void {
     "ERR_NOT_IMPLEMENTED",
     "CERT_HAS_EXPIRED",
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "ERR_TLS_HANDSHAKE_TIMEOUT",
+    "ERR_STREAM_PREMATURE_CLOSE",
+    "ERR_HTTP2_ERROR",
+    "EPROTO",
   ]);
   const reason = typeof code === "string" && knownCodes.has(code)
     ? code
+    : /module|package|specifier|resolve.*import/i.test(message)
+    ? "MODULE_RESOLUTION"
     : /not implemented|not supported|unsupported/i.test(message)
     ? "UNSUPPORTED_RUNTIME"
     : /permission/i.test(message)
@@ -574,44 +585,56 @@ function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-function extractNaverMetadata(
+function extractPageMetadata(
   html: string,
   finalUrl: string,
   checkedAt: Date,
 ): MetadataResult {
   const parsed = parseMetadataHtml(html);
-  const rawTitle = firstPresent(
-    parsed.meta.get("og:title"),
-    parsed.title,
-    parsed.headings[0],
-  );
-  const rawDescription = firstPresent(
+  if (isAccessDeniedDocument(parsed)) {
+    return emptyResult("partial", "ACCESS_DENIED", finalUrl, checkedAt);
+  }
+  if (isErrorDocument(parsed)) {
+    return emptyResult("failed", "INVALID_CONTENT", finalUrl, checkedAt);
+  }
+  const rawDescription = [
     parsed.meta.get("og:description"),
+    parsed.meta.get("twitter:description"),
     parsed.meta.get("description"),
-  );
-  const title = truncateMetadataField(rawTitle, 300);
-  const description = truncateMetadataField(rawDescription, 4000);
-  const accessDenied = isAccessDeniedDocument(parsed, title.value);
-  const meaningfulTitle = isMeaningfulTitle(title.value);
-  const meaningfulDescription = isMeaningfulDescription(description.value);
-  const metadataState: MetadataState = accessDenied ||
-      !meaningfulTitle || !meaningfulDescription
+  ].find(isMeaningfulDescription) ?? null;
+  const rawTitle = [
+    parsed.meta.get("og:title"),
+    parsed.meta.get("twitter:title"),
+    parsed.title,
+    ...parsed.headings,
+  ].find((value) =>
+    isMeaningfulTitle(value) &&
+    norm(value) !== norm(parsed.meta.get("og:site_name"))
+  ) ?? null;
+  const descriptionTitle = rawDescription?.split("\n")[0];
+  const title = rawTitle !== null
+    ? truncateMetadataField(cleanText(rawTitle), 300)
+    : truncateMetadataField(
+      isMeaningfulTitle(descriptionTitle) ? cleanText(descriptionTitle) : null,
+      120,
+    );
+  const description = truncateMetadataField(cleanText(rawDescription), 4000);
+  const metadataState: MetadataState = title.value === null ||
+      description.value === null
     ? "partial"
     : "ready";
   const errorCode: MetadataErrorCode | null = metadataState === "ready"
     ? null
-    : accessDenied
-    ? "ACCESS_DENIED"
     : "INVALID_RESULT";
 
   return {
-    fetched_title: accessDenied ? null : title.value,
-    description: accessDenied ? null : description.value,
+    fetched_title: title.value,
+    description: description.value,
     body_text: null,
     metadata_state: metadataState,
     extraction_meta: {
       adapter_version: ADAPTER_VERSION,
-      final_url: finalUrl,
+      final_url: boundedFinalUrl(finalUrl),
       title_truncated: title.truncated,
       description_truncated: description.truncated,
       body_truncated: false,
@@ -625,6 +648,7 @@ interface ParsedMetadataHtml {
   meta: Map<string, string>;
   title: string | null;
   headings: string[];
+  primaryHeading: string | null;
   hasPasswordInput: boolean;
   hasLoginForm: boolean;
   hasChallengeMarker: boolean;
@@ -634,14 +658,24 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
   const meta = new Map<string, string>();
   const titleParts: string[] = [];
   const headings: string[] = [];
+  let primaryHeading: string | null = null;
   let currentHeading: string[] | null = null;
   let titleDepth = 0;
+  let documentTitleSeen = false;
+  let bodyStarted = false;
   let headingDepth = 0;
   let ignoredDepth = 0;
   let hasPasswordInput = false;
   let hasLoginForm = false;
   let hasChallengeMarker = false;
-  const ignoredTags = new Set(["script", "style", "noscript", "template"]);
+  const ignoredTags = new Set([
+    "script",
+    "style",
+    "noscript",
+    "template",
+    "svg",
+    "math",
+  ]);
 
   const parser = new Parser({
     onopentag(name, attributes) {
@@ -655,17 +689,22 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
       }
       if (name === "meta") {
         const key = norm(attributes.property ?? attributes.name);
-        const content = cleanText(attributes.content);
+        const content = cleanMetadataText(attributes.content);
         if (
           content !== null &&
           (key === "og:title" || key === "og:description" ||
-            key === "description") &&
+            key === "twitter:title" || key === "twitter:description" ||
+            key === "description" || key === "og:site_name") &&
           !meta.has(key)
         ) {
           meta.set(key, content);
         }
       }
-      if (name === "title") {
+      if (name === "body") {
+        bodyStarted = true;
+      }
+      if (name === "title" && !documentTitleSeen && !bodyStarted) {
+        documentTitleSeen = true;
         titleDepth++;
       }
       if (name === "h1" || name === "h2") {
@@ -691,7 +730,7 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
         }`,
       );
       if (
-        /\b(challenge-form|captcha|cf-chl|access-denied)\b/u.test(marker)
+        /\b(challenge-form|cf-chl|access-denied)\b/u.test(marker)
       ) {
         hasChallengeMarker = true;
       }
@@ -719,6 +758,9 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
         headingDepth--;
         if (headingDepth === 0 && currentHeading !== null) {
           const heading = cleanText(currentHeading.join(""));
+          if (heading !== null && name === "h1" && primaryHeading === null) {
+            primaryHeading = heading;
+          }
           if (heading !== null && headings.length < 8) {
             headings.push(heading);
           }
@@ -733,41 +775,68 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
     meta,
     title: cleanText(titleParts.join("")),
     headings,
+    primaryHeading,
     hasPasswordInput,
     hasLoginForm,
     hasChallengeMarker,
   };
 }
 
-function isAccessDeniedDocument(
-  parsed: ParsedMetadataHtml,
-  title: string | null,
-): boolean {
-  const normalizedTitle = norm(title);
-  const normalizedHeadings = parsed.headings.map(norm);
-  const accessHeading = normalizedHeadings.some((heading) =>
-    /^(로그인|log in|login|access denied|접근이 제한되었습니다|서비스 이용이 제한되었습니다|just a moment)$/u
-      .test(heading)
-  );
-  const challengeTitle =
-    /^(just a moment|attention required|access denied|접근이 제한되었습니다)(?:[.…]*|\s*[:|-].*)$/u
-      .test(normalizedTitle);
-  const loginTitle =
-    /^(?:(?:네이버|naver)\s*)?(로그인|log in|login)(\s*[:|-].*)?$/u.test(
-      normalizedTitle,
-    );
-  return loginTitle || challengeTitle ||
-    (parsed.hasPasswordInput && (parsed.hasLoginForm || accessHeading)) ||
-    (parsed.hasChallengeMarker && accessHeading);
+function documentLabels(parsed: ParsedMetadataHtml): string[] {
+  const titles = [
+    parsed.title,
+    parsed.meta.get("og:title"),
+    parsed.meta.get("twitter:title"),
+  ];
+  // Subsection labels cannot override a useful document title. A title-less
+  // document may still expose its login/error message through a lone h2.
+  const heading = parsed.primaryHeading ??
+    (titles.some(isMeaningfulTitle) ? null : parsed.headings[0]);
+  return [
+    ...titles,
+    heading,
+  ].filter((value): value is string => value !== null && value !== undefined)
+    .map(norm);
 }
 
-function isMeaningfulTitle(value: string | null): boolean {
-  if (value === null || genericTitle(value)) {
+function isAccessDeniedDocument(parsed: ParsedMetadataHtml): boolean {
+  const accessDescription = [
+    parsed.meta.get("og:description"),
+    parsed.meta.get("twitter:description"),
+    parsed.meta.get("description"),
+  ].some((description) =>
+    /^(?:(?:please|you must|you need to)\s+)?(?:log\s?in|sign\s?in)\s+to\s+(?:continue|view|see|access)\b/u
+      .test(norm(description)) ||
+    /^(?:please\s+)?(?:enable|turn on)\s+javascript(?:\s+and\s+cookies)?\s+to\s+continue\b/u
+      .test(norm(description))
+  );
+  return accessDescription || parsed.hasChallengeMarker ||
+    (parsed.hasPasswordInput && parsed.hasLoginForm) ||
+    documentLabels(parsed).some((label) =>
+      /^(?:(?:네이버|naver)\s*)?(로그인|log\s?in|sign\s?in)(?:[.…!]*|\s*[:|•·–—-].*|\s+(?:to|into|on)\s+.*)$/u
+        .test(label) ||
+      /^(?:.+\s*[:|•·–—-]\s*)(로그인|log\s?in|sign\s?in)$/u.test(label) ||
+      /^(just a moment|attention required|access denied|접근이 제한되었습니다|서비스 이용이 제한되었습니다|checking your browser|verify (?:that )?you are human|security verification|human verification|captcha|robot or human|are you a robot|complete the security check)(?:[.…!?]*|\s*[:|•·–—-].*)$/u
+        .test(label)
+    );
+}
+
+function isErrorDocument(parsed: ParsedMetadataHtml): boolean {
+  return documentLabels(parsed).some((label) =>
+    /^(?:sorry[,!.]?\s*)?(?:(?:error\s*)?(?:404|410|500|502|503)\s*[:|•·–—-]?\s*)?(page not found|not found|this page isn['’]t available|this content isn['’]t available|page unavailable|internal server error|server error|service unavailable|something went wrong|페이지를 찾을 수 없습니다|요청하신 페이지를 찾을 수 없습니다)(?:[.…!]*|\s*[:|•·–—-].*)$/u
+      .test(label) || /^(error|오류|404|410|500|502|503)$/u.test(label)
+  );
+}
+
+function isMeaningfulTitle(value: string | null | undefined): boolean {
+  if (value === null || value === undefined || genericTitle(value)) {
     return false;
   }
   const normalized = norm(value);
   if (
     /^(naver blog|네이버 블로그|blog|블로그|just a moment|attention required|untitled document)$/u
+      .test(normalized) ||
+    /^threads(?:\.(?:net|com))?(?:\s*[,|•·:–—-].*)?$/u
       .test(normalized)
   ) {
     return false;
@@ -775,16 +844,18 @@ function isMeaningfulTitle(value: string | null): boolean {
   return isMeaningfulText(value);
 }
 
-function isMeaningfulText(value: string | null): boolean {
-  return value !== null && /[\p{L}\p{N}]/u.test(value);
+function isMeaningfulText(value: string | null | undefined): boolean {
+  return value !== null && value !== undefined && /[\p{L}\p{N}]/u.test(value);
 }
 
-function isMeaningfulDescription(value: string | null): boolean {
-  if (!isMeaningfulText(value)) {
+function isMeaningfulDescription(value: string | null | undefined): boolean {
+  if (!isMeaningfulText(value) || genericTitle(value ?? "")) {
     return false;
   }
-  return !/^(naver blog|네이버 블로그|서비스 홈(입니다)?|블로그(입니다)?|login|로그인)$/u
-    .test(norm(value));
+  return !/^(naver blog|네이버 블로그|서비스 홈(입니다)?|블로그(입니다)?|login|로그인|threads|instagram)$/u
+    .test(norm(value)) &&
+    !/^(join (?:threads|instagram)\b|say more with threads\b|create an account or log in to (?:threads|instagram)\b|threads에서 (?:가입|로그인))/u
+      .test(norm(value));
 }
 
 function truncateMetadataField(
@@ -800,13 +871,15 @@ function truncateMetadataField(
     : { value, truncated: false };
 }
 
-function firstPresent(
-  ...values: Array<string | null | undefined>
-): string | null {
-  return values.find((value): value is string =>
-    value !== null && value !== undefined
-  ) ??
-    null;
+function cleanMetadataText(value: string | undefined): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  const cleaned = value.replace(/\r\n?/gu, "\n").split("\n")
+    .map((line) => line.replace(/\s+/gu, " ").trim()).filter(Boolean).join(
+      "\n",
+    );
+  return cleaned.length === 0 ? null : cleaned;
 }
 
 function cleanText(value: string | null | undefined): string | null {
@@ -842,7 +915,7 @@ function htmlCharset(contentType: string | null): string | null {
   ) {
     return "euc-kr";
   }
-  return null;
+  return charset;
 }
 
 function contentLength(
@@ -893,7 +966,7 @@ export function ownUndiciMetadataResponse(
   // the moment headers are exposed; async iteration still observes real errors.
   let intentionallyCancelled = false;
   response.body.on("error", (error) => {
-    if (!intentionallyCancelled) reportNetworkFailure("HTTPS", error);
+    if (!intentionallyCancelled) reportNetworkFailure("HTTP", error);
   });
   return {
     status: response.statusCode,
@@ -934,7 +1007,7 @@ async function destroyClient(
   try {
     await owner.destroy(error ?? null);
   } catch (destroyError) {
-    reportNetworkFailure("HTTPS", destroyError);
+    reportNetworkFailure("HTTP", destroyError);
   }
 }
 
@@ -944,10 +1017,10 @@ function observeClientDestroy(
 ): void {
   try {
     owner.destroy(error).catch((destroyError) => {
-      reportNetworkFailure("HTTPS", destroyError);
+      reportNetworkFailure("HTTP", destroyError);
     });
   } catch (destroyError) {
-    reportNetworkFailure("HTTPS", destroyError);
+    reportNetworkFailure("HTTP", destroyError);
   }
 }
 
@@ -980,7 +1053,7 @@ function emptyResult(
     metadata_state: state,
     extraction_meta: {
       adapter_version: ADAPTER_VERSION,
-      final_url: finalUrl,
+      final_url: boundedFinalUrl(finalUrl),
       title_truncated: false,
       description_truncated: false,
       body_truncated: false,
@@ -988,6 +1061,10 @@ function emptyResult(
       error_code: errorCode,
     },
   };
+}
+
+function boundedFinalUrl(finalUrl: string | null): string | null {
+  return finalUrl !== null && [...finalUrl].length <= 4096 ? finalUrl : null;
 }
 
 function isPublicAddress(address: string): boolean {
@@ -1015,9 +1092,8 @@ function isPublicAddress(address: string): boolean {
   }
   const first = groups[0];
   return first >= 0x2000 && first <= 0x3fff &&
+    !(groups[0] === 0x2001 && groups[1] < 0x0200) &&
     !(groups[0] === 0x2001 && groups[1] === 0x0db8) &&
-    !(groups[0] === 0x2001 && groups[1] === 0x0002) &&
-    !(groups[0] === 0x2001 && groups[1] >= 0x0010 && groups[1] <= 0x001f) &&
     groups[0] !== 0x2002 && groups[0] !== 0x3fff;
 }
 

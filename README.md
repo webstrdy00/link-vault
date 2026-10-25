@@ -1,342 +1,235 @@
-# Link Vault
+# LinkFileBox
 
-**여러 앱에 흩어진 관심 링크를 한곳에 보관하고, 다시 찾아 원문으로 돌아가는 Android 앱입니다.**
+**흩어진 링크를 모으고, 기억나는 단서로 다시 찾으세요.**
 
-공유 메뉴나 URL 붙여넣기로 링크를 저장하고, 제목·메모·분류를 단서로 다시 찾습니다.
-사용자가 선택한 이미지 1장을 첨부하고, 기기 내 OCR로 읽은 텍스트도 검색 단서로 활용합니다.
+Android 공유 메뉴로 링크를 저장하고, 제목·메모·분류와 첨부 이미지의 인식 텍스트로
+다시 찾는 개인 링크 보관함입니다. 찾은 링크는 원래 앱이나 브라우저에서 엽니다.
 
-> **개발 상태:** 주요 기능의 로컬 구현·검증을 마쳤습니다. 실제 Google 로그인과
-> 별도 테스트 회원의 재인증 기반 탈퇴도 로컬에서 확인했습니다.
-> 실제 사용자 품질 평가와 운영 배포 인수는 미완료이며, 공개 출시·외부 베타 준비 완료를 뜻하지 않습니다.
-> 이 상태는 기존 개발 기록의 요약이며 README 개편 때 기능 시험을 다시 실행한 결과는 아닙니다.
+> **개발 중:** Google 로그인과 관리자 승인이 필요합니다.
+> 실제 사용자 품질 평가와 운영 배포 인수는 미완료이며, 공개 출시·외부 베타 준비 완료 상태는 아닙니다.
 
-[주요 기능](#주요-기능) · [제공 범위](#제공-범위와-제한) · [아키텍처](#시스템-아키텍처) · [로컬 실행](#로컬-실행) · [검증](#테스트와-검증-범위) · [상세 문서](#상세-문서)
+[주요 기능](#주요-기능) · [시작하기](#시작하기) · [지원 범위](#지원-범위와-제한)
 
-## 화면과 사용 흐름
+## 화면 미리보기
 
-| 내 보관함 | 검색 필터 |
-| --- | --- |
-| <img src="docs/assets/library.png" width="280" alt="합성 링크 세 건의 제목, 출처, 메모, 분류를 보여주는 내 보관함"> | <img src="docs/assets/filters.png" width="280" alt="여러 테스트 분류와 하단 필터 적용 버튼을 보여주는 검색 필터"> |
-| 제목·출처·메모를 읽고 저장한 링크를 다시 찾습니다. | 조건을 고른 뒤 필터 적용으로 결과에 반영합니다. |
+<table width="100%">
+  <tr>
+    <th width="50%" align="center">내 보관함</th>
+    <th width="50%" align="center">검색 필터</th>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><img src="docs/assets/library.png" width="280" alt="합성 링크의 제목, 출처, 메모, 분류를 보여주는 내 보관함"></td>
+    <td align="center" valign="top"><img src="docs/assets/filters.png" width="280" alt="여러 테스트 분류와 하단 필터 적용 버튼을 보여주는 검색 필터"></td>
+  </tr>
+  <tr>
+    <td align="center">제목·출처·메모를 읽고<br>저장한 링크를 다시 찾습니다.</td>
+    <td align="center">조건을 고른 뒤 필터 적용으로<br>결과에 반영합니다.</td>
+  </tr>
+  <tr>
+    <th align="center">검색 · 결과가 없는 상태</th>
+    <th align="center">다크 테마 · 큰 글꼴</th>
+  </tr>
+  <tr>
+    <td align="center" valign="top"><img src="docs/assets/search.png" width="280" alt="검색 입력창과 필터 버튼, 조건에 맞는 항목이 없다는 안내를 보여주는 검색 화면"></td>
+    <td align="center" valign="top"><img src="docs/assets/library-dark.png" width="280" alt="다크 테마와 큰 글꼴로 합성 링크 세 건을 보여주는 내 보관함"></td>
+  </tr>
+  <tr>
+    <td align="center">제목·URL·메모로 검색하며,<br>결과가 없으면 안내를 표시합니다.</td>
+    <td align="center">어두운 배경과 큰 글꼴로<br>링크의 제목과 메모를 읽습니다.</td>
+  </tr>
+</table>
 
-위 이미지는 기존 QA에서 **합성 자료로 실제 Compose 컴포넌트를 렌더링한 화면**입니다.
-실제 회원 자료나 SNS 앱 연동 성공의 증거가 아닙니다.
+위 이미지는 **기존 QA 캡처**입니다. 내 보관함·검색 필터·다크 테마는
+합성 자료로 실제 Compose 컴포넌트를 렌더링한 화면이며, 검색은 결과가 없는 상태의 앱 화면입니다.
+실제 회원 자료나 SNS 앱 연동 성공의 증거는 아닙니다.
+이미지는 원본 비율을 유지하며, 검색 필터에는 높이를 맞추기 위한 상하 여백을 추가했습니다.
 
-```text
-공유 메뉴 / URL 붙여넣기
-        → 링크 확인·선택 → 메모와 함께 저장
-        → 내 보관함 → 검색·분류로 다시 찾기 → 원문 앱 또는 브라우저 열기
-```
-
-연결이 끊기면 전송 대기 상태를 확인하고, 재연결 후 서버 저장 결과를 확인합니다.
-이미지는 저장된 항목과 첨부할 사진을 각각 명시적으로 선택합니다.
-
-## 해결하려는 문제
+## 왜 LinkFileBox인가
 
 관심 있는 글·장소·제품을 여러 앱에 저장하다 보면 **어디에 저장했는지부터 잊기 쉽습니다.**
-Link Vault는 원문을 복제하는 대신 링크와 기억할 단서를 모읍니다.
+LinkFileBox는 원문을 복제하는 대신 링크와 기억할 단서를 모읍니다.
 
 - **한곳에 보관:** 출처가 달라도 링크를 같은 개인 보관함에 저장합니다.
 - **기억으로 다시 찾기:** 제목·메모·확보한 메타정보·OCR 텍스트를 검색과 분류에 활용합니다.
-- **원문으로 돌아가기:** 찾은 항목에서 원래 게시물을 엽니다. 원문 사이트의 로그인 요구나 삭제는 별개입니다.
+- **원문으로 돌아가기:** 찾은 항목에서 원래 게시물을 엽니다.
+
+원문 사이트의 로그인 요구나 게시물 삭제는 LinkFileBox에서 해결하지 않습니다.
+
+## 사용 흐름
+
+1. **공유하기:** 다른 앱의 Android 공유 메뉴에서 링크를 보내거나 URL을 붙여넣습니다.
+2. **저장하기:** 링크를 확인한 뒤 저장 버튼으로 확정합니다. 제목·메모는 접힌 선택 입력이며, 여러 링크가 있으면 하나를 선택합니다.
+3. **다시 찾기:** 내 보관함에서 검색하거나 출처·기간·분류로 좁힙니다.
+4. **원문 열기:** 찾은 항목을 원래 앱이나 브라우저에서 엽니다.
+
+이미지를 첨부할 때는 저장된 항목과 사진을 직접 선택합니다.
+연결이 끊기면 전송 대기 상태를 확인하고, 재연결 후 서버 저장 결과를 확인합니다.
 
 ## 주요 기능
 
-| 기능 | 할 수 있는 일 |
-| --- | --- |
-| 링크 저장 | Android 공유 메뉴·직접 입력, 여러 HTTP/HTTPS 링크 중 하나 선택 |
-| 개인 보관함 | Google 로그인과 회원 승인 후 서버 보관함 사용, 제목·메모 편집 |
-| 검색 | 키워드·정해진 별칭 검색, 출처·기간·분류·미분류 필터 |
-| 분류 | 규칙 기반 자동 분류, 사용자 분류 생성·수정, 직접 선택과 자동 분류 재적용 |
-| 이미지·OCR | 항목당 이미지 1장 첨부·교체·삭제, 기기 내 한국어·라틴 문자 인식 |
-| 오프라인 대응 | 저장·편집 등의 대기열, 마지막 서버 목록·상세 캐시와 동기화 시각 표시 |
-| 데이터 관리 | 서버 항목 삭제, Google 재인증 기반 계정 탈퇴 |
+| 기능               | 할 수 있는 일                                                            |
+| ------------------ | ------------------------------------------------------------------------ |
+| 빠르게 저장        | Android 공유 메뉴·URL 직접 입력, 제목·메모 편집                          |
+| 단서로 검색        | 키워드·정해진 별칭 검색, 출처·기간·분류·미분류 필터                      |
+| 내 방식으로 정리   | 규칙 기반 자동 분류, 사용자 분류 생성·수정, 직접 지정과 자동 분류 재적용 |
+| 이미지로 단서 추가 | 항목당 이미지 1장 첨부·교체·삭제, 기기 내 한국어·라틴 OCR                |
+| 연결이 끊겨도 대기 | 저장·편집 등의 대기열, 마지막 서버 목록·상세 캐시와 동기화 시각 확인     |
+| 데이터 관리        | 서버 항목 삭제, Google 재인증 기반 계정 탈퇴                             |
 
-일반 실행은 `내 보관함`에서 시작하며, 하단의 보관함·검색·설정과 별도 `링크 저장` 버튼으로 이동합니다.
+앱은 `내 보관함`에서 시작합니다. 하단의 보관함·검색·설정과 별도 `링크 저장` 버튼으로 이동합니다.
 라이트·다크 테마와 앱에 포함된 Pretendard를 사용합니다.
 
-## 제공 범위와 제한
+## 시작하기
 
-| 구분 | 현재 범위 |
-| --- | --- |
-| 플랫폼 | Android 8.0 이상(minSdk 26). iOS·PC 웹은 현재 제공하지 않음 |
-| 회원 | Google 로그인 후 관리자 승인 필요. 승인 회원 최대 6명인 초기 베타 설정 |
-| 보관 한도 | 회원별 항목 100개, 새 항목 분당 10건. 사용자 분류 30개, 항목당 분류 연결 5개 |
-| 자동 정보 확보 | 허용된 네이버 호스트의 제한된 공개 메타정보만 수집 |
-| 검색·자동 분류 | 키워드·승인된 별칭·규칙 기반. 자연어 이해나 생성형 AI 분석이 아님 |
-| 오프라인 | 대기열·캐시 지원. 오프라인 검색을 서버 검색 완료로 대체하지 않음 |
-| 이미지 | 직접 선택한 이미지 1장. 회원별 서버 이미지 총량 20,000,000바이트 |
-| 미지원 | SNS 계정의 좋아요·저장 자동 수집, 전체 본문·영상 분석, 다중 이미지 첨부, 휴지통·삭제 취소, 사용자 export |
+### 이용 조건
 
-OCR은 기기에서 실행하지만 **첨부를 선택한 이미지와 인식 결과는 서버에 전송**됩니다.
-서버 저장 완료와 기기 전송 대기, 이미지 저장 성공과 OCR 성공은 구분합니다.
-삭제·탈퇴는 되돌릴 수 없으며, 백업을 포함한 모든 사본의 즉시 삭제를 보증하지 않습니다.
-개인정보 안내는 [개발용 초안](docs/development-record.md#개인정보삭제-안내-초안)이며 확정 처리방침이 아닙니다.
+- **Android 8.0 이상**이 필요합니다.
+- Google 로그인 후 **관리자 승인**을 받아야 서버 보관함을 사용할 수 있습니다.
+- 승인 회원 최대 6명의 초기 베타 설정입니다. 승인 대기는 오류가 아닙니다.
+- 아래 개발용 빌드는 공개 배포나 외부 베타 참여 경로가 아닙니다.
 
-## 시스템 아키텍처
+### 개발자용 로컬 실행
 
-```mermaid
-flowchart LR
-    Input["Android 공유 / 직접 입력"] --> UI["Compose UI"]
-    UI <--> Local["Room 대기열·캐시"]
-    Local <--> Work["WorkManager 재전송"]
-    UI --> OCR["ML Kit 기기 내 OCR"]
-    OCR --> Local
-    UI --> Auth["Google 로그인 / Supabase Auth"]
-    UI --> API["Edge Function: library-api"]
-    Work --> API
-    API --> Auth
-    API --> DB[("PostgreSQL / RPC / 접근 제어")]
-    UI -->|"이미지 예약 후 업로드"| Storage["Private Storage"]
-    API --> Storage
-    Cron["pg_cron / pg_net"] --> Worker["분류·메타정보·정리 실행기"]
-    Worker --> DB
-    Worker --> Storage
-    Worker --> Naver["허용된 네이버 메타정보"]
-```
+Android Studio·JDK 17·Android SDK 35, Node.js 24와 Docker Desktop이 필요합니다.
+Google OAuth 등록, 로컬 서버 설정, 앱 연결 설정을 마친 후 빌드합니다.
 
-회원 인증·승인·소유권을 확인한 API와 SQL 계약으로 데이터를 보호합니다.
-일반 클라이언트가 테이블에 직접 쓰지 않으며, 백그라운드 작업은 임대·재시도·버전을 확인해 반영합니다.
-위 그림은 구현 구성이고 운영 배포 완료를 나타내지 않습니다.
+다음 순서로 진행하세요.
 
-### 기술 스택
-
-| 영역 | 기술과 역할 |
-| --- | --- |
-| Android UI | Kotlin 2.1.0, Jetpack Compose, Material 3 |
-| 기기 저장·재시도 | Room 2.7.2, WorkManager 2.9.1 |
-| 인증·통신 | Credential Manager, Google Identity, Supabase Auth, Ktor |
-| 이미지 인식 | 번들된 ML Kit 한국어·라틴 OCR |
-| 서버 | Supabase Edge Functions, TypeScript / Deno |
-| 데이터·작업 | PostgreSQL, RPC·RLS, pg_cron·pg_net, 비공개 Storage |
-| 검증 | JVM·Compose 계측 시험, pgTAP, Deno·Node 테스트, 로컬 통합 시험 |
-
-## 핵심 기술적 의사결정
-
-### 1. 연결이 끊겨도 요청의 의미를 바꾸지 않기
-
-저장·편집 요청을 Room에 먼저 기록하고 WorkManager가 **같은 회원·요청 ID·본문**으로 재전송합니다.
-응답 유실과 중복 전송 때문에 새 항목이 반복 생성되거나 기존 메모가 덮어써지는 것을 막습니다.
-자동 전송은 생성 후 24시간까지이며, 만료 후에는 사용자의 재확인이 필요합니다.
-
-### 2. 오래된 편집과 응답으로 최신 자료를 덮어쓰지 않기
-
-편집은 `expected_version`으로 보호하고, 충돌하면 최신 내용을 확인한 뒤 새 요청으로 저장합니다.
-늦게 도착한 낮은 버전의 응답은 최신 캐시를 덮어쓰지 않습니다.
-로그아웃·계정 변경 시 기기 자료를 정리하고, 회원과 세션 경계로 대기 작업을 격리합니다.
-
-### 3. 실제로 확보한 정보만 검색 단서로 사용하기
-
-메타정보는 허용 호스트·공인 IP·TLS·시간·크기 제한을 적용해 읽습니다.
-전체 본문이나 원격 이미지를 수집했다고 표시하지 않으며, OCR 실패를 이미지 저장 실패와 혼동하지 않습니다.
-자동 분류보다 사용자의 직접 선택을 우선하고, 검색·분류의 일치 근거를 확인할 수 있게 합니다.
-
-### 4. 삭제한 자료가 복원으로 되살아나지 않게 하기
-
-항목 삭제는 원문·메모·검색 파생값·OCR을 지우고 후속 파일 정리를 진행합니다.
-계정 탈퇴는 Google 재인증을 거쳐 접근을 차단한 후 파일·업무 데이터·Auth 계정을 정리합니다.
-암호화 백업의 격리 복원에서는 삭제 기록을 적용하고 DB·파일·사용량을 검증합니다.
-백업의 DB 덤프와 이미지 목록은 같은 읽기 전용 PostgreSQL 스냅샷을 사용합니다.
-삭제 기록에 대응하는 행이 이미 없어도 삭제 묘비와 잔존 자료를 검사하며,
-잠금 대기·덤프 실행 제한을 초과하면 불완전한 백업을 성공으로 게시하지 않습니다.
-로컬 리허설 성공은 운영 백업·외부 키 보관·물리 폐기 검증을 대신하지 않습니다.
-
-처리 경계는 [API 구현](supabase/functions/library-api/handler.ts),
-[DB 마이그레이션](supabase/migrations)과 [상세 개발 기록](docs/development-record.md)에서 확인할 수 있습니다.
-
-## 로컬 실행
-
-명령은 **저장소 루트의 Windows PowerShell** 기준입니다.
-Linux/macOS에서는 `.\android\gradlew.bat` 대신 `./android/gradlew`를 사용하고 환경변수는 해당 셸 문법으로 설정합니다.
-
-### 1. 개발 환경 준비
-
-- Android Studio에서 `android/` 열기
-- JDK 17, Android SDK Platform 35, Gradle 8.10.2 Wrapper / AGP 8.7.3
-- `ANDROID_HOME` 또는 `android/local.properties`의 `sdk.dir`에 SDK 경로 설정
-- 서버 실행: Node.js 24와 실행 중인 Docker Desktop
-- Google 로그인 확인: Google Play 지원 에뮬레이터 또는 호환 기기와 실제 Google 계정
-
-### 2. Google OAuth와 서버 설정
-
-Google Cloud에서 웹 OAuth 클라이언트와 Android 클라이언트를 등록합니다.
-Android 패키지는 `com.linkvault.app`이며 debug/release 서명은 각각 등록해야 합니다.
+1. 개발 도구와 Google OAuth 클라이언트를 준비합니다.
+2. 의존성을 설치하고 로컬 Supabase·마이그레이션·작업 실행기를 설정합니다.
+3. 앱의 서버 주소·공개 API 키·Google 웹 Client ID를 설정합니다.
+4. 아래 명령으로 빌드한 뒤 기기에 설치하고 로그인·회원 승인을 확인합니다.
 
 ```powershell
-.\android\gradlew.bat -p android :app:signingReport
-npm ci
-```
-
-현재 `supabase/config.toml`의 Google provider는 활성화되어 있습니다.
-서버용 `GOOGLE_WEB_CLIENT_ID`와 `GOOGLE_CLIENT_SECRET`을 gitignored 루트 `.env`에 설정하고,
-Edge의 audience 설정은 `supabase/functions/.env`에 보관합니다.
-실제 키·토큰·client secret은 출력하거나 커밋하지 않습니다. nonce 검증도 끄지 않습니다.
-
-```powershell
-npm run backend:start
-npm run backend:migrate
-npm run backend:configure-worker
-```
-
-위 명령은 로컬 Supabase를 시작하고 마이그레이션과 작업 실행기를 설정합니다.
-`backend:start`는 Edge `/v1/health`의 DB 준비 상태까지 확인합니다.
-기존 DB를 초기화하거나 적용된 마이그레이션 이력을 수정하지 마세요.
-
-### 3. 앱 연결 설정과 빌드
-
-앱은 환경변수 또는 Gradle 프로젝트 속성에서 다음 값을 읽습니다.
-**Gradle은 루트 `.env`를 자동으로 읽지 않습니다.**
-
-| 설정 | 값 |
-| --- | --- |
-| `SUPABASE_URL` | 로컬 에뮬레이터: `http://10.0.2.2:18021` |
-| `SUPABASE_PUBLISHABLE_KEY` | 해당 로컬 프로젝트의 publishable/anon 키 |
-| `GOOGLE_WEB_CLIENT_ID` | 서버와 같은 웹 OAuth client ID |
-
-호스트에서의 API 주소는 `http://127.0.0.1:18021`입니다.
-실기기 연결에는 별도 네트워크 구성이 필요하며, 에뮬레이터 주소를 그대로 사용하지 않습니다.
-HTTP 예외는 debug의 로컬 에뮬레이터용이고 일반 배포 앱은 HTTPS만 허용합니다.
-앱에 service_role·`sb_secret_`·Google client secret을 넣지 마세요.
-
-```powershell
+# 저장소 루트의 Windows PowerShell — 위 설정을 마친 후 실행
 .\android\gradlew.bat -p android :app:assembleDebug
 ```
 
-APK는 `android/app/build/outputs/apk/debug/app-debug.apk`에 생성됩니다.
-기기에 설치한 뒤 Google 로그인하고, 서버 관리자가 해당 회원 UUID를 `beta_members`에 승인하고
-`approved_at`을 기록해야 보관함을 사용할 수 있습니다. 승인 대기는 오류가 아닙니다.
+APK: `android/app/build/outputs/apk/debug/app-debug.apk`
 
-설정 없이도 APK는 빌드되지만 실제 로그인·서버 보관함은 사용할 수 없습니다.
-가짜 로그인이나 로컬 전용 보관함으로 대체하지 않습니다.
-[인증 설정 상세](docs/development-record.md#실제-google-로그인-설정)를 참고하세요.
+**설정 없이도 빌드는 되지만 로그인·서버 보관함은 사용할 수 없습니다.**
+Gradle은 루트 `.env`를 자동으로 읽지 않습니다. 앱에는 서버 비밀키를 넣지 마세요.
 
-## 테스트와 검증 범위
+실기기 로컬 통합 검사는 테스트 전용 기기에서만 실행합니다. 앱을 설치하고 기존 앱 세션에서
+로그아웃하므로 개인 사용 세션에는 실행하지 마세요. 로컬 서버·작업 실행기가 준비되어 있어야 하며,
+화면 잠금을 해제한 상태에서 `adb -s <serial> reverse tcp:18021 tcp:18021`로 연결합니다.
+`LINK_VAULT_TEST_DEVICE_SERIAL=<serial>`을 명시해 `npm run test:emulator-integration`을 실행하면
+에뮬레이터 대신 지정한 기기를 사용합니다. Debug에서만 `http://127.0.0.1:18021`을 허용하며
+Release의 HTTPS 정책은 유지합니다. 종료 후에는 해당 reverse 연결을 해제하세요.
+`LINK_VAULT_TEST_FIXTURE`는 기본 `generic`(example.com), `threads`, `instagram-travel` 중
+선택하며, 마지막 항목은 실제 한국어 게시물의 여행 분류도 검사합니다.
+실행 중 USB 재연결로 reverse 연결이 사라지면 지정한 테스트 포트만 재설정합니다.
+`LINK_VAULT_TEST_DIAGNOSTICS=1`은 생성한 테스트 항목의 처리 상태·제목 확보 여부와 경과 시간을
+출력합니다. 계정 토큰·비밀번호·원문 내용은 진단 로그에 출력하지 않습니다.
 
-### 개발 검증 명령
+### 정적 사이트의 웹 계정 탈퇴 설정
 
-```powershell
-.\android\gradlew.bat -p android :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
-npm run test:api
-npm run test:beta
-npm run test:operations
-npm run test:backend-start
-```
+`website/`는 별도 정적 사이트 배포 대상입니다. API·DB 배포 워크플로
+(`.github/workflows/deploy.yml`)는 사이트나 웹 설정을 생성·배포하지 않습니다.
+`/account-deletion/config.json`이 없거나 유효하지 않으면 웹 계정 탈퇴·상태 조회는
+기본적으로 비활성화되며, 설정 생성만으로 운영 배포나 공개 출시가 승인되지는 않습니다.
 
-에뮬레이터·기기 계측 시험과 로컬 DB 시험은 별도입니다.
-**개인 자료 없는 전용 시험 기기·DB에서만 실행하세요.**
+배포 시 `website/` 내용을 **저장소 밖의 별도 staging 디렉터리**에 먼저 준비하고,
+배포 환경에 다음 값을 제공한 뒤 공개 설정을 생성합니다. 루트 `.env`는 자동으로 읽지 않습니다.
 
-```powershell
-.\android\gradlew.bat -p android :app:connectedDebugAndroidTest
-npm run test:db
-```
-
-서버 연동 시험은 회원·항목을 만들고 정리하며, 일부 시험은 네트워크 차단·앱 강제 종료를 수행합니다.
-실제 회원 자료가 있는 로컬 DB를 시험을 위해 비우지 마세요.
-[통합 시험 순서와 안전 조건](docs/development-record.md#m1m4-로컬-서버와-검증)을 먼저 확인하세요.
-
-### 실제 인수 기록용 CSV
-
-새 checkout에서 `npm ci`를 실행한 뒤, 아래 명령으로 **빈 양식 두 개**를 생성합니다.
-출력 디렉터리는 미리 만든 저장소 밖의 전용 폴더여야 하며, 기존 파일은 덮어쓰지 않습니다.
+- `SUPABASE_URL`: 정확히 `https://api.linkfilebox.com` (끝의 `/` 없이).
+- `SUPABASE_PUBLISHABLE_KEY`: 해당 서버의 `sb_publishable_…` 공개 키 또는 역할이 `anon`인
+  기존 JWT 공개 키. `sb_secret_…`·`service_role` 키와 서버 비밀키는 넣지 마세요.
+- `GOOGLE_WEB_CLIENT_ID`: 아래 고정값으로, 웹 모듈의 `GOOGLE_CLIENT_ID`와 같아야 합니다.
 
 ```powershell
-$evidence = Join-Path $HOME ("link-vault-evidence-" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Path $evidence | Out-Null
-npm run beta:templates -- --output-dir "$evidence"
+# 공개 키는 배포 환경에서 SUPABASE_PUBLISHABLE_KEY로 사전 제공합니다.
+# staging의 account-deletion 디렉터리는 이미 존재해야 합니다.
+$env:SUPABASE_URL = "https://api.linkfilebox.com"
+$env:GOOGLE_WEB_CLIENT_ID = "486032328491-4sv6bg4ukablou6d2btfnhon30e10rsb.apps.googleusercontent.com"
+npm run build:web-account-config -- --output C:\deploy\linkfilebox-static\account-deletion\config.json
 ```
 
-- `device_capture_template.csv`: 실제 공유·저장 기록. Threads 8건, Instagram 8건,
-  네이버 블로그 8건, 기타 공개 웹 6건을 기록합니다.
-- `retrieval_tasks_template.csv`: 실제 기억 단서로 다시 찾는 과제 10개를 기록합니다.
-- 헤더는 검사기의 `CAPTURE_HEADERS`·`RETRIEVAL_TASK_HEADERS`에서 생성합니다.
-  URL·메모·검색어·계정 정보를 포함한 실제 기록은 계속 저장소 밖에 두고 커밋하지 마세요.
+출력 경로는 `--output`으로 반드시 지정해야 하며, 심볼릭 링크를 해석한 부모 디렉터리가
+저장소 안이면 거부합니다. 생성기는 웹 모듈의 기존 공개 설정 검증을 재사용하여 주소·Client ID와
+공개 키 형식을 검사합니다. 이는 키의 서버 소속이나 JWT 서명 검증은 아니므로 배포자가 확인해야 합니다.
+키·설정 내용·출력 경로는 로그에 표시하지 않으며, 같은 디렉터리의 임시 파일을 완성한 뒤
+지정한 출력 파일만 원자적으로 교체하므로 같은 명령을 다시 실행할 수 있습니다.
+생성 파일은 POSIX에서 소유자만 읽고 쓰는 권한(`0600`)을 사용합니다. Windows에서는 staging의
+ACL을 별도로 제한하고, 게시할 때 필요한 웹 서버 계정의 읽기 권한을 배포 과정에서 부여하세요.
 
-작성 후 같은 PowerShell 창에서 검사합니다.
+생성한 파일은 공개 정보만 담으며, 정적 사이트와 함께
+`https://linkfilebox.com/account-deletion/config.json`으로 게시해야 합니다.
+키가 들어 있는 생성 파일을 저장소에 추가하거나 설정을 로그에 출력하지 마세요.
+이 명령은 로컬 파일만 생성하며 서버·OAuth 설정 변경이나 사이트 게시를 수행하지 않습니다.
 
-```powershell
-npm run beta:check -- --captures "$evidence/device_capture_template.csv" --tasks "$evidence/retrieval_tasks_template.csv"
+## 지원 범위와 제한
+
+| 구분           | 현재 범위                                                                                         |
+| -------------- | ------------------------------------------------------------------------------------------------- |
+| 플랫폼         | Android 전용. iOS·PC 웹은 현재 제공하지 않음                                                      |
+| 보관 한도      | 회원별 항목 100개, 새 항목 분당 10건. 사용자 분류 30개, 항목당 분류 연결 5개                      |
+| 자동 정보 확보 | 공개 HTTP·HTTPS 페이지의 제목·미리보기 설명을 비동기로 확보                                      |
+| 검색·자동 분류 | 키워드·승인된 별칭·규칙 기반. 자연어 이해나 생성형 AI 분석이 아님                                 |
+| 오프라인       | 대기열·캐시 지원. 오프라인 검색을 서버 검색 완료로 대체하지 않음                                  |
+| 이미지         | 직접 선택한 이미지 1장. 회원별 서버 이미지 총량 20,000,000바이트                                  |
+| 미지원         | SNS 좋아요·저장 자동 수집, 전체 본문·영상 분석, 다중 이미지 첨부, 휴지통·삭제 취소, 사용자 export |
+
+링크를 저장하면 공개 페이지의 메타정보 확보를 시도하고, 확보한 텍스트를 검색·자동 분류에 반영합니다.
+공유된 제목·글도 함께 활용하며, 원문 제목이 없으면 유효한 설명의 첫 줄을 짧은 표시 제목으로 사용합니다.
+직접 입력한 제목·메모와 사용자가 지정한 분류는 자동 정보 확보로 덮어쓰지 않습니다.
+HTTP 80·HTTPS 443의 공개 도메인만 대상이며, 인증 정보가 포함된 URL·IP 주소·로컬 또는 예약 도메인은 제외합니다.
+작업 실행기는 DNS 결과와 리디렉션마다 공개 주소 여부를 확인하며, 사설 주소로 연결하지 않습니다.
+로그인·접근 제한·자바스크립트 실행이 필요한 페이지는 정보를 확보하지 못하거나 일부만 확보할 수 있습니다.
+실패해도 링크는 보관되며, 이전에 미지원으로 저장한 공개 링크는 상세의 `메타데이터 다시 조회`로 재시도할 수 있습니다. 일괄 재수집하지 않습니다.
+열려 있는 상세 화면은 최대 3분 동안 정보 확보·분류 완료를 자동 확인합니다. 더 오래 걸리면 상세를 다시 열어 확인합니다.
+
+`npm run test:metadata-live`는 Threads·Instagram·X·Facebook·Bluesky·Mastodon의 공개 게시물
+8개를 실제 수집 코드로 조회하고, 브라우저에서 확인한 글 내용과 제목의 메뉴 혼입 여부를 검사합니다.
+확보한 한국어 제주 여행 게시물에 기존 분류기를 적용해 `travel` 분류도 확인합니다.
+외부 게시물 변경·삭제·접근 제한 시 실패할 수 있으므로 일반 CI와 분리한 선택 실행 검사입니다.
+이 검사는 제목·미리보기 설명의 수집 검증이며, 본문 전체·각 SNS 앱의 Android 공유·운영 배포 성공을 뜻하지 않습니다.
+
+### 개인정보와 삭제
+
+- OCR은 기기에서 실행하지만 **첨부를 선택한 이미지와 인식 결과는 서버에 전송**됩니다.
+- 서버 저장 완료와 기기 전송 대기, 이미지 저장 성공과 OCR 성공은 구분합니다.
+- 삭제·탈퇴는 되돌릴 수 없으며, 백업을 포함한 모든 사본의 즉시 삭제를 보증하지 않습니다.
+- 개인정보 안내는 개발용 초안이며 확정 처리방침이 아닙니다.
+
+## 구조와 기술 스택
+
+```mermaid
+flowchart LR
+    App["Android 앱"] <--> Local["기기 대기열·캐시"]
+    Local --> Retry["백그라운드 재전송"]
+    App --> API["인증·회원 승인 / API"]
+    Retry --> API
+    API --> DB[("개인 보관함 DB")]
+    App -->|"예약 후 이미지 업로드"| Storage["비공개 이미지 저장소"]
+    API --> Storage
 ```
 
-헤더만 있는 빈 양식은 인수 자료가 아니므로 검사 **종료 코드 1이 정상**입니다.
-생성 명령의 성공은 양식 생성만 뜻합니다. 작성된 CSV의 검사 통과도 실제 사용자 증거의
-진위를 검증하거나 외부 베타·Google 인증 전체를 승인하는 결과가 아닙니다.
-실행 날짜·기기/환경·앱 버전·`git rev-parse HEAD`·명령·결과·미실행 범위는
-같은 외부 폴더에 기록하세요. 실제 Google 최초 로그인·재시작 복원·별도 빈 회원 탈퇴의
-로컬 확인 기록과, 토큰 만료 갱신·자료가 있는 회원 탈퇴·운영 인증 인수는 구분합니다.
+| 영역             | 기술                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| Android UI       | Kotlin 2.1.0, Jetpack Compose, Material 3                                                       |
+| 기기 저장·재전송 | Room 2.7.2, WorkManager 2.9.1                                                                   |
+| 인증·통신        | Credential Manager, Google Identity, Supabase Auth, Ktor                                        |
+| 이미지 인식      | 번들된 ML Kit 한국어·라틴 OCR                                                                   |
+| 서버·데이터      | Supabase Edge Functions, TypeScript / Deno, PostgreSQL, RPC·RLS, pg_cron·pg_net, 비공개 Storage |
+| 검증             | JVM·Compose 계측 시험, pgTAP, Deno·Node 테스트, 로컬 통합 시험                                  |
 
-## 배포 자동화
+재전송 시 중복 저장을 방지하고, 오래된 편집으로 최신 자료를 덮어쓰지 않도록 설계했습니다.
+회원·세션별로 기기 자료를 격리하며 자동 분류보다 사용자의 직접 선택을 우선합니다.
+위 그림은 구현 구성의 요약이며 운영 배포 완료를 뜻하지 않습니다.
 
-- PR에서는 [CI](.github/workflows/ci.yml)와 [DB 계약 시험](.github/workflows/database-ci.yml)을 실행합니다.
-  병합 순서는 **feature 브랜치 → develop → 검증 → main**입니다.
-  `develop` push는 통합 검증만 수행하고, `main` push는 검증 후
-  `production` Environment의 담당자 승인을 기다립니다. 운영 배포와 서명 릴리스는 `main`만 허용합니다.
-- [서버 배포](.github/workflows/deploy.yml)는 별도 SSH 키와 강제 명령 계정만 사용합니다.
-  API·마이그레이션만 전달하며, 서버의 Compose·비밀값·배포 수신기는 자동으로 덮어쓰지 않습니다.
-  적용된 마이그레이션 변경은 거부하고, 신규 마이그레이션 전에 암호화 백업을 생성합니다.
-  API 전환 실패 시 이전 API를 복구하지만 **커밋된 DB 변경은 자동으로 되돌리지 않습니다.**
-  비밀값 없는 [비공개 Compose overlay](deployment/compose.private.yml)와
-  [제한 계정 설치기](scripts/install-server-automation.py)는 새 서버 구성을 위한 소스입니다.
-- [Android 배포 빌드](.github/workflows/android-release.yml)는 수동 실행·별도 승인 대상입니다.
-  서명키 네 항목과 HTTPS 서버 주소·공개 API 키·Google 웹 Client ID가 없으면 배포 빌드를 거부합니다.
-  APK/AAB 생성은 스토어 게시나 실제 계정 인수 완료를 뜻하지 않습니다.
+## 운영자와 문의
 
-### 운영 도메인
+LinkFileBox는 개인 개발자가 운영하는 링크 보관 서비스입니다.
 
-앱 API 주소는 `https://api.linkfilebox.com`입니다. Cloudflare의 프록시 A 레코드는
-현재 서버를 가리키며 SSL/TLS는 Full (strict)를 사용합니다.
-[공개 gateway overlay](deployment/compose.public.yml)는 비공개 overlay 다음에 적용하고,
-[Caddyfile](deployment/Caddyfile)은 스택의 `volumes/caddy/Caddyfile`에 설치합니다.
-80/443만 추가로 열며, Supabase gateway 8000은 계속 loopback에 바인딩합니다.
-인증·앱 API·Storage object 경로만 전달하고 Studio, REST, 내부 작업 경로는 404로 차단합니다.
-Caddy 인증서 자동 갱신 상태와 공개 접근 경계를 이전 후에도 확인해야 합니다.
+- **공개 운영자명:** LinkFileBox 운영자
+- **문의 주소:** `support@linkfilebox.com`
 
-서버 `.env`의 `SUPABASE_PUBLIC_URL=https://api.linkfilebox.com`,
-`API_EXTERNAL_URL=https://api.linkfilebox.com/auth/v1`,
-`SITE_URL=https://linkfilebox.com`과 Google 웹 client ID/secret을 설정합니다.
-Google Console redirect는 `https://api.linkfilebox.com/auth/v1/callback`입니다.
-인증 컨테이너 재생성 후 gateway upstream이 503이면 Envoy를 재시작하고 외부 health를 검증합니다.
-신규 가입은 Google 프로젝트·Android 서명 인증서·실제 계정 인수가 끝날 때까지 비활성화합니다.
-루트 도메인의 소개 페이지·개인정보 안내는 별도이며 API 연결만으로 제공되지 않습니다.
-`volumes/caddy`의 인증서·설정은 기존 전체 스택 암호화 백업에 포함됩니다.
 
-### 백업과 서버 이전
+## 라이선스 안내
 
-[백업 명령](scripts/server-backup.py)은 DB dump·역할·Storage·Vault 키·서버 설정·배포 소스를
-`age` 공개 수신자로 암호화합니다. 일관된 파일·DB 상태를 위해 캡처 중 앱 서비스를 잠시 중지하고
-종료 시 원래 실행 상태로 복구합니다. 운영자는 이 중단 시간을 고려해야 합니다.
-서버에는 공개 수신자만 두고, 복호화용 개인 키는 별도 보관합니다.
-Git 저장소와 앱 서명·접속키 복구 묶음은 먼저 별도로 암호화한 `recovery-capsules/` 형태로
-서버 스냅샷에 포함할 수 있습니다. 이 묶음에도 백업 복호화용 개인 키는 포함하지 않습니다.
+저장소 루트에 프로젝트 전체에 적용할 라이선스 파일이 명시되어 있지 않습니다.
+글꼴 라이선스를 프로젝트 전체의 사용·재배포 허가로 해석하지 마세요.
 
-- 서버에서는 완료된 암호화 스냅샷 **최근 7개**를 보존합니다.
-- [외부 백업 workflow](.github/workflows/backup.yml)는 암호화 파일만 GitHub artifact에 **30일** 보관합니다.
-  GitHub 예약 실행은 **기본 브랜치에 workflow가 병합된 뒤** 동작합니다.
-  기본 브랜치 반영 전에도 서버 timer와 push로 시작된 백업은 별개로 동작합니다.
-- 백업 실패 또는 서버 만료 14일 이내에는 저장소 담당자에게 할당된 이슈를 생성합니다.
-  이메일·모바일 수신은 담당자의 GitHub 알림 설정에 따릅니다.
-- GitHub artifact는 영구 보관소가 아닙니다. 필요한 복구 지점은 만료 전에 별도 장기 저장소로 옮기고,
-  개인 복호화 키는 백업 파일과 다른 계정·오프라인 매체에 보관하세요.
-
-이전 시에는 새 서버에서 아카이브의 manifest에 기록된 이미지 digest를 준비하고, 외부에서 복호화한
-Vault 키·DB 역할·DB dump·Storage·Compose 설정·소스를 복원합니다.
-아카이브의 복구 순서를 따르고, 신규 환경에서 Vault 복호화·API·Storage·예약 작업을 검증한 뒤
-DNS와 앱 연결을 전환하세요. 기존 서버는 복구 검증과 최종 데이터 동기화 전에 폐기하지 않습니다.
-Android 서명키는 앱 업데이트의 동일성을 결정하므로 서버 이전과 무관하게 계속 보존해야 합니다.
-`secrets/`, `.env*`, 서명 저장소, 복호화 키는 Git에 추가하지 마세요.
-
-## 상세 문서
-
-| 목적 | 문서 |
-| --- | --- |
-| DB·접근 권한 | [마이그레이션](supabase/migrations) · [DB 계약 시험](supabase/tests) |
-| API 계약 | [요청 처리](supabase/functions/library-api/handler.ts) · [계약 시험](supabase/functions/library-api/handler_test.ts) |
-| 검색·분류 | [검색·분류 엔진](supabase/functions/library-api/discovery-engine.ts) · [규칙](supabase/functions/library-api/rules.json) |
-| 재시도·동시성 | [보관 안정성](docs/development-record.md#m2-보관-안정성) · [작업 실행기](docs/development-record.md#백그라운드-실행기와-기존-분류-정규화) |
-| 운영·백업·복원 | [로컬 운영과 백업 리허설](docs/development-record.md#m5-로컬-운영백업-리허설) — 운영 장애 복원 명령이 아님 |
-| 검증 이력·개인정보 | [개발·검증 상세 기록](docs/development-record.md) — 개편 전 README 보존본 |
-
-기획 원본은 저장소의 로컬 보관 정책에 따라 공개 대상에서 제외합니다.
-위 링크는 공개 대상 파일만 사용하며, 상세 기록에 적힌 기획 문서 경로·내부 아티팩트 번호는 공개 링크가 아닙니다.
-
-Pretendard의 [OFL 라이선스](android/app/src/main/assets/licenses/pretendard-OFL.txt)는 앱에 함께 포함되어 있으며,
+Pretendard의 [OFL 라이선스](android/app/src/main/assets/licenses/pretendard-OFL.txt)는 앱에 포함되어 있으며,
 설정의 `글꼴 라이선스`에서도 네트워크 연결 없이 읽을 수 있습니다.

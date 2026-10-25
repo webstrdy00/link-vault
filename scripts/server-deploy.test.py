@@ -486,7 +486,7 @@ class CommandAndHealthTests(ReceiverCase):
                 mock.patch.object(deploy.os, "access", return_value=True), \
                 mock.patch.object(deploy, "run_command") as runner:
             deploy.mandatory_backup(Path("stack"))
-        runner.assert_called_once_with([str(deploy.BACKUP)], Path("stack"), 900,
+        runner.assert_called_once_with([str(deploy.BACKUP)], Path("stack"), 3600,
                                        "MANDATORY_BACKUP_FAILED")
 
     def test_root_ownership_links_and_permissions_are_checked(self):

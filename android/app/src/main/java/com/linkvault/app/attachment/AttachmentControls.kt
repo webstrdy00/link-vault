@@ -304,7 +304,7 @@ private fun AttachmentStatusContent(state: AttachmentUiState) {
 
         if (metadataNeedsAttention) {
             AttachmentInfoSection(title = "링크 정보") {
-                if (state.item.metadataState == "pending") {
+                if (state.item.isMetadataProcessing) {
                     StatusLine(metadataStatusMessage(state.item), busy = true)
                 } else {
                     Text(
@@ -519,7 +519,7 @@ private fun AttachmentButtons(
         if (state.supportsMetadataRetry) {
             OutlinedButton(
                 onClick = onRetryMetadata,
-                enabled = !state.actionRunning,
+                enabled = state.canRetryMetadata,
                 shape = EditorialShape,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -886,12 +886,13 @@ private fun ocrStatusMessage(item: LibraryItemDetail): String = when (item.ocrSt
     else -> "OCR 상태를 확인할 수 없어요."
 }
 
-private fun metadataStatusMessage(item: LibraryItemDetail): String = when (item.metadataState) {
+internal fun metadataStatusMessage(item: LibraryItemDetail): String = when (item.metadataState) {
     "ready" -> "메타데이터 조회를 완료했어요. 페이지 전체 보존을 의미하지는 않아요."
     "partial" -> "일부 메타데이터만 저장됐어요."
-    "unsupported" -> "이 주소는 자동 메타데이터 조회를 지원하지 않아요."
+    "unsupported" -> "링크 정보를 가져오지 못했어요. 다시 조회해 현재 지원 여부를 확인할 수 있어요."
     "failed" -> "메타데이터 조회를 완료하지 못했어요."
-    "pending" -> "서버에서 메타데이터를 조회하고 있어요."
+    "queued" -> "서버에서 메타데이터 조회를 기다리고 있어요."
+    "running" -> "서버에서 메타데이터를 조회하고 있어요."
     else -> "메타데이터 상태를 확인할 수 없어요."
 }
 
@@ -933,9 +934,10 @@ private fun attachmentFailureMessage(code: String): String = when (code) {
     else -> "이미지 작업을 완료하지 못했어요."
 }
 
-private fun commandFailureMessage(code: String): String = when (code) {
+internal fun commandFailureMessage(code: String): String = when (code) {
     "VERSION_CONFLICT" -> "다른 변경이 먼저 저장되어 최신 내용 확인이 필요해요."
     "ASSET_NOT_ACTIVE" -> "대상 이미지가 더 이상 현재 이미지가 아니에요."
+    "METADATA_UNSUPPORTED" -> "이 주소는 메타데이터 조회를 지원하지 않아요."
     "RATE_LIMITED" -> "요청이 많아 잠시 뒤 다시 시도해야 해요."
     else -> "서버 요청을 완료하지 못했어요."
 }

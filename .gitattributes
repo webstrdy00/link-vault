@@ -1,0 +1,3 @@
+# Applied migrations are byte-hashed by the production deployment ledger.
+# Preserve their exact committed bytes; do not normalize line endings.
+supabase/migrations/*.sql -text

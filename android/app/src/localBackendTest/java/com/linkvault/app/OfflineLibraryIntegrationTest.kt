@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.ConnectivityManager
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -49,6 +50,12 @@ class OfflineLibraryIntegrationTest {
     private fun awaitText(text: String, substring: Boolean = false) {
         compose.waitUntil(30_000) {
             compose.onAllNodesWithText(text, substring = substring).fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+    private fun awaitTag(tag: String) {
+        compose.waitUntil(30_000) {
+            compose.onAllNodes(hasTestTag(tag), useUnmergedTree = true)
+                .fetchSemanticsNodes().isNotEmpty()
         }
     }
     private fun shell(command: String) {
@@ -147,13 +154,21 @@ class OfflineLibraryIntegrationTest {
             compose.onNodeWithTag("root-library").performClick()
             awaitText("오프라인 재시작 보관 검증", substring = true)
             compose.onNodeWithTag("detail-${argument("fixtureItemId")}").performScrollTo().performClick()
-            awaitText("처리 정보 보기")
-            compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
-            awaitText("링크 정보", substring = true)
-            compose.onNodeWithText("처리 정보 접기").performScrollTo().performClick()
+            awaitTag("detail-back")
+            awaitText("원문 열기")
+            compose.onNodeWithText("원문 열기").assertExists()
+            compose.onNodeWithText("처리 정보 보기").assertDoesNotExist()
+            compose.onNodeWithText("카테고리 관리").assertDoesNotExist()
+            compose.onNodeWithTag("detail-more").performScrollTo().performClick()
+            compose.onNodeWithTag("detail-manage-categories").performClick()
+            awaitText("카테고리 관리")
             compose.onNodeWithText("카테고리 관리").performScrollTo().performClick()
             awaitText("직접 선택 (", substring = true)
-            compose.onNodeWithText("관리 닫기").performScrollTo().performClick()
+            compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+            awaitTag("detail-${argument("fixtureItemId")}")
+            compose.onNodeWithTag("detail-${argument("fixtureItemId")}").performScrollTo().performClick()
+            awaitTag("detail-back")
+            awaitText("원문 열기")
             compose.onNodeWithText("오프라인 재시작 보관 검증").assertExists()
             // A wrong queued owner must be rejected before any HTTP request can write it.
             val rejected = runCatching {
@@ -167,7 +182,7 @@ class OfflineLibraryIntegrationTest {
             }.exceptionOrNull()
             assertTrue(rejected is com.linkvault.app.auth.AccountClientException)
             assertEquals(owner, app.accountClient.sessionUserId())
-            compose.onNodeWithText("더보기").performScrollTo().performClick()
+            compose.onNodeWithTag("detail-more").performScrollTo().performClick()
             compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
             val current = app.accountClient.libraryRequest(owner, "/items/${argument("fixtureItemId")}")
             app.accountClient.libraryRequest(
@@ -191,7 +206,7 @@ class OfflineLibraryIntegrationTest {
             compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
             scenario.recreate()
             awaitText("재시작 후 편집 검증")
-            compose.onNodeWithText("보관함 목록").performScrollTo().performClick()
+            compose.onNodeWithTag("detail-back").performScrollTo().performClick()
             shell("svc wifi disable")
             shell("svc data disable")
             val connectivity = app.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager

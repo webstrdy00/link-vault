@@ -14,6 +14,13 @@ assert.equal(
 const fixtureEmail = `emulator-${randomUUID()}@example.test`;
 const fixturePassword = `Local-emulator-${randomUUID()}`;
 const fixtureKind = process.env.LINK_VAULT_TEST_FIXTURE ?? "generic";
+const verifyListDeletion = process.env.LINK_VAULT_TEST_DELETE === "1";
+const verifyUncachedDeletion =
+  process.env.LINK_VAULT_TEST_DELETE_UNCACHED === "1";
+assert.ok(
+  !verifyUncachedDeletion || verifyListDeletion,
+  "Uncached deletion requires delete verification",
+);
 const fixtures = {
   generic: {
     url: `https://example.com/?capture-fixture=${randomUUID()}`,
@@ -86,6 +93,11 @@ async function api(
     },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(15000),
+  }).catch((error) => {
+    throw new Error(
+      `Local fixture request failed: ${method} ${route.split("?")[0]}`,
+      { cause: error },
+    );
   });
   const text = await response.text();
   return { status: response.status, data: text ? JSON.parse(text) : null };
@@ -117,6 +129,43 @@ try {
   });
   assert.equal(session.status, 200);
   accessToken = session.data.access_token;
+  let seededItemId = "";
+  if (verifyUncachedDeletion) {
+    const bootstrap = await api("/functions/v1/library-api/v1/bootstrap", {
+      token: accessToken,
+      method: "POST",
+      body: {},
+      headers: { "X-Request-Id": randomUUID() },
+    });
+    assert.equal(bootstrap.status, 200);
+    const seeded = await api("/functions/v1/library-api/v1/items", {
+      token: accessToken,
+      method: "POST",
+      headers: { "X-Request-Id": randomUUID() },
+      body: {
+        url: `https://list-delete.invalid/${randomUUID()}`,
+        title: "목록 삭제 검증",
+      },
+    });
+    assert.equal(seeded.status, 201);
+    seededItemId = seeded.data.item.id;
+    const classified = await api(
+      "/functions/v1/library-api/v1/internal/classify",
+      {
+        method: "POST",
+        body: { limit: 20 },
+      },
+    );
+    assert.equal(classified.status, 200);
+    const stable = await api(
+      `/functions/v1/library-api/v1/items/${seededItemId}`,
+      {
+        token: accessToken,
+      },
+    );
+    assert.equal(stable.status, 200);
+    assert.notEqual(stable.data.classification_state, "pending");
+  }
 
   const gradle = process.platform === "win32"
     ? "android\\gradlew.bat"
@@ -127,11 +176,14 @@ try {
     ":app:connectedDebugAndroidTest",
     "--console=plain",
     "-PlocalBackendTests=true",
+    "-PisolatedDeviceTests=true",
     "-Pandroid.testInstrumentationRunnerArguments.class=com.linkvault.app.LocalLibraryIntegrationTest",
     `-Pandroid.testInstrumentationRunnerArguments.fixtureEmail=${fixtureEmail}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixturePassword=${fixturePassword}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureUrl=${fixtureUrl}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureKind=${fixtureKind}`,
+    `-Pandroid.testInstrumentationRunnerArguments.fixtureDelete=${verifyListDeletion}`,
+    `-Pandroid.testInstrumentationRunnerArguments.fixtureSeededItemId=${seededItemId}`,
   ];
   const env = {
     ...process.env,
@@ -267,41 +319,52 @@ try {
     token: accessToken,
   });
   assert.equal(items.status, 200);
-  assert.equal(items.data.items.length, 1, "device created exactly one item");
-  const detail = await api(
-    `/functions/v1/library-api/v1/items/${items.data.items[0].id}`,
-    { token: accessToken },
-  );
-  assert.equal(detail.status, 200);
-  assert.equal(detail.data.url, fixtureUrl, "original URL persisted");
-  assert.equal(
-    detail.data.note,
-    null,
-    "URL-only UI save requires no note",
-  );
-  assert.equal(
-    detail.data.user_title,
-    null,
-    "URL-only UI save requires no manual title",
-  );
-  assert.ok(
-    detail.data.fetched_title?.includes(fixture.title),
-    "public title reached the saved item",
-  );
-  assert.equal(
-    detail.data.metadata_state,
-    fixture.metadata,
-    "metadata completeness matches the public fixture",
-  );
-  assert.equal(
-    detail.data.classification_state,
-    fixture.classification,
-    "automatic classification settled",
-  );
-  if (fixtureKind === "instagram-travel") {
-    assert.ok(
-      detail.data.category_refs.some((category) => category.name === "여행"),
+  if (verifyListDeletion) {
+    assert.equal(
+      items.data.items.length,
+      0,
+      "confirmed list deletion persists on the server",
     );
+    console.log(
+      "PASS device list delete: cancel preserves, confirm deletes, restart remains deleted",
+    );
+  } else {
+    assert.equal(items.data.items.length, 1, "device created exactly one item");
+    const detail = await api(
+      `/functions/v1/library-api/v1/items/${items.data.items[0].id}`,
+      { token: accessToken },
+    );
+    assert.equal(detail.status, 200);
+    assert.equal(detail.data.url, fixtureUrl, "original URL persisted");
+    assert.equal(
+      detail.data.note,
+      null,
+      "URL-only UI save requires no note",
+    );
+    assert.equal(
+      detail.data.user_title,
+      null,
+      "URL-only UI save requires no manual title",
+    );
+    assert.ok(
+      detail.data.fetched_title?.includes(fixture.title),
+      "public title reached the saved item",
+    );
+    assert.equal(
+      detail.data.metadata_state,
+      fixture.metadata,
+      "metadata completeness matches the public fixture",
+    );
+    assert.equal(
+      detail.data.classification_state,
+      fixture.classification,
+      "automatic classification settled",
+    );
+    if (fixtureKind === "instagram-travel") {
+      assert.ok(
+        detail.data.category_refs.some((category) => category.name === "여행"),
+      );
+    }
   }
   console.log(
     "PASS device UI -> real Auth session -> Edge API -> PostgreSQL -> reload",

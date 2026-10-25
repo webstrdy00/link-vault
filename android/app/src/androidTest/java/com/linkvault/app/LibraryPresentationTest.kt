@@ -2,36 +2,53 @@ package com.linkvault.app
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.test.platform.app.InstrumentationRegistry
+import com.linkvault.app.library.DetailContent
 import com.linkvault.app.library.LibraryCategoryRef
+import com.linkvault.app.library.LibraryDetailState
 import com.linkvault.app.library.LibraryItemCard
+import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.library.LibraryItemSummary
 import com.linkvault.app.library.LibraryRootHeader
 import com.linkvault.app.ui.VaultTheme
 import java.io.File
+import kotlin.math.abs
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -41,35 +58,46 @@ class LibraryPresentationTest {
     val compose = createComposeRule()
 
     @Test
-    fun editorialRowKeepsRealMetadataVisibleAndWholeRowOpensDetail() {
+    fun editorialRowCompactsLongTitleToTwoLinesAndWholeRowOpensDetail() {
         val title =
             "아주 긴 한글 제목도 잘리지 않고 개인 보관함에서 충분히 읽을 수 있어야 합니다 "
                 .repeat(4)
                 .trim()
+        val compactTitle = title.take(59).trimEnd() + "…"
         var openedItemId: String? = null
 
         compose.setContent {
             VaultTheme {
-                LibraryItemCard(
-                    item = LibraryItemSummary(
-                        id = "long-title-item",
-                        url = "https://example.com/long-title",
-                        displayTitle = title,
-                        source = "example.com",
-                        noteExcerpt = "나중에 다시 찾기 위한 짧은 메모",
-                        categoryRefs = listOf(
-                            LibraryCategoryRef(name = "여행"),
-                            LibraryCategoryRef(name = "업무·학습"),
+                Column(modifier = Modifier.width(220.dp)) {
+                    LibraryItemCard(
+                        item = LibraryItemSummary(
+                            id = "long-title-item",
+                            url = "https://example.com/long-title",
+                            displayTitle = title,
+                            source = "example.com",
+                            noteExcerpt = "나중에 다시 찾기 위한 짧은 메모",
+                            categoryRefs = listOf(
+                                LibraryCategoryRef(name = "여행"),
+                                LibraryCategoryRef(name = "업무·학습"),
+                            ),
+                            hasAttachment = true,
+                            createdAt = "2026-09-20T12:00:00Z",
                         ),
-                        hasAttachment = true,
-                        createdAt = "2026-09-20T12:00:00Z",
-                    ),
-                    onOpenDetail = { openedItemId = it },
-                )
+                        onOpenDetail = { openedItemId = it },
+                    )
+                }
             }
         }
 
-        compose.onNodeWithText(title).assertExists()
+        compose.onNodeWithText(title).assertDoesNotExist()
+        compose.onNodeWithText(compactTitle, useUnmergedTree = true)
+            .assertTextEquals(compactTitle)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertEquals(2, layouts.single().lineCount)
+                assertTrue(layouts.single().isLineEllipsized(1))
+            }
         compose.onNodeWithText("example.com").assertIsDisplayed()
         compose.onNodeWithText("여행 · 업무·학습").assertIsDisplayed()
         compose.onNodeWithText("첨부 있음").assertIsDisplayed()
@@ -101,6 +129,367 @@ class LibraryPresentationTest {
 
         compose.onNodeWithText(url).assertTextEquals(url)
         compose.onNodeWithText("첨부 있음").assertDoesNotExist()
+    }
+
+    @Test
+    fun observedThreadsPostShowsShortHeadingAndCompleteDescriptionWithoutExpanding() {
+        val heading = "You've got mail: a postcard from Mars!"
+        val acquiredText = "$heading To mark the Curiosity rover’s 5,000th day on the Red Planet, " +
+            "this new postcard combines two panoramas captured by the rover's navigation cameras."
+        showDetail(
+            LibraryItemDetail(
+                id = "public-threads-presentation-fixture",
+                version = 1,
+                url = "https://www.threads.com/@nasa/post/DdXJKzbkqPg",
+                displayTitle = acquiredText,
+                fetchedTitle = acquiredText,
+                description = acquiredText,
+            ),
+        )
+
+        compose.onNodeWithText(heading).assertIsDisplayed()
+        assertNoDetailClutter()
+        compose.onAllNodesWithText(acquiredText).assertCountEquals(1)
+        compose.onNodeWithText(acquiredText).performScrollTo()
+            .assertIsDisplayed()
+            .assertTextEquals(acquiredText)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertFalse(layouts.single().hasVisualOverflow)
+            }
+        compose.onNodeWithText("가져온 제목").assertDoesNotExist()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+        File(context.cacheDir, "threads-short-title-description.png").outputStream().use {
+            assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it))
+        }
+    }
+
+    @Test
+    fun detailShowsFullBodyOnceWithoutDuplicatingDescriptionOrRawProvenance() {
+        val title = "첫 문장으로 알아보는 여행 기록. " + "가져온 긴 제목의 나머지 내용 ".repeat(8)
+        val body = "본문 첫 줄\n" + "생략하면 안 되는 본문 문장입니다.\n".repeat(8) + "본문 마지막 줄 😀"
+        val description = "설명 첫 줄\n" + "미리보기 설명도 끝까지 보입니다.\n".repeat(8) + "설명 마지막 줄 😀"
+        val sharedText = "공유할 때 받은 원래 글\n줄바꿈을 유지합니다."
+        val url = "https://example.com/" + "original-url-".repeat(10)
+        var openedUrl: String? = null
+        showDetail(
+            item = LibraryItemDetail(
+                id = "full-acquired-text",
+                version = 1,
+                url = url,
+                displayTitle = title,
+                fetchedTitle = title,
+                sharedText = sharedText,
+                bodyText = body,
+                description = description,
+                note = "내가 따로 남긴 메모",
+                categoryRefs = listOf(LibraryCategoryRef(name = "여행")),
+            ),
+            onOpenOriginal = { openedUrl = it },
+        )
+
+        compose.onNodeWithText("첫 문장으로 알아보는 여행 기록.").assertIsDisplayed()
+        compose.onNodeWithText(title).assertDoesNotExist()
+        compose.onNodeWithText(sharedText).assertDoesNotExist()
+        compose.onNodeWithText("가져온 제목").assertDoesNotExist()
+        compose.onNodeWithText("내가 따로 남긴 메모").assertDoesNotExist()
+        compose.onNodeWithText("여행").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("원문 열기").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(url, openedUrl) }
+        listOf(body).forEach { fullText ->
+            compose.onNodeWithText(fullText)
+                .performScrollTo()
+                .assertTextEquals(fullText)
+                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                    val layouts = mutableListOf<TextLayoutResult>()
+                    assertTrue(action(layouts))
+                    val layout = layouts.single()
+                    assertTrue(layout.lineCount > 3)
+                    assertFalse(layout.hasVisualOverflow)
+                    assertEquals(fullText.length, layout.getLineEnd(layout.lineCount - 1))
+                }
+        }
+
+        compose.onNodeWithText(title).assertDoesNotExist()
+        compose.onNodeWithText(sharedText).assertDoesNotExist()
+        compose.onAllNodesWithText(body).assertCountEquals(1)
+        compose.onNodeWithText(description).assertDoesNotExist()
+        compose.onNodeWithText("표시 제목 원문").assertDoesNotExist()
+        assertNoDetailClutter()
+    }
+
+    @Test
+    fun detailPrefersTheManualTitleWithoutInferringATopicFromDescription() {
+        val userTitle = "  내가\t정한 제목입니다.  " + "내 제목의 원래 뒷부분 ".repeat(8)
+        val displayTitle = "서버가 고른 제목입니다. 원래 표시 제목의 뒷부분입니다."
+        val fetchedTitle = "@example_account"
+        val description = "맛집에 대한 긴 설명입니다. 계정 이름을 주제로 바꾸지 않습니다."
+        showDetail(
+            item = LibraryItemDetail(
+                id = "manual-title",
+                version = 2,
+                url = "https://example.com/manual-title",
+                displayTitle = displayTitle,
+                userTitle = userTitle,
+                fetchedTitle = fetchedTitle,
+                description = description,
+            ),
+        )
+
+        compose.onNodeWithText("내가 정한 제목입니다.").assertIsDisplayed()
+        compose.onNodeWithText("서버가 고른 제목입니다.").assertDoesNotExist()
+        compose.onNodeWithText(userTitle).assertDoesNotExist()
+        compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
+        compose.onNodeWithText(description).performScrollTo().assertTextEquals(description)
+        compose.onNodeWithText(userTitle).assertDoesNotExist()
+        compose.onNodeWithText(displayTitle).assertDoesNotExist()
+        compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
+        compose.onNodeWithText("본문").assertDoesNotExist()
+        assertNoDetailClutter()
+    }
+
+    @Test
+    fun detailKeepsAccountDisplayTitleRatherThanInventingATopicFromDescription() {
+        val description = "카페에 대한 유용한 설명입니다. 가져온 설명을 그대로 보여 줍니다."
+        showDetail(
+            item = LibraryItemDetail(
+                id = "account-title",
+                version = 1,
+                url = "https://example.com/account-post",
+                source = "threads",
+                displayTitle = "@example_account",
+                userTitle = " \t ",
+                fetchedTitle = "@example_account",
+                description = description,
+            ),
+        )
+
+        compose.onNodeWithText("@example_account").assertIsDisplayed()
+        compose.onNodeWithText("카페에 대한 유용한 설명입니다.").assertDoesNotExist()
+        compose.onNodeWithText(description).performScrollTo().assertTextEquals(description)
+    }
+
+    @Test
+    fun detailCompactsFallbackUrlButKeepsTheOriginalActionAndOmitsBlankContent() {
+        val url = "https://example.com/" + "😀".repeat(65)
+        val compactUrl = "https://example.com/" + "😀".repeat(39) + "…"
+        var openedUrl: String? = null
+        showDetail(
+            item = LibraryItemDetail(
+                id = "fallback-detail",
+                version = 1,
+                url = url,
+                displayTitle = " \n ",
+                bodyText = " \t ",
+                description = "\n ",
+            ),
+            onOpenOriginal = { openedUrl = it },
+        )
+
+        compose.onNodeWithText(compactUrl).assertTextEquals(compactUrl)
+        compose.onNodeWithText(url).assertTextEquals(url)
+        compose.onNodeWithText("원문 열기").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(url, openedUrl) }
+        compose.onNodeWithText("본문").assertDoesNotExist()
+        compose.onNodeWithText("미리보기 설명").assertDoesNotExist()
+        compose.onNodeWithText("저장된 내용 보기").assertDoesNotExist()
+    }
+
+    @Test
+    fun detailCentersReadableFrameAndTitleWithBackAtTheRightEdge() {
+        var backCalls = 0
+        showDetail(publicTextDetail(), onBack = { backCalls++ })
+
+        assertDetailGeometry()
+        assertNoDetailClutter()
+        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(publicText)
+        captureDetail("clean-detail-centered-public-text.png")
+        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, backCalls) }
+    }
+
+    @Test
+    fun narrowDetailKeepsRightBackAndFullTextInsideItsFrame() {
+        showDetail(publicTextDetail(), viewportWidth = 260.dp)
+
+        assertDetailGeometry()
+        compose.onNodeWithTag("detail-content")
+            .performScrollTo()
+            .assertTextEquals(publicText)
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertFalse(layouts.single().hasVisualOverflow)
+                assertEquals(publicText.length, layouts.single().getLineEnd(layouts.single().lineCount - 1))
+            }
+        val frame = compose.onNodeWithTag("detail-frame").getUnclippedBoundsInRoot()
+        val content = compose.onNodeWithTag("detail-content").getUnclippedBoundsInRoot()
+        assertTrue(content.left >= frame.left && content.right <= frame.right)
+        captureDetail("clean-detail-narrow-public-text.png")
+    }
+
+    @Test
+    fun imageAndCategoryEditorsRequireExplicitMoreActions() {
+        var imageActions = 0
+        var categoryActions = 0
+        showDetail(
+            publicTextDetail(),
+            onManageImages = { imageActions++ },
+            onManageCategories = { categoryActions++ },
+        )
+
+        compose.onNodeWithTag("detail-manage-images").assertDoesNotExist()
+        compose.onNodeWithTag("detail-manage-categories").assertDoesNotExist()
+        assertNoDetailClutter()
+        compose.onNodeWithTag("detail-more").performClick()
+        compose.onNodeWithTag("detail-manage-images").assertTextEquals("이미지 관리").performClick()
+        compose.runOnIdle {
+            assertEquals(1, imageActions)
+            assertEquals(0, categoryActions)
+        }
+        compose.onNodeWithTag("detail-more").performClick()
+        compose.onNodeWithTag("detail-manage-categories").assertTextEquals("분류 수정").performClick()
+        compose.runOnIdle { assertEquals(1, categoryActions) }
+    }
+
+    @Test
+    fun urlOnlyBodyAndDescriptionFallBackToMeaningfulSharedText() {
+        val url = "https://example.com/shared"
+        val shared = "공유받은 글의 첫 줄입니다.\n줄바꿈과 마지막 문장도 유지합니다."
+        showDetail(
+            LibraryItemDetail(
+                id = "shared-content",
+                version = 1,
+                url = url,
+                displayTitle = "공유받은 글",
+                bodyText = "  $url\nhttps://example.com/another  ",
+                description = url,
+                sharedText = shared,
+            ),
+        )
+
+        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(shared)
+        compose.onAllNodesWithText(shared).assertCountEquals(1)
+    }
+
+    @Test
+    fun urlOnlySharedTextDoesNotInventAcquiredContent() {
+        val url = "https://example.com/url-only"
+        showDetail(
+            LibraryItemDetail(id = "url-only", version = 1, url = url, sharedText = "  $url  "),
+        )
+
+        compose.onNodeWithTag("detail-content").assertDoesNotExist()
+        assertNoDetailClutter()
+    }
+
+    private fun assertDetailGeometry() {
+        val viewport = compose.onNodeWithTag("detail-viewport").getUnclippedBoundsInRoot()
+        val frame = compose.onNodeWithTag("detail-frame").getUnclippedBoundsInRoot()
+        val title = compose.onNodeWithTag("detail-title").getUnclippedBoundsInRoot()
+        val back = compose.onNodeWithTag("detail-back").getUnclippedBoundsInRoot()
+        assertTrue(frame.right - frame.left <= 841.dp)
+        val frameCenter = (frame.left.value + frame.right.value) / 2f
+        assertEquals((viewport.left.value + viewport.right.value) / 2f, frameCenter, 1f)
+        assertEquals(frameCenter, (title.left.value + title.right.value) / 2f, 1f)
+        assertEquals(frame.right.value, back.right.value, 1f)
+        assertTrue((back.left.value + back.right.value) / 2f > frameCenter)
+        assertTrue(back.left >= frame.left)
+        compose.onNodeWithTag("detail-title")
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertEquals(TextAlign.Center, layouts.single().layoutInput.style.textAlign)
+            }
+        compose.onNodeWithTag("detail-back").assertTextEquals("보관함 목록")
+        compose.onAllNodesWithText("보관함 목록").assertCountEquals(1)
+        compose.onNodeWithText("뒤로").assertDoesNotExist()
+        assertTrue(abs((frame.left - viewport.left).value - (viewport.right - frame.right).value) <= 1f)
+    }
+
+    private fun assertNoDetailClutter() {
+        listOf(
+            "처리 정보 보기", "저장된 내용 보기", "세부 정보", "가져온 제목", "본문", "미리보기 설명",
+            "텍스트 인식 (OCR)", "이미지 첨부", "이미지 상태", "검색 준비", "자동 분류",
+            "링크 정보를 가져오지 못했어요.", "이미지에서 글자를 읽지 못했어요.",
+        ).forEach { compose.onNodeWithText(it).assertDoesNotExist() }
+    }
+
+    private fun captureDetail(name: String) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        File(context.cacheDir, name).outputStream().use { output ->
+            assertTrue(compose.onRoot().captureToImage().asAndroidBitmap().compress(Bitmap.CompressFormat.PNG, 100, output))
+        }
+    }
+
+    private val publicText =
+        "Four score and seven years ago our fathers brought forth on this continent, " +
+            "a new nation, conceived in Liberty, and dedicated to the proposition that all men are created equal.\n\n" +
+            "Now we are engaged in a great civil war, testing whether that nation, or any nation so conceived " +
+            "and so dedicated, can long endure. We are met on a great battle-field of that war. " +
+            "We have come to dedicate a portion of that field, as a final resting place for those who here " +
+            "gave their lives that that nation might live. It is altogether fitting and proper that we should do this."
+
+    private fun publicTextDetail() = LibraryItemDetail(
+        id = "public-domain-reading",
+        version = 1,
+        url = "https://www.loc.gov/exhibits/gettysburg-address/",
+        displayTitle = "Gettysburg Address. A public-domain reading fixture.",
+        bodyText = publicText,
+        description = publicText,
+        source = "Library of Congress",
+        createdAt = "2026-10-24T03:00:00Z",
+        categoryRefs = listOf(LibraryCategoryRef(name = "업무·학습")),
+        metadataState = "failed",
+        ocrState = "failed",
+        classificationState = "pending",
+    )
+
+    private fun showDetail(
+        item: LibraryItemDetail,
+        onOpenOriginal: (String) -> Unit = {},
+        viewportWidth: Dp? = null,
+        onBack: () -> Unit = {},
+        onManageImages: () -> Unit = {},
+        onManageCategories: () -> Unit = {},
+    ) {
+        compose.setContent {
+            VaultTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+                    Column(
+                        modifier = Modifier
+                            .then(if (viewportWidth != null) Modifier.width(viewportWidth) else Modifier.fillMaxSize())
+                            .fillMaxHeight()
+                            .verticalScroll(rememberScrollState())
+                            .testTag("detail-viewport")
+                            .padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        DetailContent(
+                            detail = LibraryDetailState.Loaded(item),
+                            edit = null,
+                            delete = null,
+                            onBackToList = onBack,
+                            onOpenOriginal = onOpenOriginal,
+                            onBeginEdit = {},
+                            onEditTitleChange = {},
+                            onEditNoteChange = {},
+                            onSaveEdit = {},
+                            onCancelEdit = {},
+                            onLoadLatest = {},
+                            onConfirmAgain = {},
+                            onBeginDelete = {},
+                            onManageImages = onManageImages,
+                            onManageCategories = onManageCategories,
+                        )
+                    }
+                    }
+                }
+            }
+        }
     }
 
     @Test

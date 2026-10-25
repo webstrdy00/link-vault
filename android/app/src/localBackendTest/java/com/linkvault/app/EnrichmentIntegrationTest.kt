@@ -233,30 +233,17 @@ class EnrichmentIntegrationTest {
         val itemId = fixtureItemId()
         awaitTag("detail-$itemId")
         clickTag("detail-$itemId")
-        awaitText("처리 정보 보기")
-        compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
-        awaitText("처리 정보")
-        awaitText("링크 정보 ·", substring = true)
+        awaitTag("detail-back")
+        awaitText("원문 열기")
+        compose.onNodeWithText("원문 열기").assertExists()
+        compose.onNodeWithText("처리 정보 보기").assertDoesNotExist()
+        compose.onNodeWithText("링크 정보 ·", substring = true).assertDoesNotExist()
     }
 
-    private fun assertMetadataUiIsIndependent() {
-        if (compose.onAllNodesWithText("세부 정보 보기").fetchSemanticsNodes().isNotEmpty()) {
-            compose.onNodeWithText("세부 정보 보기").performScrollTo().performClick()
-        }
-        val possibleMessages = listOf(
-            "메타데이터 조회를 완료했어요. 페이지 전체 보존을 의미하지는 않아요.",
-            "일부 메타데이터만 저장됐어요.",
-            "이 주소는 자동 메타데이터 조회를 지원하지 않아요.",
-            "메타데이터 조회를 완료하지 못했어요.",
-            "서버에서 메타데이터를 조회하고 있어요.",
-            "메타데이터 상태를 확인할 수 없어요.",
-        )
-        assertTrue(
-            "metadata has a separate bounded UI state",
-            possibleMessages.any { message ->
-                compose.onAllNodesWithText(message).fetchSemanticsNodes().isNotEmpty()
-            },
-        )
+    private fun openImageManagement() {
+        clickTag("detail-more")
+        clickRoot("detail-manage-images")
+        awaitText("이미지 첨부")
     }
 
     private suspend fun currentItem(): JsonObject = app.accountClient.libraryRequest(
@@ -340,12 +327,12 @@ class EnrichmentIntegrationTest {
                     .performScrollTo()
                     .performClick()
                 openFixtureDetail()
-                assertMetadataUiIsIndependent()
                 assertTrue(
                     "opening a target never starts shared-image preparation",
                     app.attachmentRepository.observe(ownerId, itemId).first().isEmpty(),
                 )
                 assertTrue(app.incomingImageStore.draft.value != null)
+                openImageManagement()
                 awaitTag("attachment-import-shared")
 
                 setNetwork(enabled = false)
@@ -363,6 +350,8 @@ class EnrichmentIntegrationTest {
                 awaitText("기기에 보관됨 · 전송 대기 중")
 
                 scenario.recreate()
+                awaitTag("detail-back")
+                openImageManagement()
                 awaitTag("attachment-queue-status")
                 val restored = awaitPending(ownerId, itemId) {
                     it.operationId == pending.operationId
@@ -411,12 +400,12 @@ class EnrichmentIntegrationTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
             openFixtureDetail()
+            openImageManagement()
             awaitText("이미지 첨부 ·", substring = true)
             setNetwork(enabled = true)
             awaitText("서버에 저장된 활성 이미지가 있어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             awaitPreviewImage()
-            assertMetadataUiIsIndependent()
 
             val (firstItem, firstAsset) = awaitActiveAsset()
             val firstAssetId = firstAsset.getValue("id").jsonPrimitive.content
@@ -440,8 +429,9 @@ class EnrichmentIntegrationTest {
             )
             assertEquals(firstAssetId, (failedOcr.getValue("active_asset") as JsonObject)
                 .getValue("id").jsonPrimitive.content)
-            compose.onNodeWithText("보관함 목록").performScrollTo().performClick()
+            clickTag("detail-back")
             openFixtureDetail()
+            openImageManagement()
             awaitText("OCR은 실패했지만 서버의 이미지는 정상적으로 유지돼요.")
             clickTag("attachment-ocr-retry")
             awaitText("OCR 텍스트가 저장돼 있어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
@@ -471,6 +461,7 @@ class EnrichmentIntegrationTest {
                 .performScrollTo()
                 .performClick()
             openFixtureDetail()
+            openImageManagement()
             awaitText("서버에 저장된 활성 이미지가 있어요.")
             val beforeReplacement = currentItem()
             val expectedReplacementVersion = beforeReplacement.getValue("version").jsonPrimitive.long
@@ -527,6 +518,7 @@ class EnrichmentIntegrationTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
             openFixtureDetail()
+            openImageManagement()
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             compose.onNodeWithTag("attachment-delete", useUnmergedTree = true)
                 .performScrollTo()

@@ -19,11 +19,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.AlertDialog
@@ -134,17 +137,19 @@ fun LibraryScreen(
     )
     val onBackFromDetail =
         if (initialItemId != null) onBack else libraryViewModel::closeDetail
+    val isDeleteConfirmation = state.delete?.status is LibraryDeleteStatus.Confirming ||
+        state.delete?.status is LibraryDeleteStatus.ReadyToConfirm
     val navigateBack: () -> Unit = {
         when {
             state.edit != null -> libraryViewModel.cancelEdit()
-            state.delete != null -> libraryViewModel.cancelDeleteConfirmation()
+            isDeleteConfirmation -> libraryViewModel.cancelDeleteConfirmation()
             state.detail !is LibraryDetailState.None -> onBackFromDetail()
             else -> onBack()
         }
     }
     BackHandler(
         enabled = state.availability is LibraryAvailability.Ready &&
-            state.detail !is LibraryDetailState.None,
+            (state.detail !is LibraryDetailState.None || isDeleteConfirmation),
         onBack = navigateBack,
     )
 
@@ -162,6 +167,7 @@ fun LibraryScreen(
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         if (onAdd != null && state.detail is LibraryDetailState.None) {
             LibraryRootHeader(
@@ -171,7 +177,7 @@ fun LibraryScreen(
                 onRefresh = libraryViewModel::refresh,
                 onDiscover = onDiscover,
             )
-        } else {
+        } else if (state.detail is LibraryDetailState.None) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -273,6 +279,7 @@ fun LibraryScreen(
                         LibraryListContent(
                             state = state,
                             onOpenDetail = libraryViewModel::openDetail,
+                            onDelete = libraryViewModel::beginDeleteFromList,
                             onRetry = libraryViewModel::retryList,
                             onLoadMore = libraryViewModel::loadMore,
                             onAdd = onAdd,
@@ -290,6 +297,12 @@ fun LibraryScreen(
                     )
 
                     is LibraryDetailState.Loaded -> {
+                        var activeEditor by rememberSaveable(detail.item.id) {
+                            mutableStateOf<String?>(null)
+                        }
+                        LaunchedEffect(detail.item.id, incomingImageUri) {
+                            if (incomingImageUri != null) activeEditor = "images"
+                        }
                         DetailContent(
                             detail = detail,
                             edit = state.edit,
@@ -304,11 +317,19 @@ fun LibraryScreen(
                             onLoadLatest = libraryViewModel::loadLatestForEdit,
                             onConfirmAgain = libraryViewModel::confirmEditAgain,
                             onBeginDelete = libraryViewModel::beginDelete,
-                            onCancelDelete = libraryViewModel::cancelDeleteConfirmation,
-                            onConfirmDelete = libraryViewModel::confirmDelete,
-                            onLoadLatestDelete = libraryViewModel::loadLatestForDelete,
+                            onManageImages = { activeEditor = "images" },
+                            onManageCategories = { activeEditor = "categories" },
                         )
-                        if (state.edit == null && state.delete == null) {
+                        val canShowEditor = state.edit == null && state.delete == null
+                        Column(
+                            modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                        ) {
+                            if (activeEditor != null && canShowEditor) {
+                                TextButton(onClick = { activeEditor = null }) {
+                                    Text("관리 닫기")
+                                }
+                            }
                             AttachmentControls(
                                 item = detail.item,
                                 client = client,
@@ -317,20 +338,29 @@ fun LibraryScreen(
                                 onRefreshItem = { libraryViewModel.refreshDetail(detail.item.id) },
                                 incomingImageUri = incomingImageUri,
                                 onIncomingImageConsumed = onIncomingImageConsumed,
+                                showEditor = activeEditor == "images" && canShowEditor,
                             )
-                            ClassificationControls(
-                                client = client,
-                                outbox = outbox,
-                                entryId = entryId,
-                                item = detail.item,
-                                onRefresh = {
-                                    libraryViewModel.refreshDetail(detail.item.id)
-                                },
-                                onEditNote = libraryViewModel::beginEdit,
-                            )
+                            if (activeEditor == "categories" && canShowEditor) {
+                                ClassificationControls(
+                                    client = client,
+                                    outbox = outbox,
+                                    entryId = entryId,
+                                    item = detail.item,
+                                    onRefresh = {
+                                        libraryViewModel.refreshDetail(detail.item.id)
+                                    },
+                                    onEditNote = libraryViewModel::beginEdit,
+                                )
+                            }
                         }
                     }
                 }
+                LibraryDeleteContent(
+                    delete = state.delete,
+                    onCancel = libraryViewModel::cancelDeleteConfirmation,
+                    onConfirm = libraryViewModel::confirmDelete,
+                    onLoadLatest = libraryViewModel::loadLatestForDelete,
+                )
             }
         }
     }
@@ -876,9 +906,10 @@ private fun OutboxContent(
 }
 
 @Composable
-private fun LibraryListContent(
+internal fun LibraryListContent(
     state: LibraryUiState,
     onOpenDetail: (String) -> Unit,
+    onDelete: (String) -> Unit,
     onRetry: () -> Unit,
     onLoadMore: () -> Unit,
     onAdd: (() -> Unit)?,
@@ -920,6 +951,8 @@ private fun LibraryListContent(
                     LibraryItemCard(
                         item = item,
                         onOpenDetail = onOpenDetail,
+                        onDelete = onDelete,
+                        deleteEnabled = state.delete == null && (item.version ?: 0L) > 0L,
                     )
                 }
             }
@@ -963,6 +996,8 @@ private fun LibraryListContent(
 internal fun LibraryItemCard(
     item: LibraryItemSummary,
     onOpenDetail: (String) -> Unit,
+    onDelete: ((String) -> Unit)? = null,
+    deleteEnabled: Boolean = true,
 ) {
     val source = item.source?.takeUnless(String::isBlank)?.let { value ->
         DiscoverySource.entries.firstOrNull { it.apiValue == value }?.displayName ?: value
@@ -970,9 +1005,10 @@ internal fun LibraryItemCard(
     val date = formatLibraryDate(item.updatedAt ?: item.createdAt)
     val categoryNames = item.categoryRefs.mapNotNull { it.name?.takeUnless(String::isBlank) }
     Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
         Column(
             modifier = Modifier
-                .fillMaxWidth()
+                .weight(1f)
                 .clickable { onOpenDetail(item.id) }
                 .testTag("detail-${item.id}")
                 .padding(vertical = 18.dp),
@@ -1029,12 +1065,12 @@ internal fun LibraryItemCard(
                 }
             }
             Text(
-                text = item.displayTitle?.takeUnless(String::isBlank) ?: item.url,
+                text = compactLibraryTitle(item.displayTitle, item.url),
                 modifier = Modifier.padding(top = if (source != null || date != null) 8.dp else 0.dp),
                 fontSize = 17.sp,
                 lineHeight = 24.sp,
                 fontWeight = FontWeight.SemiBold,
-                maxLines = 3,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             item.noteExcerpt?.takeUnless(String::isBlank)?.let { note ->
@@ -1082,6 +1118,20 @@ internal fun LibraryItemCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
+            }
+        }
+            if (onDelete != null) {
+                IconButton(
+                    onClick = { onDelete(item.id) },
+                    enabled = deleteEnabled,
+                    modifier = Modifier.testTag("list-delete-${item.id}"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Delete,
+                        contentDescription = "${compactLibraryTitle(item.displayTitle, item.url)} 삭제",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -1201,9 +1251,12 @@ private fun ListFailure(
 
 @Composable
 private fun DetailLoadingContent(onBackToList: () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        TextButton(onClick = onBackToList) {
-            Text("보관함 목록")
+    Column(
+        modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            DetailBackButton(onBackToList)
         }
         LoadingMessage("상세 정보를 불러오고 있어요.")
     }
@@ -1215,9 +1268,12 @@ private fun DetailFailureContent(
     onBackToList: () -> Unit,
     onRetry: () -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        TextButton(onClick = onBackToList) {
-            Text("보관함 목록")
+    Column(
+        modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            DetailBackButton(onBackToList)
         }
         Text(message, color = MaterialTheme.colorScheme.error)
         Button(
@@ -1231,7 +1287,64 @@ private fun DetailFailureContent(
 }
 
 @Composable
-private fun DetailContent(
+private fun DetailBackButton(onBackToList: () -> Unit) {
+    TextButton(onClick = onBackToList, modifier = Modifier.testTag("detail-back")) {
+        Text("보관함 목록")
+    }
+}
+
+@Composable
+internal fun LibraryDeleteContent(
+    delete: LibraryDeleteUiState?,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+    onLoadLatest: () -> Unit,
+) {
+    if (delete == null) return
+    val deleteStatus = delete.status
+    if (
+        deleteStatus is LibraryDeleteStatus.Confirming ||
+        deleteStatus is LibraryDeleteStatus.ReadyToConfirm
+    ) {
+        val reviewingConflict = deleteStatus is LibraryDeleteStatus.ReadyToConfirm
+        AlertDialog(
+            onDismissRequest = onCancel,
+            title = {
+                Text(if (reviewingConflict) "최신 내용 삭제 확인" else "링크를 삭제할까요?")
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (reviewingConflict) {
+                        Text("다른 변경이 있어 최신 내용을 확인했어요. 삭제하려면 다시 확인해 주세요.")
+                    }
+                    Text("저장된 링크와 앱에 올린 첨부 파일이 삭제되며 되돌릴 수 없어요.")
+                    Text("휴대전화에 있는 원본 파일은 삭제하지 않아요.")
+                    Text("오프라인에서는 연결된 뒤 삭제되며, 그전까지 링크가 보일 수 있어요.")
+                    delete.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onConfirm,
+                    modifier = Modifier.testTag("confirm-item-delete"),
+                    shape = MaterialTheme.shapes.small,
+                ) {
+                    Text("삭제")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onCancel) {
+                    Text("취소")
+                }
+            },
+        )
+    } else {
+        DeleteStatusContent(delete = delete, onLoadLatest = onLoadLatest)
+    }
+}
+
+@Composable
+internal fun DetailContent(
     detail: LibraryDetailState.Loaded,
     edit: LibraryEditUiState?,
     delete: LibraryDeleteUiState?,
@@ -1245,54 +1358,20 @@ private fun DetailContent(
     onLoadLatest: () -> Unit,
     onConfirmAgain: () -> Unit,
     onBeginDelete: () -> Unit,
-    onCancelDelete: () -> Unit,
-    onConfirmDelete: () -> Unit,
-    onLoadLatestDelete: () -> Unit,
+    onManageImages: (() -> Unit)? = null,
+    onManageCategories: (() -> Unit)? = null,
 ) {
     val item = detail.item
     var showMoreMenu by rememberSaveable(item.id) { mutableStateOf(false) }
-    var showSavedContent by rememberSaveable(item.id) { mutableStateOf(false) }
-    var showProcessingDetails by rememberSaveable(item.id) { mutableStateOf(false) }
-    val deleteStatus = delete?.status
-    if (
-        deleteStatus is LibraryDeleteStatus.Confirming ||
-        deleteStatus is LibraryDeleteStatus.ReadyToConfirm
+    Column(
+        modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth().testTag("detail-frame"),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        val reviewingConflict = deleteStatus is LibraryDeleteStatus.ReadyToConfirm
-        AlertDialog(
-            onDismissRequest = onCancelDelete,
-            title = {
-                Text(if (reviewingConflict) "최신 내용 삭제 확인" else "링크를 삭제할까요?")
-            },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (reviewingConflict) {
-                        Text("다른 변경이 있어 최신 내용을 확인했어요. 삭제하려면 다시 확인해 주세요.")
-                    }
-                    Text("저장된 링크와 앱에 올린 첨부 파일이 삭제되며 되돌릴 수 없어요.")
-                    Text("휴대전화에 있는 원본 파일은 삭제하지 않아요.")
-                    Text("오프라인에서는 연결된 뒤 삭제되며, 그전까지 링크가 보일 수 있어요.")
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = onConfirmDelete,
-                    modifier = Modifier.testTag("confirm-item-delete"),
-                    shape = MaterialTheme.shapes.small,
-                ) {
-                    Text("삭제")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = onCancelDelete) {
-                    Text("취소")
-                }
-            },
-        )
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (edit != null) {
-            TextButton(onClick = onCancelEdit) {
+            TextButton(
+                onClick = onCancelEdit,
+                modifier = Modifier.align(Alignment.End).testTag("detail-back"),
+            ) {
                 Text("상세로 돌아가기")
             }
             EditContent(
@@ -1312,15 +1391,13 @@ private fun DetailContent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            TextButton(onClick = onBackToList) {
-                Text("보관함 목록")
-            }
             Box {
-                TextButton(
+                IconButton(
                     onClick = { showMoreMenu = true },
                     enabled = delete == null,
+                    modifier = Modifier.testTag("detail-more"),
                 ) {
-                    Text("더보기")
+                    Icon(Icons.Outlined.MoreVert, contentDescription = "더보기")
                 }
                 DropdownMenu(
                     expanded = showMoreMenu,
@@ -1334,6 +1411,27 @@ private fun DetailContent(
                         },
                         enabled = item.version != null,
                     )
+                    if (onManageImages != null) {
+                        DropdownMenuItem(
+                            text = { Text("이미지 관리") },
+                            onClick = {
+                                showMoreMenu = false
+                                onManageImages()
+                            },
+                            modifier = Modifier.testTag("detail-manage-images"),
+                        )
+                    }
+                    if (onManageCategories != null) {
+                        DropdownMenuItem(
+                            text = { Text("분류 수정") },
+                            onClick = {
+                                showMoreMenu = false
+                                onManageCategories()
+                            },
+                            enabled = item.version != null,
+                            modifier = Modifier.testTag("detail-manage-categories"),
+                        )
+                    }
                     DropdownMenuItem(
                         text = {
                             Text(
@@ -1350,13 +1448,7 @@ private fun DetailContent(
                     )
                 }
             }
-        }
-        if (detail.isCached) {
-            Text(
-                text = "마지막 동기화 · ${detail.fetchedAt?.let(::formatCachedAt) ?: "시각 확인 불가"}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            DetailBackButton(onBackToList)
         }
         val sourceAndDate = listOfNotNull(
             item.source?.takeUnless(String::isBlank),
@@ -1369,15 +1461,19 @@ private fun DetailContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        SelectionContainer {
+        SelectionContainer(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = item.displayTitle?.takeUnless(String::isBlank) ?: item.url,
+                text = compactLibraryTitle(
+                    item.userTitle?.takeUnless(String::isBlank) ?: item.displayTitle,
+                    item.url,
+                ),
                 style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.fillMaxWidth().testTag("detail-title"),
                 fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
-        }
-        item.note?.takeUnless(String::isBlank)?.let { note ->
-            DetailValue("메모", note)
         }
         CategorySummary(
             names = item.categoryRefs.mapNotNull { it.name?.takeUnless(String::isBlank) },
@@ -1397,74 +1493,27 @@ private fun DetailContent(
             Text("원문 열기")
         }
 
-        if (item.version == null) {
-            Text(
-                text = "최신 정보를 불러온 뒤 수정하거나 삭제할 수 있어요.",
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-        if (delete != null) {
-            DeleteStatusContent(
-                delete = delete,
-                onLoadLatest = onLoadLatestDelete,
-            )
-        }
-
-        val hasSavedContent = listOf(
-            item.userTitle,
-            item.fetchedTitle,
-            item.description,
-            item.sharedText,
-            item.bodyText,
-        ).any { !it.isNullOrBlank() }
-        if (hasSavedContent) {
-            TextButton(onClick = { showSavedContent = !showSavedContent }) {
-                Text(if (showSavedContent) "저장된 내용 접기" else "저장된 내용 보기")
-            }
-            if (showSavedContent) {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    DetailValueIfPresent("내가 정한 제목", item.userTitle)
-                    DetailValueIfPresent("가져온 제목", item.fetchedTitle)
-                    DetailValueIfPresent("설명", item.description)
-                    DetailValueIfPresent("공유된 글", item.sharedText)
-                    DetailValueIfPresent("본문", item.bodyText)
-                }
-            }
-        }
-
-        item.processingProblems().forEach { problem ->
-            Text(
-                text = problem,
-                color = MaterialTheme.colorScheme.error,
-                fontWeight = FontWeight.SemiBold,
-            )
-        }
-        TextButton(onClick = { showProcessingDetails = !showProcessingDetails }) {
-            Text(if (showProcessingDetails) "처리 정보 접기" else "처리 정보 보기")
-        }
-        if (showProcessingDetails) {
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                shape = MaterialTheme.shapes.medium,
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text(
-                        text = "처리 정보",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Text("링크 정보 · ${metadataStateLabel(item.metadataState)}")
-                    Text("이미지 글자 · ${ocrStateLabel(item.ocrState)}")
-                    Text("자동 분류 · ${classificationStateLabel(item.classificationState)}")
-                    Text("검색 준비 · ${cueStateLabel(item.cueState)}")
-                }
+        acquiredContent(item)?.let { content ->
+            SelectionContainer {
+                Text(
+                    text = content,
+                    modifier = Modifier.fillMaxWidth().testTag("detail-content"),
+                    style = MaterialTheme.typography.bodyLarge,
+                    lineHeight = 28.sp,
+                )
             }
         }
     }
 }
+
+private fun acquiredContent(item: LibraryItemDetail): String? =
+    listOf(item.bodyText, item.description, item.sharedText).firstOrNull { text ->
+        !text.isNullOrBlank() && !text.trim().split(Regex("\\s+")).all { part ->
+            part.startsWith("https://", ignoreCase = true) ||
+                part.startsWith("http://", ignoreCase = true) ||
+                part.startsWith("www.", ignoreCase = true)
+        }
+    }
 
 @Composable
 private fun DeleteStatusContent(
@@ -1707,23 +1756,6 @@ private fun DraftComparison(form: LibraryEditForm, latest: LibraryItemDetail?) {
 }
 
 @Composable
-private fun DetailValue(label: String, value: String?) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(label, fontWeight = FontWeight.SemiBold)
-        SelectionContainer {
-            Text(value?.takeUnless(String::isBlank) ?: "없음")
-        }
-    }
-}
-
-@Composable
-private fun DetailValueIfPresent(label: String, value: String?) {
-    value?.takeUnless(String::isBlank)?.let {
-        DetailValue(label, it)
-    }
-}
-
-@Composable
 private fun CategorySummary(names: List<String>) {
     if (names.isEmpty()) return
     Surface(
@@ -1756,43 +1788,6 @@ private fun LibraryItemSummary.processingProblem(): String? {
         if (ocrState == "failed") add("이미지에서 글자를 읽지 못했어요.")
     }
     return problems.takeIf { it.isNotEmpty() }?.joinToString(" ")
-}
-
-private fun LibraryItemDetail.processingProblems(): List<String> = buildList {
-    if (metadataState == "failed") add("링크 정보를 가져오지 못했어요.")
-    if (ocrState == "failed") add("이미지에서 글자를 읽지 못했어요.")
-}
-
-private fun metadataStateLabel(state: String?): String = when (state) {
-    "queued", "running" -> "가져오는 중"
-    "ready" -> "완료"
-    "partial" -> "일부만 가져옴"
-    "unsupported" -> "가져올 수 없음"
-    "failed" -> "실패"
-    else -> "확인 중"
-}
-
-private fun ocrStateLabel(state: String?): String = when (state) {
-    "queued", "running" -> "읽는 중"
-    "ready" -> "완료"
-    "not_requested" -> "해당 없음"
-    "failed" -> "실패"
-    else -> "확인 중"
-}
-
-private fun classificationStateLabel(state: String?): String = when (state) {
-    "pending" -> "정리 중"
-    "automatic" -> "자동 정리됨"
-    "manual" -> "직접 정리됨"
-    "unclassified" -> "분류 없음"
-    else -> "확인 중"
-}
-
-private fun cueStateLabel(state: String?): String = when (state) {
-    "pending" -> "준비 중"
-    "missing", "limited" -> "메모 보완 가능"
-    "available" -> "완료"
-    else -> "확인 중"
 }
 
 private fun OutboxState.queueMessage(): String = when (this) {

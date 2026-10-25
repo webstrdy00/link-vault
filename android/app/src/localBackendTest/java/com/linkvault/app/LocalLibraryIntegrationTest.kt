@@ -21,6 +21,12 @@ import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.logging.LogLevel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -43,7 +49,7 @@ class LocalLibraryIntegrationTest {
         compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
     }
 
-    private fun openSingleSavedItem() {
+    private fun openSingleSavedItem(): String {
         val itemCard = androidx.compose.ui.test.SemanticsMatcher("library item card") { node ->
             node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("detail-") == true
         }
@@ -51,9 +57,13 @@ class LocalLibraryIntegrationTest {
             compose.onAllNodes(itemCard, useUnmergedTree = true)
                 .fetchSemanticsNodes().isNotEmpty()
         }
-        compose.onNode(itemCard, useUnmergedTree = true)
+        val node = compose.onNode(itemCard, useUnmergedTree = true)
+        val itemId = checkNotNull(node.fetchSemanticsNode().config.getOrNull(SemanticsProperties.TestTag))
+            .removePrefix("detail-")
+        node
             .performScrollTo()
             .performClick()
+        return itemId
     }
 
     @Test
@@ -91,7 +101,7 @@ class LocalLibraryIntegrationTest {
                 action = Intent.ACTION_MAIN
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
-            ActivityScenario.launch<MainActivity>(intent).use {
+            ActivityScenario.launch<MainActivity>(intent).use { scenario ->
                 clickRoot("root-account")
                 compose.waitUntil(timeoutMillis = 20_000) {
                     compose.onAllNodesWithText("로그인했어요").fetchSemanticsNodes().isNotEmpty() ||
@@ -101,6 +111,32 @@ class LocalLibraryIntegrationTest {
                     compose.onNodeWithText("승인 상태 다시 확인").performScrollTo().performClick()
                 }
                 awaitText("로그인했어요")
+                val app = ApplicationProvider.getApplicationContext<LinkVaultApplication>()
+                val owner = checkNotNull(app.accountClient.sessionUserId())
+                val seededItemId = arguments.getString("fixtureSeededItemId").orEmpty()
+                if (seededItemId.isNotBlank()) {
+                    clickRoot("root-library")
+                    awaitText("목록 삭제 검증")
+                    assertNull(app.outboxRepository.readCachedDetail(owner, seededItemId))
+                    compose.onNodeWithTag("list-delete-$seededItemId").performScrollTo().performClick()
+                    awaitText("링크를 삭제할까요?")
+                    compose.onNodeWithText("취소").performClick()
+                    assertNull(app.outboxRepository.readCachedDetail(owner, seededItemId))
+                    assertEquals(seededItemId, app.accountClient.libraryRequest(owner, "/items/$seededItemId")
+                        .getValue("id").jsonPrimitive.content)
+                    compose.onNodeWithTag("detail-back").assertDoesNotExist()
+                    compose.onNodeWithTag("list-delete-$seededItemId").performScrollTo().performClick()
+                    compose.onNodeWithTag("confirm-item-delete").performClick()
+                    compose.waitUntil(timeoutMillis = 30_000) {
+                        compose.onAllNodes(hasTestTag("detail-$seededItemId")).fetchSemanticsNodes().isEmpty()
+                    }
+                    scenario.recreate()
+                    clickRoot("root-library")
+                    compose.onNodeWithTag("detail-$seededItemId").assertDoesNotExist()
+                    assertTrue(app.accountClient.libraryRequest(owner, "/items")
+                        .toString().contains(seededItemId).not())
+                    return@use
+                }
                 clickRoot("root-capture")
                 compose.onNodeWithText("공유 텍스트 또는 원문 URL").performScrollTo()
                     .performTextReplacement(fixtureUrl)
@@ -111,19 +147,37 @@ class LocalLibraryIntegrationTest {
                 compose.onNodeWithText("저장").performScrollTo().assertIsEnabled().performClick()
                 awaitText("저장했어요.")
                 compose.onNodeWithText("새로고침").performScrollTo().performClick()
-                openSingleSavedItem()
-                awaitText("처리 정보 보기")
-                compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
-                awaitText("처리 정보")
+                val itemId = openSingleSavedItem()
+                compose.onNodeWithTag("detail-back").assertExists()
+                compose.onNodeWithText("처리 정보 보기").assertDoesNotExist()
+                compose.onNodeWithText("저장된 내용 보기").assertDoesNotExist()
+                compose.onNodeWithText("이미지 첨부").assertDoesNotExist()
                 awaitText(expectedTitle, substring = true, timeoutMillis = 180_000)
-                awaitText(if (fixtureKind == "generic") "링크 정보 · 일부만 가져옴" else "링크 정보 · 완료")
-                val classificationLabel = if (fixtureKind == "instagram-travel") {
-                    "자동 분류 · 자동 정리됨"
-                } else {
-                    "자동 분류 · 분류 없음"
+                withTimeout(180_000) {
+                    while (app.accountClient.libraryRequest(owner, "/items/$itemId")
+                            ["classification_state"]?.jsonPrimitive?.content == "pending") {
+                        delay(1_000)
+                    }
                 }
-                compose.waitUntil(timeoutMillis = 180_000) {
-                    compose.onAllNodesWithText(classificationLabel).fetchSemanticsNodes().isNotEmpty()
+                if (fixtureKind == "instagram-travel") awaitText("여행", timeoutMillis = 180_000)
+                if (arguments.getString("fixtureDelete") == "true") {
+                    compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+                    compose.onNodeWithTag("list-delete-$itemId").performScrollTo().performClick()
+                    awaitText("링크를 삭제할까요?")
+                    compose.onNodeWithText("취소").performClick()
+                    compose.onNodeWithTag("detail-$itemId").assertExists()
+                    assertEquals(itemId, app.accountClient.libraryRequest(owner, "/items/$itemId")
+                        .getValue("id").jsonPrimitive.content)
+                    compose.onNodeWithTag("list-delete-$itemId").performScrollTo().performClick()
+                    compose.onNodeWithTag("confirm-item-delete").performClick()
+                    compose.waitUntil(timeoutMillis = 30_000) {
+                        compose.onAllNodes(hasTestTag("detail-$itemId")).fetchSemanticsNodes().isEmpty()
+                    }
+                    scenario.recreate()
+                    clickRoot("root-library")
+                    compose.onNodeWithTag("detail-$itemId").assertDoesNotExist()
+                    assertTrue(app.accountClient.libraryRequest(owner, "/items")
+                        .toString().contains(itemId).not())
                 }
             }
         } finally {

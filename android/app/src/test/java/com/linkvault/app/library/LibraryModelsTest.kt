@@ -1,9 +1,13 @@
 package com.linkvault.app.library
 
+import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxState
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -12,6 +16,115 @@ import org.junit.Test
 
 class LibraryModelsTest {
     private val requestId = "11111111-2222-4333-8444-555555555555"
+    private val deleteItemId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    private val otherItemId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+
+    @Test
+    fun compactTitleNormalizesWhitespaceAndPrefersFirstSentenceOrLine() {
+        val examples = mapOf(
+            "  제주\t맛집   안내  " to "제주 맛집 안내",
+            "\n  첫 줄에서 찾을 수 있는 제목 \t\r\n두 번째 줄도 보관합니다." to
+                "첫 줄에서 찾을 수 있는 제목",
+            "맛집을 찾았습니다. 다음 주에 방문할 계획입니다." to "맛집을 찾았습니다.",
+            "A useful English summary! More details remain." to "A useful English summary!",
+            "버전 3.14의 새 기능입니다. 나머지 설명도 남겨 둡니다." to "버전 3.14의 새 기능입니다.",
+            "\"Keep it simple.\" There is more to read." to "\"Keep it simple.\"",
+            "😀 이모지도 보관합니다! 다음 문장입니다." to "😀 이모지도 보관합니다!",
+        )
+
+        examples.forEach { (original, expected) ->
+            assertEquals(original, expected, compactLibraryTitle(original, "https://example.com"))
+        }
+    }
+
+    @Test
+    fun compactTitleCapsLongUnpunctuatedTextAndDoesNotSkipTheFirstLongLine() {
+        val korean = "아주 긴 한글 제목을 그대로 찾을 수 있어야 합니다 ".repeat(6).trim()
+        val english = "An English post without punctuation keeps all its original words ".repeat(4)
+            .trim()
+
+        listOf(korean, english, "가".repeat(70) + "\n짧은 두 번째 줄").forEach { original ->
+            assertEquals(
+                original.take(59).trimEnd() + "…",
+                compactLibraryTitle(original, "https://example.com"),
+            )
+        }
+        assertEquals("가".repeat(60), compactLibraryTitle("가".repeat(60), "unused"))
+        assertEquals("가".repeat(59) + "…", compactLibraryTitle("가".repeat(61), "unused"))
+    }
+
+    @Test
+    fun compactTitleCountsTheEllipsisAndDoesNotSplitEmojiSurrogatePairs() {
+        assertEquals("😀".repeat(60), compactLibraryTitle("😀".repeat(60), "unused"))
+        val compact = compactLibraryTitle("가".repeat(58) + "😀나다", "unused")
+
+        assertEquals("가".repeat(58) + "😀…", compact)
+        assertEquals(60, compact.codePointLength())
+        assertEquals(
+            "😀".repeat(59) + "…",
+            compactLibraryTitle("😀".repeat(61), "unused"),
+        )
+    }
+
+    @Test
+    fun compactTitleFallsBackToTheUrlForMissingOrBlankTitles() {
+        val url = "https://example.com/article"
+        val longUrl = "https://example.com/" + "a".repeat(80)
+
+        listOf(null, "", " \t\r\n ").forEach { title ->
+            assertEquals(url, compactLibraryTitle(title, url))
+            assertEquals(longUrl.take(59) + "…", compactLibraryTitle(title, longUrl))
+        }
+        assertEquals("@example_account", compactLibraryTitle("@example_account", url))
+    }
+
+    @Test
+    fun compactPresentationLeavesAcquiredFieldsAndManualEditSourceUntouched() {
+        val userTitle = "  내가 정한 제목\t" + "원문 단어 ".repeat(20) + "\n마지막 줄"
+        val fetchedTitle = "  가져온 제목입니다.\n" + "가져온 전체 내용 ".repeat(20)
+        val displayTitle = "  표시 제목입니다.  두 번째 문장입니다.\n세 번째 줄"
+        val description = "미리보기 설명 첫 줄\n" + "설명을 생략하지 않습니다. ".repeat(20)
+        val bodyText = "본문 첫 줄\n" + "본문도 그대로 보관합니다. ".repeat(20)
+        val sharedText = "공유한 원래 글\nhttps://example.com/article"
+        val detail = parseLibraryDetailResponse(
+            buildJsonObject {
+                put("id", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                put("version", 7)
+                put("url", "https://example.com/article")
+                put("display_title", displayTitle)
+                put("user_title", userTitle)
+                put("fetched_title", fetchedTitle)
+                put("description", description)
+                put("body_text", bodyText)
+                put("shared_text", sharedText)
+                put("note", "수동 메모")
+            },
+        )
+
+        assertEquals("표시 제목입니다.", compactLibraryTitle(detail.displayTitle, detail.url))
+        assertTrue(compactLibraryTitle(detail.userTitle, detail.url).endsWith("…"))
+        assertEquals(displayTitle, detail.displayTitle)
+        assertEquals(userTitle, detail.userTitle)
+        assertEquals(fetchedTitle, detail.fetchedTitle)
+        assertEquals(description, detail.description)
+        assertEquals(bodyText, detail.bodyText)
+        assertEquals(sharedText, detail.sharedText)
+
+        val preparation = prepareLibraryEdit(
+            ownerId = "member-a",
+            itemId = detail.id,
+            requestId = requestId,
+            expectedVersion = requireNotNull(detail.version),
+            originalTitle = detail.userTitle,
+            originalNote = detail.note,
+            form = LibraryEditForm(title = detail.userTitle.orEmpty(), note = "메모만 수정"),
+        ) as LibraryEditPreparation.Valid
+        val body = Json.parseToJsonElement(preparation.operation.body).jsonObject
+        assertEquals(userTitle, preparation.operation.originalTitle)
+        assertEquals(userTitle, preparation.operation.form.title)
+        assertFalse(body.containsKey("title"))
+        assertEquals("메모만 수정", body.getValue("note").jsonPrimitive.content)
+    }
 
     @Test
     fun validationCountsUnicodeCodePointsAtEveryServerLimit() {
@@ -598,6 +711,214 @@ class LibraryModelsTest {
         assertEquals("POST", retryAttempt.method)
         assertEquals("/items", retryAttempt.path)
     }
+
+    @Test
+    fun listDeleteUsesCurrentSummaryVersionWithoutOpeningOrReplacingDetail() {
+        val state = listDeleteState().copy(
+            detail = LibraryDetailState.Loaded(
+                LibraryItemDetail(id = deleteItemId, version = 2, url = "https://example.com/old"),
+            ),
+        )
+        val confirming = state.withListDeleteConfirmation(deleteItemId)
+        val deletion = requireNotNull(confirming.delete)
+
+        assertEquals(deleteItemId, deletion.itemId)
+        assertEquals(9L, deletion.expectedVersion)
+        assertEquals(LibraryDeleteStatus.Confirming, deletion.status)
+        assertEquals(state.detail, confirming.detail)
+        assertEquals(state.items, confirming.items)
+        assertEquals(state.outboxEntries, confirming.outboxEntries)
+
+        val refreshed = state.copy(items = state.items.map { it.copy(version = 12) })
+            .withListDeleteConfirmation(deleteItemId)
+        assertEquals(12L, refreshed.delete?.expectedVersion)
+        val operation = prepareLibraryDelete(
+            ownerId = "member-a",
+            itemId = deletion.itemId,
+            requestId = requestId,
+            expectedVersion = deletion.expectedVersion,
+        )
+        assertEquals("member-a", operation.ownerId)
+        assertEquals(deleteItemId, operation.itemId)
+        assertEquals(requestId, operation.requestId)
+        assertEquals("""{"expected_version":9}""", operation.body)
+    }
+
+    @Test
+    fun listDeleteRejectsMissingInvalidAndUnavailableTargets() {
+        val state = listDeleteState()
+        assertEquals(state, state.withListDeleteConfirmation("missing"))
+        listOf(null, 0L, -1L).forEach { version ->
+            val unknownVersion = state.copy(items = listOf(state.items.first().copy(version = version)))
+            assertEquals(unknownVersion, unknownVersion.withListDeleteConfirmation(deleteItemId))
+        }
+        val invalidId = state.copy(items = listOf(state.items.first().copy(id = "invalid")))
+        assertEquals(invalidId, invalidId.withListDeleteConfirmation("invalid"))
+        listOf(LibraryAvailability.Checking, LibraryAvailability.SignInRequired("로그인 필요"))
+            .forEach { availability ->
+                val unavailable = state.copy(availability = availability)
+                assertEquals(unavailable, unavailable.withListDeleteConfirmation(deleteItemId))
+            }
+    }
+
+    @Test
+    fun listDeleteCannotReplaceAnExistingEditOrDeletion() {
+        val state = listDeleteState()
+        val editing = state.copy(
+            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("", "")),
+        )
+        assertEquals(editing, editing.withListDeleteConfirmation(deleteItemId))
+        val confirming = state.withListDeleteConfirmation(deleteItemId)
+        assertEquals(confirming, confirming.withListDeleteConfirmation(otherItemId))
+        val queued = confirming.copy(
+            delete = confirming.delete?.copy(status = LibraryDeleteStatus.Queued(requestId)),
+        )
+        assertEquals(queued, queued.withListDeleteConfirmation(otherItemId))
+    }
+
+    @Test
+    fun cancellingListConfirmationRestoresListWithoutCreatingAnOutboxRequest() {
+        val original = listDeleteState().copy(outboxEntries = listOf(deleteEntry(OutboxState.RETRY)))
+        val confirming = original.withListDeleteConfirmation(otherItemId)
+
+        assertEquals(LibraryDetailState.None, confirming.detail)
+        assertEquals(original, confirming.withDeleteConfirmationCancelled())
+        assertEquals(original.outboxEntries, confirming.outboxEntries)
+    }
+
+    @Test
+    fun listDeleteRestoresQueuedFailedAndBlockedRequestsWithoutSelectingDetail() {
+        val state = listDeleteState()
+        val expectedStatuses = mapOf(
+            OutboxState.PENDING to LibraryDeleteStatus.Queued(requestId),
+            OutboxState.RUNNING to LibraryDeleteStatus.Queued(requestId),
+            OutboxState.RETRY to LibraryDeleteStatus.Queued(requestId),
+            OutboxState.WAITING_LOGIN to LibraryDeleteStatus.Queued(requestId),
+            OutboxState.FAILED to LibraryDeleteStatus.Failed(requestId, "요청 실패"),
+            OutboxState.CONFLICT to LibraryDeleteStatus.Blocked(requestId, LibraryDeleteBlockReason.VERSION_CONFLICT),
+            OutboxState.EXPIRED to LibraryDeleteStatus.Blocked(requestId, LibraryDeleteBlockReason.EXPIRED),
+        )
+        expectedStatuses.forEach { (outboxState, expectedStatus) ->
+            val entry = deleteEntry(outboxState)
+            val restored = state.copy(delete = state.restoredDelete(listOf(entry), "member-a"))
+
+            assertEquals(outboxState.name, expectedStatus, restored.delete?.status)
+            assertEquals(deleteItemId, restored.delete?.itemId)
+            assertEquals(7L, restored.delete?.expectedVersion)
+            assertEquals(state.items, restored.items)
+            assertEquals(LibraryDetailState.None, restored.detail)
+            assertNull(restored.restoredDelete(listOf(entry), "member-a"))
+        }
+    }
+
+    @Test
+    fun listDeleteRestorationRejectsOtherOwnersItemsReceiptsAndMalformedVersions() {
+        val state = listDeleteState()
+        val entry = deleteEntry(OutboxState.CONFLICT)
+        val invalidEntries = listOf(
+            entry.copy(ownerId = "member-b"),
+            entry.copy(path = "/items/cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa"),
+            entry.copy(state = OutboxState.SAVED),
+            entry.copy(method = "PATCH"),
+            entry.copy(payloadJson = """{"expected_version":0}"""),
+            entry.copy(payloadJson = """{"expected_version":"7"}"""),
+            entry.copy(payloadJson = """{"expected_version":7,"extra":true}"""),
+        )
+
+        assertNull(state.restoredDelete(invalidEntries, "member-a"))
+        val selectedOther = state.copy(detail = LibraryDetailState.Loading(otherItemId))
+        assertNull(selectedOther.restoredDelete(listOf(entry), "member-a"))
+        val editing = state.copy(
+            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("", "")),
+        )
+        assertNull(editing.restoredDelete(listOf(entry), "member-a"))
+    }
+
+    @Test
+    fun reviewingListDeleteConflictKeepsListAndUnrelatedDetailUntilReconfirmed() {
+        val loading = listDeleteState().copy(
+            delete = LibraryDeleteUiState(
+                deleteItemId,
+                9,
+                LibraryDeleteStatus.LoadingLatest(requestId, LibraryDeleteBlockReason.VERSION_CONFLICT),
+            ),
+        )
+        val latest = LibraryDetailState.Loaded(
+            LibraryItemDetail(deleteItemId, 10, url = "https://example.com/latest"),
+        )
+        val ready = loading.withLatestDeleteVersion(latest, requestId)
+
+        assertEquals(LibraryDetailState.None, ready.detail)
+        assertEquals(loading.items, ready.items)
+        assertEquals(10L, ready.delete?.expectedVersion)
+        assertEquals(
+            LibraryDeleteStatus.ReadyToConfirm(requestId, LibraryDeleteBlockReason.VERSION_CONFLICT),
+            ready.delete?.status,
+        )
+        val cancelled = ready.withDeleteConfirmationCancelled()
+        assertEquals(
+            LibraryDeleteStatus.Blocked(requestId, LibraryDeleteBlockReason.VERSION_CONFLICT),
+            cancelled.delete?.status,
+        )
+        assertEquals(loading.items, cancelled.items)
+        assertEquals(10L, cancelled.delete?.expectedVersion)
+
+        val unrelated = loading.copy(detail = LibraryDetailState.Loading(otherItemId))
+        assertEquals(unrelated.detail, unrelated.withLatestDeleteVersion(latest, requestId).detail)
+        val selectedTarget = loading.copy(detail = LibraryDetailState.Loading(deleteItemId))
+        assertEquals(latest, selectedTarget.withLatestDeleteVersion(latest, requestId).detail)
+        assertEquals(loading, loading.withLatestDeleteVersion(latest, "different-request"))
+        assertEquals(
+            loading,
+            loading.withLatestDeleteVersion(latest.copy(item = latest.item.copy(id = otherItemId)), requestId),
+        )
+    }
+
+    @Test
+    fun listDeleteReceiptRemovesOnlyItsTargetAndKeepsUnrelatedSelectedDetailAndEditor() {
+        val state = listDeleteState().withListDeleteConfirmation(deleteItemId).copy(
+            detail = LibraryDetailState.Loading(otherItemId),
+            edit = LibraryEditUiState(otherItemId, 5, null, null, LibraryEditForm("draft", "note")),
+        )
+        val applied = state.withDeletedItems(setOf(deleteItemId), "삭제 완료")
+
+        assertEquals(listOf(state.items.last()), applied.items)
+        assertEquals(state.detail, applied.detail)
+        assertEquals(state.edit, applied.edit)
+        assertNull(applied.delete)
+        assertEquals("삭제 완료", applied.deletionNotice)
+        val listOnly = state.copy(detail = LibraryDetailState.None, edit = null)
+            .withDeletedItems(setOf(deleteItemId), "삭제 완료")
+        assertEquals(LibraryDetailState.None, listOnly.detail)
+        assertEquals(listOf(state.items.last()), listOnly.items)
+        val targetSelected = state.copy(detail = LibraryDetailState.Loading(deleteItemId), edit = null)
+            .withDeletedItems(setOf(deleteItemId), "삭제 완료")
+        assertEquals(LibraryDetailState.None, targetSelected.detail)
+    }
+
+    private fun listDeleteState() = LibraryUiState(
+        availability = LibraryAvailability.Ready,
+        form = LibrarySaveForm(initialUrl = null, sharedText = ""),
+        items = listOf(
+            LibraryItemSummary(deleteItemId, 9, url = "https://example.com/target"),
+            LibraryItemSummary(otherItemId, 5, url = "https://example.com/other"),
+        ),
+        isListLoading = false,
+    )
+
+    private fun deleteEntry(state: OutboxState) = OutboxEntry(
+        requestId = requestId,
+        ownerId = "member-a",
+        method = "DELETE",
+        path = "/items/$deleteItemId",
+        payloadJson = """{"expected_version":7}""",
+        state = state,
+        attemptCount = 1,
+        createdAt = 1,
+        expiresAt = 86_400_001,
+        nextAttemptAt = 1,
+        errorMessage = "요청 실패",
+    )
 
     private fun assertHasIssue(form: LibrarySaveForm, field: LibraryFormField) {
         assertTrue(validateLibrarySaveForm(form).any { it.field == field })

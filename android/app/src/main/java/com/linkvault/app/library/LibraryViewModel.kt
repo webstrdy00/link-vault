@@ -432,22 +432,23 @@ class LibraryViewModel internal constructor(
         )
     }
 
+    fun beginDeleteFromList(itemId: String) {
+        if (ownerId.isNullOrBlank() || !identityMatches()) {
+            invalidateIdentity()
+            return
+        }
+        if (deleteJob?.isActive == true || editJob?.isActive == true) return
+        if (itemId in deletedItemIds) return
+        val state = mutableUiState.value
+        val confirming = state.withListDeleteConfirmation(itemId)
+        if (confirming === state) return
+        restoreDelete(state.outboxEntries.filter { it.libraryItemDeleteIdOrNull() == itemId })
+        if (mutableUiState.value.delete == null) mutableUiState.value = confirming
+    }
+
     fun cancelDeleteConfirmation() {
         if (deleteJob?.isActive == true) return
-        val deletion = mutableUiState.value.delete ?: return
-        mutableUiState.value = mutableUiState.value.copy(
-            delete = when (val status = deletion.status) {
-                is LibraryDeleteStatus.ReadyToConfirm -> deletion.copy(
-                    status = LibraryDeleteStatus.Blocked(
-                        requestId = status.requestId,
-                        reason = status.reason,
-                    ),
-                    error = null,
-                )
-                LibraryDeleteStatus.Confirming -> null
-                else -> deletion
-            },
-        )
+        mutableUiState.value = mutableUiState.value.withDeleteConfirmationCancelled()
     }
 
     fun confirmDelete() {
@@ -514,7 +515,7 @@ class LibraryViewModel internal constructor(
                     cacheResponse = true,
                 )
                 val latestVersion = publication?.item?.version
-                if (publication == null || latestVersion == null) {
+                if (publication == null || latestVersion == null || latestVersion <= 0L) {
                     restoreBlockedDelete(deletion.itemId, blocked)
                     return@launch
                 }
@@ -525,16 +526,9 @@ class LibraryViewModel internal constructor(
                     current?.itemId == deletion.itemId &&
                     loading?.requestId == blocked.requestId
                 ) {
-                    mutableUiState.value = state.copy(
-                        detail = publication.toDetailState(),
-                        delete = current.copy(
-                            expectedVersion = latestVersion,
-                            status = LibraryDeleteStatus.ReadyToConfirm(
-                                requestId = blocked.requestId,
-                                reason = blocked.reason,
-                            ),
-                            error = null,
-                        ),
+                    mutableUiState.value = state.withLatestDeleteVersion(
+                        latest = publication.toDetailState(),
+                        requestId = blocked.requestId,
                     )
                 }
             } catch (error: CancellationException) {
@@ -1026,7 +1020,54 @@ class LibraryViewModel internal constructor(
             delete = current.copy(status = LibraryDeleteStatus.Queuing, error = null),
         )
         val job = viewModelScope.launch {
+            var checkingDetail = true
             try {
+                val cached = readCachedDetailOrNull(operation.ownerId, operation.itemId)
+                if (cached?.serverVersion != operation.expectedVersion) {
+                    val response = client.libraryRequest(
+                        expectedOwnerId = operation.ownerId,
+                        path = "/items/${operation.itemId}",
+                    )
+                    val publication = resolveDetailPublication(
+                        requestOwner = operation.ownerId,
+                        requestedItemId = operation.itemId,
+                        response = response,
+                        cacheResponse = true,
+                    )
+                    if (publication == null) {
+                        if (operation.itemId in deletedItemIds || !identityMatches()) return@launch
+                        throw IllegalStateException("The deletion target could not be verified.")
+                    }
+                    if (publication.item.version != operation.expectedVersion) {
+                        replacesRequestId?.let(replacedRequestIds::remove)
+                        val state = mutableUiState.value
+                        val deletion = state.delete
+                        if (
+                            pendingDeleteRequestId == operation.requestId &&
+                            pendingDeleteItemId == operation.itemId &&
+                            deletion?.itemId == operation.itemId &&
+                            deletion.status is LibraryDeleteStatus.Queuing
+                        ) {
+                            mutableUiState.value = state.copy(
+                                delete = deletion.copy(
+                                    status = LibraryDeleteStatus.Blocked(
+                                        requestId = replacesRequestId ?: operation.requestId,
+                                        reason = LibraryDeleteBlockReason.VERSION_CONFLICT,
+                                    ),
+                                ),
+                            )
+                        }
+                        releaseEditRequestOwnership(operation.ownerId, operation.requestId)
+                        pendingDeleteRequestId = null
+                        pendingDeleteItemId = null
+                        return@launch
+                    }
+                }
+                if (!responseBelongsTo(operation.ownerId)) {
+                    invalidateIdentity()
+                    return@launch
+                }
+                checkingDetail = false
                 outbox.enqueue(
                     ownerId = operation.ownerId,
                     requestId = operation.requestId,
@@ -1077,7 +1118,12 @@ class LibraryViewModel internal constructor(
                     mutableUiState.value = state.copy(
                         delete = deletion.copy(
                             status = fallbackStatus,
-                            error = error.localQueueMessage(),
+                            error = if (checkingDetail) {
+                                (error as? AccountClientException)?.safeLibraryMessage()
+                                    ?: "삭제할 링크의 최신 내용을 확인하지 못했어요. 네트워크 연결 후 다시 시도해 주세요."
+                            } else {
+                                error.localQueueMessage()
+                            },
                         ),
                     )
                 }
@@ -1218,6 +1264,7 @@ class LibraryViewModel internal constructor(
                     isShowingCache = false,
                     cacheFetchedAt = null,
                 )
+                restoreDelete(mutableUiState.value.outboxEntries)
                 succeeded = true
             } catch (error: CancellationException) {
                 throw error
@@ -1268,6 +1315,7 @@ class LibraryViewModel internal constructor(
                         isShowingCache = cachedItems.isNotEmpty(),
                         cacheFetchedAt = cachedFetchedAt,
                     )
+                    restoreDelete(mutableUiState.value.outboxEntries)
                 }
             }
         }
@@ -1390,16 +1438,9 @@ class LibraryViewModel internal constructor(
             pendingDeleteItemId = null
         }
         cachedItems = cachedItems.filterNot { it.id in deletedIds }
-        mutableUiState.value = state.copy(
-            items = state.items.filterNot { it.id in deletedIds },
-            detail = if (state.detail.itemIdOrNull() in deletedIds) {
-                LibraryDetailState.None
-            } else {
-                state.detail
-            },
-            edit = state.edit?.takeUnless { it.itemId in deletedIds },
-            delete = state.delete?.takeUnless { it.itemId in deletedIds },
-            deletionNotice = "삭제된 링크를 목록에서 숨겼어요. 이 항목은 다시 표시하지 않으며 되돌릴 수 없어요.",
+        mutableUiState.value = state.withDeletedItems(
+            deletedIds = deletedIds,
+            notice = "삭제된 링크를 목록에서 숨겼어요. 이 항목은 다시 표시하지 않으며 되돌릴 수 없어요.",
         )
     }
 
@@ -1536,52 +1577,19 @@ class LibraryViewModel internal constructor(
     }
 
     private fun restoreDelete(entries: List<OutboxEntry>) {
-        if (mutableUiState.value.delete != null) return
-        val openItemId = mutableUiState.value.detail.itemIdOrNull() ?: return
-        val entry = entries
-            .asSequence()
-            .filter { it.libraryItemDeleteIdOrNull() == openItemId }
-            .filter { it.state != OutboxState.SAVED }
-            .maxByOrNull { it.createdAt }
-            ?: return
-        val expectedVersion = entry.itemDeleteExpectedVersionOrNull() ?: return
-        val status = when (entry.state) {
-            OutboxState.PENDING,
-            OutboxState.RUNNING,
-            OutboxState.RETRY,
-            OutboxState.WAITING_LOGIN,
-            -> LibraryDeleteStatus.Queued(entry.requestId)
-
-            OutboxState.FAILED -> LibraryDeleteStatus.Failed(
-                requestId = entry.requestId,
-                message = entry.failureMessage(),
-            )
-
-            OutboxState.CONFLICT -> LibraryDeleteStatus.Blocked(
-                requestId = entry.requestId,
-                reason = LibraryDeleteBlockReason.VERSION_CONFLICT,
-            )
-
-            OutboxState.EXPIRED -> LibraryDeleteStatus.Blocked(
-                requestId = entry.requestId,
-                reason = LibraryDeleteBlockReason.EXPIRED,
-            )
-
-            OutboxState.SAVED -> return
-        }
-        if (!acquireEditRequestOwnership(entry.ownerId, entry.requestId)) return
-        pendingDeleteRequestId = entry.requestId
-        pendingDeleteItemId = openItemId
+        val boundOwner = ownerId ?: return
+        val deletion = mutableUiState.value.restoredDelete(entries, boundOwner) ?: return
+        val requestId = deletion.status.requestIdOrNull() ?: return
+        if (!acquireEditRequestOwnership(boundOwner, requestId)) return
+        pendingDeleteRequestId = requestId
+        pendingDeleteItemId = deletion.itemId
         mutableUiState.value = mutableUiState.value.copy(
-            delete = LibraryDeleteUiState(
-                itemId = openItemId,
-                expectedVersion = expectedVersion,
-                status = status,
-            ),
+            delete = deletion,
         )
     }
 
     private suspend fun restoreBlockedEdit(entries: List<OutboxEntry>) {
+        if (mutableUiState.value.delete != null) return
         val openItemId = when (val detail = mutableUiState.value.detail) {
             LibraryDetailState.None -> null
             is LibraryDetailState.Loading -> detail.itemId
@@ -1708,6 +1716,10 @@ class LibraryViewModel internal constructor(
                         preparedReceipts -= entry.requestId
                         return
                     }
+                    if (!responseBelongsTo(entry.ownerId)) {
+                        invalidateIdentity()
+                        return
+                    }
                     val state = mutableUiState.value
                     cachedItems = cachedItems.filterNot { it.id == deletedId }
                     val deletion = state.delete
@@ -1722,16 +1734,9 @@ class LibraryViewModel internal constructor(
                         ownedRequestId = ownedRequestId,
                         ownedItemId = deletion?.itemId,
                     )
-                    mutableUiState.value = state.copy(
-                        items = state.items.filterNot { it.id == deletedId },
-                        detail = if (state.detail.itemIdOrNull() == deletedId) {
-                            LibraryDetailState.None
-                        } else {
-                            state.detail
-                        },
-                        edit = if (state.edit?.itemId == deletedId) null else state.edit,
-                        delete = if (deletion?.itemId == deletedId) null else deletion,
-                        deletionNotice = if (receipt.alreadyDeleted) {
+                    mutableUiState.value = state.withDeletedItems(
+                        deletedIds = setOf(deletedId),
+                        notice = if (receipt.alreadyDeleted) {
                             "서버에 이미 없던 링크를 이 기기에서도 삭제 완료로 정리했어요. 되돌릴 수 없어요."
                         } else {
                             "링크를 목록에서 숨겼어요. 서버가 저장된 사본을 백그라운드에서 물리적으로 정리 중이며 되돌릴 수 없어요."
@@ -2058,6 +2063,7 @@ class LibraryViewModel internal constructor(
             isShowingCache = cachedItems.isNotEmpty() || state.isShowingCache,
             cacheFetchedAt = cachedFetchedAt ?: state.cacheFetchedAt,
         )
+        restoreDelete(mutableUiState.value.outboxEntries)
     }
 
     private suspend fun readCachedDetailOrNull(
@@ -2257,6 +2263,108 @@ data class LibraryUiState(
     val outboxEntries: List<OutboxEntry> = emptyList(),
     val receiptsAwaitingAcknowledgement: Set<String> = emptySet(),
 )
+
+internal fun LibraryUiState.withListDeleteConfirmation(itemId: String): LibraryUiState {
+    if (availability !is LibraryAvailability.Ready || edit != null || delete != null) return this
+    val item = items.firstOrNull { it.id == itemId } ?: return this
+    val version = item.version?.takeIf { it > 0L } ?: return this
+    if (!item.id.isCanonicalUuid()) return this
+    return copy(
+        delete = LibraryDeleteUiState(
+            itemId = item.id,
+            expectedVersion = version,
+            status = LibraryDeleteStatus.Confirming,
+        ),
+    )
+}
+
+internal fun LibraryUiState.withDeleteConfirmationCancelled(): LibraryUiState {
+    val deletion = delete ?: return this
+    return copy(
+        delete = when (val status = deletion.status) {
+            is LibraryDeleteStatus.ReadyToConfirm -> deletion.copy(
+                status = LibraryDeleteStatus.Blocked(status.requestId, status.reason),
+                error = null,
+            )
+            LibraryDeleteStatus.Confirming -> null
+            else -> deletion
+        },
+    )
+}
+
+internal fun LibraryUiState.withLatestDeleteVersion(
+    latest: LibraryDetailState.Loaded,
+    requestId: String,
+): LibraryUiState {
+    val deletion = delete ?: return this
+    val loading = deletion.status as? LibraryDeleteStatus.LoadingLatest ?: return this
+    val version = latest.item.version?.takeIf { it > 0L } ?: return this
+    if (deletion.itemId != latest.item.id || loading.requestId != requestId) return this
+    return copy(
+        detail = if (detail.itemIdOrNull() == latest.item.id) latest else detail,
+        delete = deletion.copy(
+            expectedVersion = version,
+            status = LibraryDeleteStatus.ReadyToConfirm(requestId, loading.reason),
+            error = null,
+        ),
+    )
+}
+
+internal fun LibraryUiState.withDeletedItems(
+    deletedIds: Set<String>,
+    notice: String,
+): LibraryUiState = copy(
+    items = items.filterNot { it.id in deletedIds },
+    detail = if (detail.itemIdOrNull() in deletedIds) LibraryDetailState.None else detail,
+    edit = edit?.takeUnless { it.itemId in deletedIds },
+    delete = delete?.takeUnless { it.itemId in deletedIds },
+    deletionNotice = notice,
+)
+
+internal fun LibraryUiState.restoredDelete(
+    entries: List<OutboxEntry>,
+    ownerId: String,
+): LibraryDeleteUiState? {
+    if (availability !is LibraryAvailability.Ready || delete != null || edit != null) return null
+    val selectedItemId = detail.itemIdOrNull()
+    val entry = entries
+        .asSequence()
+        .filter { it.ownerId == ownerId && it.state != OutboxState.SAVED }
+        .filter {
+            val itemId = it.libraryItemDeleteIdOrNull()
+            itemId != null && if (selectedItemId != null) {
+                itemId == selectedItemId
+            } else {
+                items.any { item -> item.id == itemId }
+            }
+        }
+        .filter { it.itemDeleteExpectedVersionOrNull() != null }
+        .maxByOrNull { it.createdAt }
+        ?: return null
+    val status = when (entry.state) {
+        OutboxState.PENDING,
+        OutboxState.RUNNING,
+        OutboxState.RETRY,
+        OutboxState.WAITING_LOGIN,
+        -> LibraryDeleteStatus.Queued(entry.requestId)
+
+        OutboxState.FAILED -> LibraryDeleteStatus.Failed(entry.requestId, entry.failureMessage())
+        OutboxState.CONFLICT -> LibraryDeleteStatus.Blocked(
+            entry.requestId,
+            LibraryDeleteBlockReason.VERSION_CONFLICT,
+        )
+        OutboxState.EXPIRED -> LibraryDeleteStatus.Blocked(
+            entry.requestId,
+            LibraryDeleteBlockReason.EXPIRED,
+        )
+        OutboxState.SAVED -> return null
+    }
+    return LibraryDeleteUiState(
+        itemId = checkNotNull(entry.libraryItemDeleteIdOrNull()),
+        expectedVersion = checkNotNull(entry.itemDeleteExpectedVersionOrNull()),
+        status = status,
+    )
+}
 
 internal class LibraryListRecoveryPolicy {
     var hasFailedRequest: Boolean = false

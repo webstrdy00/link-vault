@@ -161,16 +161,17 @@ class DeletionIntegrationTest {
 
     private fun openDetail(itemId: String) {
         clickTag("detail-$itemId")
-        awaitText("처리 정보 보기")
+        awaitTag("detail-back")
+        awaitText("원문 열기")
     }
 
     private fun beginDelete() {
-        clickText("더보기")
+        clickTag("detail-more")
         clickTag("delete-item")
     }
 
     private fun backToList() {
-        clickText("보관함 목록")
+        clickTag("detail-back")
     }
 
     private fun receiptFile() = File(app.filesDir, RECEIPT_FILE)
@@ -284,13 +285,29 @@ class DeletionIntegrationTest {
                     app.outboxRepository.observeOutbox(ownerId).first()
                         .none { it.method == "DELETE" && it.path == "/items/$acceptedItemId" },
                 )
-                beginDelete()
+                backToList()
+                clickTag("list-delete-$acceptedItemId")
+                awaitText("링크를 삭제할까요?")
+                clickText("취소")
+                awaitTag("detail-$acceptedItemId")
+                assertTrue(
+                    "cancelling a list deletion creates no delete request",
+                    app.outboxRepository.observeOutbox(ownerId).first()
+                        .none { it.method == "DELETE" && it.path == "/items/$acceptedItemId" },
+                )
+                assertFalse(app.outboxRepository.isItemDeleted(ownerId, acceptedItemId))
+                assertEquals(
+                    "cancelling leaves the server item and version unchanged",
+                    staleAccepted["version"],
+                    currentItem(acceptedItemId)["version"],
+                )
+                clickTag("list-delete-$acceptedItemId")
+                awaitText("링크를 삭제할까요?")
                 setNetwork(enabled = false)
                 clickTag("confirm-item-delete")
                 awaitText("삭제를 준비했어요. 연결되면 동기화합니다.")
                 assertFalse(app.outboxRepository.isItemDeleted(ownerId, acceptedItemId))
                 assertTrue(app.outboxRepository.readCachedDetail(ownerId, acceptedItemId) != null)
-                backToList()
                 awaitTag("detail-$acceptedItemId")
                 awaitText("삭제가 동기화될 때까지 이 링크가 보일 수 있어요.")
 

@@ -95,6 +95,10 @@ android {
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", buildConfigString("GOOGLE_WEB_CLIENT_ID"))
     }
 
+    if (providers.gradleProperty("isolatedDeviceTests").orNull == "true") {
+        buildTypes.getByName("debug").applicationIdSuffix = ".titleiconqa"
+    }
+
     if (releaseStoreFile != null) {
         signingConfigs {
             create("release") {

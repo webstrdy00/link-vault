@@ -61,6 +61,7 @@ fun AttachmentControls(
     onRefreshItem: () -> Unit,
     incomingImageUri: Uri? = null,
     onIncomingImageConsumed: () -> Unit = {},
+    showEditor: Boolean = false,
 ) {
     val context = LocalContext.current
     val currentOnIncomingImageConsumed by rememberUpdatedState(onIncomingImageConsumed)
@@ -124,6 +125,8 @@ fun AttachmentControls(
         attachmentViewModel.setVisible(true)
         onDispose { attachmentViewModel.setVisible(false) }
     }
+
+    if (!showEditor) return
 
     HorizontalDivider()
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {

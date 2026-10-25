@@ -21,6 +21,27 @@ const val LIBRARY_SHARED_TEXT_MAX_CODE_POINTS = 4000
 const val LIBRARY_CATEGORY_MAX_SELECTION = 5
 
 private val libraryJson = Json { ignoreUnknownKeys = true }
+private const val LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS = 60
+private val libraryTitleWhitespace = Regex("[\\s\\p{Z}]+")
+private val libraryTitleSentenceEnd = Regex("""[.!?。！？]+["'”’」』)]*(?= |$)""")
+
+internal fun compactLibraryTitle(title: String?, url: String): String {
+    val original = title?.takeUnless(String::isBlank) ?: url
+    val normalized = original.replace(libraryTitleWhitespace, " ").trim()
+    val firstLine = original.lineSequence()
+        .map { it.replace(libraryTitleWhitespace, " ").trim() }
+        .firstOrNull(String::isNotEmpty)
+    val firstSentence = libraryTitleSentenceEnd.find(normalized)?.let { boundary ->
+        normalized.substring(0, boundary.range.last + 1)
+    }
+    val preferred = listOfNotNull(firstLine, firstSentence)
+        .filter { it.codePointLength() <= LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS }
+        .minByOrNull(String::length)
+        ?: normalized
+    if (preferred.codePointLength() <= LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS) return preferred
+    val end = preferred.offsetByCodePoints(0, LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS - 1)
+    return preferred.substring(0, end).trimEnd() + "…"
+}
 
 data class LibrarySaveForm(
     val initialUrl: String?,

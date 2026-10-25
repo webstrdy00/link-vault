@@ -34,6 +34,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -41,6 +42,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -88,11 +90,12 @@ class DiscoveryIntegrationTest {
         compose.onNodeWithTag(tag, useUnmergedTree = true).performClick()
     }
 
-    private fun expandProcessingDetails() {
-        awaitText("처리 정보 보기")
-        compose.onNodeWithText("처리 정보 보기").performScrollTo().performClick()
-        awaitText("처리 정보")
-        awaitText("링크 정보 ·", substring = true)
+    private fun openDetailCategories() {
+        awaitTag("detail-back")
+        awaitText("원문 열기")
+        clickTag("detail-more")
+        clickTag("detail-manage-categories", scrollTo = false)
+        awaitText("카테고리")
     }
 
     private fun openCategoryManagement() {
@@ -205,8 +208,10 @@ class DiscoveryIntegrationTest {
 
                 clickTag("search-item-$aliasItemId")
                 awaitText("카카오톡 프로필 사진 엑셀")
+                openDetailCategories()
                 clickTag("current-category-$workCategoryId")
-                awaitText("표현: 엑셀 · 필드: user_title")
+                awaitText("분류에 반영된 표현 · 엑셀")
+                assertWorkExplanation(readItem(application, aliasItemId))
                 compose.onNodeWithText("신뢰도", substring = true).assertDoesNotExist()
                 compose.onNodeWithText("점수", substring = true).assertDoesNotExist()
 
@@ -221,13 +226,19 @@ class DiscoveryIntegrationTest {
                 closeCategoryManagement()
 
                 clickTag("search-item-$aliasItemId")
+                openDetailCategories()
+                compose.onNodeWithText("카테고리 관리").performScrollTo().performClick()
                 awaitText("직접 선택 (1 / 5)")
                 clickTag("classification-choice-$workCategoryId")
                 clickTag("classification-choice-$customCategoryId")
                 awaitText("직접 선택 (1 / 5)")
-                compose.onNodeWithText("선택한 분류 저장").performScrollTo().performClick()
+                compose.onNodeWithText("선택 저장").performScrollTo().performClick()
                 awaitText("분류를 저장했어요.")
-                awaitText("직접 선택한 분류")
+                assertEquals(
+                    true,
+                    readItem(application, aliasItemId)["manual_override"]
+                        ?.jsonPrimitive?.booleanOrNull,
+                )
                 awaitTag("current-category-$customCategoryId")
                 compose.onNodeWithTag(
                     "current-category-$workCategoryId",
@@ -235,7 +246,7 @@ class DiscoveryIntegrationTest {
                 ).assertDoesNotExist()
 
                 compose.onNodeWithText("자동 분류 다시 적용").performScrollTo().performClick()
-                awaitText("직접 만든 분류는 유지하고, 기본 분류를 다시 적용합니다.")
+                awaitText("직접 만든 카테고리는 유지하고 기본 카테고리를 다시 정리해요.")
                 val ownerId = checkNotNull(application.accountClient.sessionUserId())
                 val reapplyTrace = ReapplyOutboxTrace(aliasItemId)
                 val traceReady = CompletableDeferred<Unit>()
@@ -247,13 +258,17 @@ class DiscoveryIntegrationTest {
                 }
                 traceReady.await()
                 try {
-                    compose.onNodeWithText("확인")
+                    compose.onNodeWithText("다시 적용")
                         .performScrollTo()
                         .assertIsEnabled()
                         .performClick()
                     awaitTag("current-category-$workCategoryId")
                     awaitTag("current-category-$customCategoryId")
-                    awaitNoText("직접 선택한 분류")
+                    assertEquals(
+                        false,
+                        readItem(application, aliasItemId)["manual_override"]
+                            ?.jsonPrimitive?.booleanOrNull,
+                    )
                 } catch (error: Throwable) {
                     val screenshot = captureFixtureScreenshot()
                     val serverState = readReapplyServerState(
@@ -271,39 +286,80 @@ class DiscoveryIntegrationTest {
                     traceJob.cancelAndJoin()
                 }
                 clickTag("current-category-$workCategoryId")
-                awaitText("표현: 엑셀 · 필드: user_title")
+                awaitText("분류에 반영된 표현 · 엑셀")
+                assertWorkExplanation(readItem(application, aliasItemId))
 
                 clickRoot("root-discovery")
                 awaitTag("search-query")
                 compose.onNodeWithTag("search-query").performTextReplacement("")
                 applyNeedsCuesFilter()
                 clickTag("search-item-$cueItemId")
+                openDetailCategories()
                 awaitText(CUE_PROMPT)
                 compose.onNodeWithText("나중에").performScrollTo().performClick()
                 awaitText("현재 내용의 찾기 질문을 나중으로 미뤘어요.")
                 awaitNoText(CUE_PROMPT)
+                val dismissed = readItem(application, cueItemId)
+                assertEquals(true, dismissed["cue_prompt_dismissed"]?.jsonPrimitive?.booleanOrNull)
 
                 scenario.recreate()
                 compose.waitForIdle()
-                expandProcessingDetails()
+                awaitTag("detail-back")
+                compose.onNodeWithText("처리 정보 보기").assertDoesNotExist()
+                openDetailCategories()
+                assertEquals(
+                    true,
+                    readItem(application, cueItemId)["cue_prompt_dismissed"]
+                        ?.jsonPrimitive?.booleanOrNull,
+                )
                 compose.onNodeWithText(CUE_PROMPT).assertDoesNotExist()
 
-                compose.onNodeWithText("더보기").performScrollTo().performClick()
+                clickTag("detail-more")
                 awaitText("제목·메모 수정")
                 compose.onNodeWithText("제목·메모 수정").performScrollTo().performClick()
-                awaitText("수정 요청 보관")
-                compose.onNodeWithText("나중에 찾을 메모")
+                awaitText("변경 사항 저장")
+                compose.onNodeWithText("메모 (선택 사항)")
                     .performScrollTo()
                     .performTextReplacement("메모")
-                compose.onNodeWithText("수정 요청 보관").performScrollTo().performClick()
+                compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
                 awaitText("제목·메모를 저장했어요.")
-                compose.onNodeWithText("수정 닫기").performScrollTo().performClick()
+                compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
+                openDetailCategories()
                 awaitText(CUE_PROMPT)
+                val revised = readItem(application, cueItemId)
+                assertEquals("메모", revised["note"]?.jsonPrimitive?.contentOrNull)
+                assertEquals(false, revised["cue_prompt_dismissed"]?.jsonPrimitive?.booleanOrNull)
+                assertEquals("limited", revised["cue_state"]?.jsonPrimitive?.contentOrNull)
+                assertTrue(
+                    "editing the note advances the dismissed text revision",
+                    checkNotNull(revised["text_revision"]?.jsonPrimitive?.longOrNull) >
+                        checkNotNull(dismissed["text_revision"]?.jsonPrimitive?.longOrNull),
+                )
             }
         } finally {
             sessionClient.auth.clearSession()
             sessionClient.close()
         }
+    }
+
+    private suspend fun readItem(
+        application: LinkVaultApplication,
+        itemId: String,
+    ): JsonObject = application.accountClient.libraryRequest(
+        expectedOwnerId = checkNotNull(application.accountClient.sessionUserId()),
+        path = "/items/$itemId",
+    )
+
+    private fun assertWorkExplanation(item: JsonObject) {
+        assertTrue(
+            "automatic work classification retains the matched user-title expression",
+            item["classification_explanations"]?.jsonArray.orEmpty().any { element ->
+                val explanation = element.jsonObject
+                explanation["category_code"]?.jsonPrimitive?.contentOrNull == "work" &&
+                    explanation["field"]?.jsonPrimitive?.contentOrNull == "user_title" &&
+                    explanation["expression"]?.jsonPrimitive?.contentOrNull == "엑셀"
+            },
+        )
     }
 
     private fun captureFixtureScreenshot(): String {
@@ -410,7 +466,7 @@ class DiscoveryIntegrationTest {
     private companion object {
         const val UI_TIMEOUT_MILLIS = 60_000L
         const val CUSTOM_CATEGORY_NAME = "에뮬레이터분류"
-        const val CUE_PROMPT = "나중에 어떤 말로 찾을까요?"
+        const val CUE_PROMPT = "검색을 위한 메모"
         const val REAPPLY_SCREENSHOT_PATH = "/data/local/tmp/link-vault-reapply.png"
         val FIXED_CLASSIFICATION_STATES = setOf(
             "pending",

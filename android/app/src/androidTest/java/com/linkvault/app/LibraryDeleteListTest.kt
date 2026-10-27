@@ -1,28 +1,37 @@
 package com.linkvault.app
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
 import com.linkvault.app.library.LibraryAvailability
 import com.linkvault.app.library.LibraryDeleteBlockReason
 import com.linkvault.app.library.LibraryDeleteContent
+import com.linkvault.app.library.LibraryDeletionNoticeHost
+import com.linkvault.app.library.withDeletedItems
+import com.linkvault.app.library.withDismissedDeletionNotice
 import com.linkvault.app.library.LibraryDeleteStatus
 import com.linkvault.app.library.LibraryDeleteUiState
 import com.linkvault.app.library.LibraryDetailState
@@ -32,6 +41,7 @@ import com.linkvault.app.library.LibrarySaveForm
 import com.linkvault.app.library.LibraryUiState
 import com.linkvault.app.ui.VaultTheme
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -51,6 +61,37 @@ class LibraryDeleteListTest {
     private var confirmCalls = 0
     private var cancelCalls = 0
     private var reviewCalls = 0
+
+    @Test
+    fun deletionNoticeAppearsAtBottomExpiresAndCanRepeatWithoutMovingContent() {
+        state = state.withDeletedItems(setOf(item.id), "링크를 삭제했어요.")
+        compose.setContent {
+            VaultTheme {
+                Box(Modifier.fillMaxSize()) {
+                    Text("보관함", modifier = Modifier.align(Alignment.TopStart))
+                    LibraryDeletionNoticeHost(
+                        message = state.deletionNotice,
+                        version = state.deletionNoticeVersion,
+                        onDismissed = { state = state.withDismissedDeletionNotice(it) },
+                        modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+                    )
+                }
+            }
+        }
+        compose.onNodeWithText("링크를 삭제했어요.").assertIsDisplayed()
+        val top = compose.onNodeWithText("보관함").getUnclippedBoundsInRoot().top
+        val root = compose.onRoot().getUnclippedBoundsInRoot()
+        val notice = compose.onNodeWithTag("library-deletion-notice").getUnclippedBoundsInRoot()
+        assertTrue(notice.top > root.top + (root.bottom - root.top) / 2)
+        compose.waitUntil(timeoutMillis = 12_000) { state.deletionNotice == null }
+        compose.onNodeWithText("링크를 삭제했어요.").assertDoesNotExist()
+        assertEquals(top, compose.onNodeWithText("보관함").getUnclippedBoundsInRoot().top)
+        compose.runOnIdle {
+            state = state.withDeletedItems(setOf(item.id), "링크를 삭제했어요.")
+        }
+        compose.onNodeWithText("링크를 삭제했어요.").assertIsDisplayed()
+        compose.waitUntil(timeoutMillis = 12_000) { state.deletionNotice == null }
+    }
 
     @Test
     fun rowDeleteDoesNotOpenDetailAndCancelDoesNotConfirm() {

@@ -416,6 +416,10 @@ class LibraryViewModel internal constructor(
         mutableUiState.value = mutableUiState.value.copy(edit = null)
     }
 
+    fun dismissDeletionNotice(version: Long) {
+        mutableUiState.value = mutableUiState.value.withDismissedDeletionNotice(version)
+    }
+
     fun beginDelete() {
         if (deleteJob?.isActive == true || mutableUiState.value.edit != null) return
         val detail = mutableUiState.value.detail as? LibraryDetailState.Loaded ?: return
@@ -1452,7 +1456,7 @@ class LibraryViewModel internal constructor(
         cachedItems = cachedItems.filterNot { it.id in deletedIds }
         mutableUiState.value = state.withDeletedItems(
             deletedIds = deletedIds,
-            notice = "삭제된 링크를 목록에서 숨겼어요. 이 항목은 다시 표시하지 않으며 되돌릴 수 없어요.",
+            notice = "삭제된 링크를 목록에서 정리했어요.",
         )
     }
 
@@ -1749,9 +1753,9 @@ class LibraryViewModel internal constructor(
                     mutableUiState.value = state.withDeletedItems(
                         deletedIds = setOf(deletedId),
                         notice = if (receipt.alreadyDeleted) {
-                            "서버에 이미 없던 링크를 이 기기에서도 삭제 완료로 정리했어요. 되돌릴 수 없어요."
+                            "이미 삭제된 링크예요."
                         } else {
-                            "링크를 목록에서 숨겼어요. 서버가 저장된 사본을 백그라운드에서 물리적으로 정리 중이며 되돌릴 수 없어요."
+                            "링크를 삭제했어요."
                         },
                     )
                     if (deletion?.itemId == deletedId) {
@@ -2271,6 +2275,7 @@ data class LibraryUiState(
     val edit: LibraryEditUiState? = null,
     val delete: LibraryDeleteUiState? = null,
     val deletionNotice: String? = null,
+    val deletionNoticeVersion: Long = 0,
     val outboxEntries: List<OutboxEntry> = emptyList(),
     val receiptsAwaitingAcknowledgement: Set<String> = emptySet(),
 )
@@ -2330,7 +2335,11 @@ internal fun LibraryUiState.withDeletedItems(
     edit = edit?.takeUnless { it.itemId in deletedIds },
     delete = delete?.takeUnless { it.itemId in deletedIds },
     deletionNotice = notice,
+    deletionNoticeVersion = deletionNoticeVersion + 1,
 )
+
+internal fun LibraryUiState.withDismissedDeletionNotice(version: Long): LibraryUiState =
+    if (version == deletionNoticeVersion) copy(deletionNotice = null) else this
 
 internal fun LibraryUiState.restoredDelete(
     entries: List<OutboxEntry>,

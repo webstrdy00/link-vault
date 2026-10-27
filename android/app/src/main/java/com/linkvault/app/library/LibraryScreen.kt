@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -45,6 +46,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -53,6 +57,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -60,6 +65,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -165,6 +171,7 @@ fun LibraryScreen(
         libraryViewModel.acknowledgeSavedReceipts(state.receiptsAwaitingAcknowledgement)
     }
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -221,20 +228,6 @@ fun LibraryScreen(
                 }
             }
             HorizontalDivider()
-        }
-
-        state.deletionNotice?.let { message ->
-            Surface(
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                shape = MaterialTheme.shapes.medium,
-            ) {
-                Text(
-                    text = message,
-                    modifier = Modifier.padding(16.dp),
-                    color = MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
         }
 
         when (val availability = state.availability) {
@@ -362,6 +355,34 @@ fun LibraryScreen(
             }
         }
     }
+        key(libraryViewModel) {
+            LibraryDeletionNoticeHost(
+                message = state.deletionNotice,
+                version = state.deletionNoticeVersion,
+                onDismissed = libraryViewModel::dismissDeletionNotice,
+                modifier = Modifier.align(Alignment.BottomCenter)
+                    .safeDrawingPadding().padding(16.dp)
+                    .widthIn(max = 640.dp).fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+internal fun LibraryDeletionNoticeHost(
+    message: String?,
+    version: Long,
+    onDismissed: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val host = remember { SnackbarHostState() }
+    LaunchedEffect(message, version) {
+        if (message != null) {
+            host.showSnackbar(message = message, duration = SnackbarDuration.Short)
+            onDismissed(version)
+        }
+    }
+    SnackbarHost(hostState = host, modifier = modifier.testTag("library-deletion-notice"))
 }
 
 @Composable
@@ -1140,21 +1161,16 @@ internal fun LibraryItemCard(
 @Composable
 private fun LibrarySourceBadge(source: String, itemId: String) {
     val colors = MaterialTheme.colorScheme
-    val darkBackground = colors.surface.luminance() < 0.5f
     val background = when (source) {
-        DiscoverySource.INSTAGRAM.displayName ->
-            if (darkBackground) Color(0xFF4D203F) else Color(0xFFFCE0ED)
-        DiscoverySource.THREADS.displayName -> colors.inverseSurface
-        DiscoverySource.NAVER_BLOG.displayName ->
-            if (darkBackground) Color(0xFF173D26) else Color(0xFFDCF5DF)
+        DiscoverySource.INSTAGRAM.displayName -> Color.Transparent
+        DiscoverySource.THREADS.displayName -> Color.Black
+        DiscoverySource.NAVER_BLOG.displayName -> Color(0xFF03C75A)
         else -> colors.surfaceContainerLow
     }
     val foreground = when (source) {
-        DiscoverySource.INSTAGRAM.displayName ->
-            if (darkBackground) Color(0xFFFFD8EC) else Color(0xFF6E1746)
-        DiscoverySource.THREADS.displayName -> colors.inverseOnSurface
-        DiscoverySource.NAVER_BLOG.displayName ->
-            if (darkBackground) Color(0xFFBAEDC8) else Color(0xFF14562A)
+        DiscoverySource.INSTAGRAM.displayName,
+        DiscoverySource.THREADS.displayName -> Color.White
+        DiscoverySource.NAVER_BLOG.displayName -> Color.Black
         else -> colors.onSurfaceVariant
     }
     Surface(
@@ -1173,7 +1189,16 @@ private fun LibrarySourceBadge(source: String, itemId: String) {
             },
         ),
     ) {
-        Box(contentAlignment = Alignment.Center) {
+        Box(
+            modifier = if (source == DiscoverySource.INSTAGRAM.displayName) {
+                Modifier.background(
+                    Brush.linearGradient(
+                        listOf(Color(0xFFFCAF45), Color(0xFFF77737), Color(0xFFE1306C), Color(0xFFC13584), Color(0xFF833AB4)),
+                    ),
+                )
+            } else Modifier,
+            contentAlignment = Alignment.Center,
+        ) {
             Text(
                 text = sourceMonogram(source),
                 modifier = Modifier.testTag("library-source-monogram-$itemId"),

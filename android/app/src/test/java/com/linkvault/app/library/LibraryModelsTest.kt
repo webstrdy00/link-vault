@@ -21,6 +21,22 @@ class LibraryModelsTest {
     private val otherItemId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 
     @Test
+    fun repeatedDeletionNoticesAreDistinctAndOldDismissalCannotClearNewNotice() {
+        val initial = LibraryUiState(LibraryAvailability.Ready, LibrarySaveForm(null, ""))
+        val first = initial.withDeletedItems(setOf(deleteItemId), "링크를 삭제했어요.")
+        val second = first.withDeletedItems(setOf(otherItemId), "링크를 삭제했어요.")
+        assertTrue(second.deletionNoticeVersion > first.deletionNoticeVersion)
+        assertEquals(second, second.withDismissedDeletionNotice(first.deletionNoticeVersion))
+        val dismissed = second.withDismissedDeletionNotice(second.deletionNoticeVersion)
+        assertNull(dismissed.deletionNotice)
+        assertEquals(second.items, dismissed.items)
+        assertEquals(second.delete, dismissed.delete)
+        val third = dismissed.withDeletedItems(setOf(deleteItemId), "링크를 삭제했어요.")
+        assertEquals("링크를 삭제했어요.", third.deletionNotice)
+        assertTrue(third.deletionNoticeVersion > second.deletionNoticeVersion)
+    }
+
+    @Test
     fun compactTitleNormalizesWhitespaceAndPrefersFirstSentenceOrLine() {
         val examples = mapOf(
             "  제주\t맛집   안내  " to "제주 맛집 안내",

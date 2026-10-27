@@ -378,7 +378,7 @@ class DeletionIntegrationTest {
             openLibrary()
             awaitItemTombstone(ownerId, acceptedItemId)
             awaitText(
-                "링크를 목록에서 숨겼어요. 서버가 저장된 사본을 백그라운드에서 물리적으로 정리 중이며 되돌릴 수 없어요.",
+                "링크를 삭제했어요.",
                 timeoutMillis = SERVER_TIMEOUT_MILLIS,
             )
             compose.onNodeWithTag("detail-$acceptedItemId").assertDoesNotExist()

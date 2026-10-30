@@ -327,8 +327,8 @@ class DiscoveryIntegrationTest {
 
                 closeDetailCategories()
                 clickTag("detail-more")
-                awaitText("제목/내용 수정")
-                compose.onNodeWithText("제목/내용 수정").performScrollTo().performClick()
+                awaitText("제목/메모 수정")
+                compose.onNodeWithText("제목/메모 수정").performScrollTo().performClick()
                 awaitText("변경 사항 저장")
                 compose.onNodeWithTag("detail-edit-content")
                     .performScrollTo()

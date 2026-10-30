@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -137,14 +138,14 @@ class LibraryViewModel internal constructor(
         )
     }
 
-    fun save() {
+    fun save(): String? {
         if (saveJob?.isActive == true || mutableUiState.value.availability !is LibraryAvailability.Ready) {
-            return
+            return null
         }
         val boundOwner = ownerId
         if (boundOwner == null || !identityMatches()) {
             invalidateIdentity()
-            return
+            return null
         }
         val preparation = prepareLibrarySave(
             form = mutableUiState.value.form,
@@ -156,9 +157,13 @@ class LibraryViewModel internal constructor(
                 mutableUiState.value = mutableUiState.value.copy(
                     saveStatus = LibrarySaveStatus.Invalid(preparation.issues),
                 )
+                return null
             }
 
-            is LibrarySavePreparation.Valid -> enqueueSave(preparation.operation)
+            is LibrarySavePreparation.Valid -> {
+                enqueueSave(preparation.operation)
+                return preparation.operation.requestId
+            }
         }
     }
 
@@ -178,13 +183,13 @@ class LibraryViewModel internal constructor(
         }
     }
 
-    fun reconfirmExpiredSave(requestId: String) {
-        if (saveJob?.isActive == true) return
+    fun reconfirmExpiredSave(requestId: String): String? {
+        if (saveJob?.isActive == true) return null
         val entry = mutableUiState.value.outboxEntries.firstOrNull {
             it.requestId == requestId && it.ownerId == ownerId && it.state == OutboxState.EXPIRED
-        } ?: return
-        if (entry.method != "POST" || entry.path != "/items") return
-        val boundOwner = ownerId ?: return
+        } ?: return null
+        if (entry.method != "POST" || entry.path != "/items") return null
+        val boundOwner = ownerId ?: return null
         val newRequestId = UUID.randomUUID().toString()
         pendingSaveRequestId = newRequestId
         mutableUiState.value = mutableUiState.value.copy(saveStatus = LibrarySaveStatus.Saving)
@@ -198,9 +203,10 @@ class LibraryViewModel internal constructor(
                     path = entry.path,
                     payloadJson = entry.payloadJson,
                 )
-                outbox.discard(boundOwner, requestId)
+                val removalError = removeReplacedRequest(boundOwner, requestId)
                 mutableUiState.value = mutableUiState.value.copy(
                     saveStatus = LibrarySaveStatus.Queued(newRequestId),
+                    queueError = removalError,
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -227,6 +233,7 @@ class LibraryViewModel internal constructor(
         job.invokeOnCompletion {
             if (saveJob === job) saveJob = null
         }
+        return newRequestId
     }
 
     fun refresh() {
@@ -700,7 +707,7 @@ class LibraryViewModel internal constructor(
                     publishLatestLibraryValue(
                         itemId = edit.itemId,
                         awaitLastSuspension = {
-                            outbox.discard(boundOwner, ready.requestId)
+                            discardPendingRequest(boundOwner, ready.requestId)
                         },
                         isDeletedAfterLastSuspension = {
                             outbox.isItemDeleted(boundOwner, edit.itemId)
@@ -785,8 +792,7 @@ class LibraryViewModel internal constructor(
                     path = "/items/${operation.itemId}",
                     payloadJson = operation.body,
                 )
-                outbox.discard(boundOwner, ready.requestId)
-                releaseEditRequestOwnership(boundOwner, ready.requestId)
+                val removalError = removeReplacedRequest(boundOwner, ready.requestId)
                 val state = mutableUiState.value
                 val currentEdit = state.edit
                 if (
@@ -802,7 +808,7 @@ class LibraryViewModel internal constructor(
                             originalNote = ready.latest.note,
                             submittedPatch = parseLibraryEditPatch(operation.body),
                             status = LibraryEditStatus.Queued(operation.requestId),
-                            latestError = null,
+                            latestError = removalError,
                         ),
                     )
                 }
@@ -849,7 +855,7 @@ class LibraryViewModel internal constructor(
 
     fun discardOperation(requestId: String) {
         mutateOutbox(requestId) { boundOwner ->
-            outbox.discard(boundOwner, requestId)
+            discardPendingRequest(boundOwner, requestId)
             releaseEditRequestOwnership(boundOwner, requestId)
             if (pendingEditRequestId == requestId) {
                 pendingEditRequestId = null
@@ -882,6 +888,39 @@ class LibraryViewModel internal constructor(
         }
     }
 
+    private suspend fun discardPendingRequest(requestOwner: String, requestId: String) {
+        val removed = outbox.discard(requestOwner, requestId)
+        if (!responseBelongsTo(requestOwner)) throw AccountAuthenticationRequiredException()
+        if (!removed) {
+            throw AccountClientException(
+                message = "이미 전송 중이거나 완료되어 대기 요청을 취소할 수 없습니다.",
+                retryable = false,
+            )
+        }
+    }
+
+    private suspend fun removeReplacedRequest(requestOwner: String, requestId: String): String? {
+        try {
+            val removed = outbox.discard(requestOwner, requestId)
+            val absent = removed ||
+                outbox.observeOutbox(requestOwner).first().none { it.requestId == requestId }
+            if (!responseBelongsTo(requestOwner)) throw AccountAuthenticationRequiredException()
+            if (absent) {
+                releaseEditRequestOwnership(requestOwner, requestId)
+                return null
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: AccountAuthenticationRequiredException) {
+            throw error
+        } catch (_: Exception) {
+            if (!responseBelongsTo(requestOwner)) throw AccountAuthenticationRequiredException()
+            // The new immutable request is already queued; keep tracking it.
+        }
+        replacedRequestIds -= requestId
+        return "새 요청은 대기열에 등록됐지만 이전 요청은 제거하지 못했어요. 동기화 상태를 확인해 주세요."
+    }
+
     fun acknowledgeSavedReceipts(receiptIds: Set<String>) {
         if (receiptIds.isEmpty()) return
         val boundOwner = ownerId ?: return
@@ -896,6 +935,8 @@ class LibraryViewModel internal constructor(
                     mutableUiState.value = mutableUiState.value.copy(
                         receiptsAwaitingAcknowledgement =
                             mutableUiState.value.receiptsAwaitingAcknowledgement - requestId,
+                        completedCaptureRequestIds =
+                            mutableUiState.value.completedCaptureRequestIds - requestId,
                     )
                 } catch (_: AccountAuthenticationRequiredException) {
                     invalidateIdentity()
@@ -1091,9 +1132,8 @@ class LibraryViewModel internal constructor(
                     path = "/items/${operation.itemId}",
                     payloadJson = operation.body,
                 )
-                if (replacesRequestId != null) {
-                    outbox.discard(operation.ownerId, replacesRequestId)
-                    releaseEditRequestOwnership(operation.ownerId, replacesRequestId)
+                val removalError = replacesRequestId?.let {
+                    removeReplacedRequest(operation.ownerId, it)
                 }
                 val state = mutableUiState.value
                 val deletion = state.delete
@@ -1106,7 +1146,7 @@ class LibraryViewModel internal constructor(
                     mutableUiState.value = state.copy(
                         delete = deletion.copy(
                             status = LibraryDeleteStatus.Queued(operation.requestId),
-                            error = null,
+                            error = removalError,
                         ),
                     )
                 }
@@ -1723,6 +1763,10 @@ class LibraryViewModel internal constructor(
                     }
                     listRecoveryPolicy.onSavedReceipt(entry.requestId)
                     recoverFailedListIfNeeded()
+                    mutableUiState.value = mutableUiState.value.copy(
+                        completedCaptureRequestIds =
+                            mutableUiState.value.completedCaptureRequestIds + entry.requestId,
+                    )
                 }
 
                 deleteItemId != null -> {
@@ -2278,6 +2322,7 @@ data class LibraryUiState(
     val deletionNoticeVersion: Long = 0,
     val outboxEntries: List<OutboxEntry> = emptyList(),
     val receiptsAwaitingAcknowledgement: Set<String> = emptySet(),
+    val completedCaptureRequestIds: Set<String> = emptySet(),
 )
 
 internal fun LibraryUiState.withListDeleteConfirmation(itemId: String): LibraryUiState {

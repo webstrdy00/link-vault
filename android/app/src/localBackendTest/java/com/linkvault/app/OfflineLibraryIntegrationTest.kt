@@ -187,7 +187,7 @@ class OfflineLibraryIntegrationTest {
             assertTrue(rejected is com.linkvault.app.auth.AccountClientException)
             assertEquals(owner, app.accountClient.sessionUserId())
             compose.onNodeWithTag("detail-more").performScrollTo().performClick()
-            compose.onNodeWithText("제목/내용 수정").performScrollTo().performClick()
+            compose.onNodeWithText("제목/메모 수정").performScrollTo().performClick()
             val current = app.accountClient.libraryRequest(owner, "/items/${argument("fixtureItemId")}")
             app.accountClient.libraryRequest(
                 expectedOwnerId = owner,

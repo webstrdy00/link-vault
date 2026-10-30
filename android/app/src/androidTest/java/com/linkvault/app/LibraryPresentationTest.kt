@@ -62,10 +62,12 @@ import com.linkvault.app.library.LibraryCategoryRef
 import com.linkvault.app.library.LibraryDetailState
 import com.linkvault.app.library.LibraryEditForm
 import com.linkvault.app.library.LibraryEditUiState
+import com.linkvault.app.library.LibraryExtractionMeta
 import com.linkvault.app.library.LibraryItemCard
 import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.library.LibraryItemSummary
 import com.linkvault.app.library.LibraryRootHeader
+import com.linkvault.app.library.formatLibrarySavedDate
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxState
 import com.linkvault.app.ui.VaultTheme
@@ -80,6 +82,97 @@ import org.junit.Test
 class LibraryPresentationTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun listPreviewUpdatesFromCollectedContentToMemoAndUsesSavedDate() {
+        val content = "수집한 내용을 두 줄 안에서 읽습니다. ".repeat(12)
+        var item by mutableStateOf(
+            LibraryItemSummary(
+                id = "preview",
+                url = "https://example.com",
+                displayTitle = "보관한 링크",
+                contentExcerpt = content,
+                createdAt = "2026-10-24T12:00:00+09:00",
+                updatedAt = "2026-10-28T12:00:00+09:00",
+            ),
+        )
+        compose.setContent {
+            VaultTheme { Column(Modifier.width(220.dp)) { LibraryItemCard(item, onOpenDetail = {}) } }
+        }
+        compose.onNodeWithText(content, useUnmergedTree = true)
+            .assertIsDisplayed()
+            .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                assertEquals(2, layouts.single().lineCount)
+                assertTrue(layouts.single().isLineEllipsized(1))
+            }
+        compose.onNodeWithText("저장 · ${formatLibrarySavedDate(item.createdAt)}").assertIsDisplayed()
+        compose.onNodeWithText("2026.10.28", substring = true).assertDoesNotExist()
+        compose.runOnIdle { item = item.copy(noteExcerpt = "내 메모") }
+        compose.onNodeWithText("내 메모").assertIsDisplayed()
+        compose.onNodeWithText(content).assertDoesNotExist()
+        compose.runOnIdle { item = item.copy(noteExcerpt = " \n") }
+        compose.onNodeWithText(content).assertIsDisplayed()
+        compose.runOnIdle { item = item.copy(contentExcerpt = null) }
+        compose.onNodeWithText(content).assertDoesNotExist()
+        compose.runOnIdle { item = item.copy(noteExcerpt = "https://example.com/memo") }
+        compose.onNodeWithText("https://example.com/memo").assertIsDisplayed()
+    }
+
+    @Test
+    fun detailReflectsMetadataTransitionsAndNewContentWithoutCopyingItToMemo() {
+        var item by mutableStateOf(
+            LibraryItemDetail(
+                id = "transition",
+                version = 1,
+                url = "https://example.com",
+                displayTitle = "수집 상태",
+                createdAt = "2026-10-24T12:00:00+09:00",
+                updatedAt = "2026-10-28T12:00:00+09:00",
+                metadataState = "queued",
+            ),
+        )
+        compose.setContent {
+            VaultTheme {
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    DetailContent(
+                        detail = LibraryDetailState.Loaded(item), edit = null, delete = null,
+                        onBackToList = {}, onOpenOriginal = {}, onBeginEdit = {},
+                        onEditTitleChange = {}, onEditNoteChange = {}, onSaveEdit = {},
+                        onCancelEdit = {}, onLoadLatest = {}, onConfirmAgain = {}, onBeginDelete = {},
+                    )
+                }
+            }
+        }
+        compose.onNodeWithText("저장 · ${formatLibrarySavedDate(item.createdAt)}").assertExists()
+        compose.onNodeWithText("2026.10.28", substring = true).assertDoesNotExist()
+        compose.onNodeWithTag("detail-no-content").performScrollTo().assertIsDisplayed()
+        listOf(
+            "queued" to "링크 정보를 가져오기 위해 대기 중이에요.",
+            "running" to "링크 정보를 가져오고 있어요.",
+            "failed" to "링크 정보를 가져오지 못했어요.",
+            "unsupported" to "이 링크는 내용 수집을 지원하지 않아요.",
+            "partial" to "링크 정보의 일부만 가져왔어요.",
+        ).forEach { (state, expected) ->
+            compose.runOnIdle { item = item.copy(metadataState = state) }
+            compose.onNodeWithTag("detail-metadata-status").performScrollTo().assertTextEquals(expected)
+        }
+        compose.runOnIdle {
+            item = item.copy(metadataState = "queued", extractionMeta = LibraryExtractionMeta(errorCode = "NETWORK_ERROR"))
+        }
+        compose.onNodeWithTag("detail-metadata-status").performScrollTo()
+            .assertTextEquals("링크 정보를 다시 가져오기 위해 대기 중이에요.")
+        compose.runOnIdle { item = item.copy(metadataState = "ready", bodyText = "새로 수집한 본문", note = "내가 쓴 메모") }
+        compose.onNodeWithTag("detail-note").performScrollTo().assertTextEquals("내가 쓴 메모")
+        compose.onNodeWithText("본문").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals("새로 수집한 본문")
+        compose.onNodeWithTag("detail-no-content").assertDoesNotExist()
+        compose.onNodeWithTag("detail-metadata-status").assertDoesNotExist()
+        compose.runOnIdle { item = item.copy(note = "새로 수집한 본문") }
+        compose.onNodeWithTag("detail-content").assertDoesNotExist()
+        compose.onAllNodesWithText("새로 수집한 본문").assertCountEquals(1)
+    }
 
     @Test
     fun everySourceShortcutScrollsIntoNarrowHeaderAndInvokesOnlyItsBrowseCallbackOnce() {
@@ -359,16 +452,17 @@ class LibraryPresentationTest {
             ),
         )
 
-        compose.onNodeWithTag("detail-title").assertTextEquals(userTitle)
+        compose.onNodeWithTag("detail-title").assertTextEquals("내가 정한 제목입니다.")
             .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
                 val layouts = mutableListOf<TextLayoutResult>()
                 assertTrue(action(layouts))
-                assertEquals(2, layouts.single().lineCount)
-                assertTrue(layouts.single().isLineEllipsized(1))
+                assertTrue(layouts.single().lineCount <= 2)
+                assertFalse(layouts.single().hasVisualOverflow)
             }
         compose.onNodeWithText("서버가 고른 제목입니다.").assertDoesNotExist()
         compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
         compose.onNodeWithText(description).performScrollTo().assertTextEquals(description)
+        compose.onNodeWithText("미리보기").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText(displayTitle).assertDoesNotExist()
         compose.onNodeWithText(fetchedTitle).assertDoesNotExist()
         compose.onNodeWithText("본문").assertDoesNotExist()
@@ -479,12 +573,12 @@ class LibraryPresentationTest {
         }
         compose.onNodeWithTag("detail-manage-categories").assertDoesNotExist()
         compose.onNodeWithTag("detail-more").performClick()
-        compose.onNodeWithText("제목/내용 수정").performClick()
+        compose.onNodeWithText("제목/메모 수정").performClick()
         compose.runOnIdle { assertEquals(1, editActions) }
     }
 
     @Test
-    fun manualContentOverridesCollectedTextWithoutShowingBothVersions() {
+    fun manualMemoAndCollectedBodyCoexistWithoutDuplicatingLowerPrioritySources() {
         val manual = "직접 수정한 첫 줄\n\n원래 줄바꿈과 마지막 줄을 그대로 보여요."
         val item = publicTextDetail().copy(
             note = manual,
@@ -492,9 +586,11 @@ class LibraryPresentationTest {
         )
         showDetail(item)
 
-        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(manual)
+        compose.onNodeWithText("내 메모").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("detail-note").performScrollTo().assertTextEquals(manual)
         compose.onAllNodesWithText(manual).assertCountEquals(1)
-        compose.onNodeWithText(publicText).assertDoesNotExist()
+        compose.onNodeWithText("본문").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(publicText)
         compose.onNodeWithText(item.sharedText!!).assertDoesNotExist()
         assertNoDetailClutter()
     }
@@ -520,8 +616,8 @@ class LibraryPresentationTest {
         compose.onNodeWithTag("detail-edit-title").assertTextContains(title)
         compose.onNodeWithTag("detail-edit-content").performScrollTo().assertTextContains(content)
         compose.onNodeWithText("제목").assertExists()
-        compose.onNodeWithText("내용").assertExists()
-        compose.onNodeWithText("내용을 비우면 수집한 내용을 다시 보여요.").assertExists()
+        compose.onNodeWithText("내 메모").assertExists()
+        compose.onNodeWithText("메모를 비워도 수집한 내용은 그대로 남아요.").assertExists()
         compose.onNodeWithText("메모 (선택 사항)").assertDoesNotExist()
     }
 
@@ -734,6 +830,7 @@ class LibraryPresentationTest {
         )
 
         compose.onNodeWithTag("detail-content").performScrollTo().assertTextEquals(shared)
+        compose.onNodeWithText("공유한 내용").performScrollTo().assertIsDisplayed()
         compose.onAllNodesWithText(shared).assertCountEquals(1)
     }
 
@@ -745,6 +842,7 @@ class LibraryPresentationTest {
         )
 
         compose.onNodeWithTag("detail-content").assertDoesNotExist()
+        compose.onNodeWithTag("detail-no-content").performScrollTo().assertIsDisplayed()
         assertNoDetailClutter()
     }
 
@@ -828,9 +926,9 @@ class LibraryPresentationTest {
 
     private fun assertNoDetailClutter() {
         listOf(
-            "처리 정보 보기", "저장된 내용 보기", "세부 정보", "가져온 제목", "본문", "미리보기 설명",
+            "처리 정보 보기", "저장된 내용 보기", "세부 정보", "가져온 제목", "미리보기 설명",
             "텍스트 인식 (OCR)", "이미지 첨부", "이미지 상태", "검색 준비", "자동 분류",
-            "링크 정보를 가져오지 못했어요.", "이미지에서 글자를 읽지 못했어요.",
+            "이미지에서 글자를 읽지 못했어요.",
         ).forEach { compose.onNodeWithText(it).assertDoesNotExist() }
     }
 

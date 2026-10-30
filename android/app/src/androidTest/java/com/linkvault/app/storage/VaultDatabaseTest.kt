@@ -489,6 +489,117 @@ class VaultDatabaseTest {
     }
 
     @Test
+    fun futurePendingAndRetryRowsDoNotBlockReadyRowOrLoseTheirDeadlines() = runBlocking {
+        val now = 20_000L
+        val outbox = database.outboxDao()
+        val futurePending = outboxEntry(
+            UUID.randomUUID().toString(), "owner-a", "{}", createdAt = 1_000L,
+        ).copy(nextAttemptAt = now + 2_000L)
+        val futureRetry = outboxEntry(
+            UUID.randomUUID().toString(), "owner-a", "{}", createdAt = 2_000L,
+        ).copy(
+            state = OutboxState.RETRY,
+            attemptCount = 1,
+            nextAttemptAt = now + 3_000L,
+            errorCode = "RATE_LIMITED",
+        )
+        val ready = outboxEntry(
+            UUID.randomUUID().toString(), "owner-a", "{}", createdAt = 3_000L,
+        )
+        listOf(futurePending, futureRetry, ready).forEach { outbox.insertImmutable(it) }
+        outbox.retry("owner-a", futureRetry.requestId, now)
+
+        val claimed = outbox.claimNext("owner-a", now, now + 1_000L)
+        assertEquals(ready.requestId, claimed?.requestId)
+        assertEquals(1, outbox.completeSaved("owner-a", ready.requestId, now + 1_000L, "{}"))
+        assertEquals(futurePending, outbox.findByRequestId(futurePending.requestId))
+        val retainedRetry = outbox.findByRequestId(futureRetry.requestId)
+        assertEquals(OutboxState.RETRY, retainedRetry?.state)
+        assertEquals(futureRetry.nextAttemptAt, retainedRetry?.nextAttemptAt)
+        assertEquals(futureRetry.expiresAt, retainedRetry?.expiresAt)
+        assertEquals(futurePending.nextAttemptAt, outbox.nextWakeAt("owner-a"))
+        assertNull(outbox.claimNext("owner-a", now + 1_999L, now + 4_000L))
+
+        val duePending = outbox.claimNext("owner-a", now + 2_000L, now + 4_000L)
+        assertEquals(futurePending.requestId, duePending?.requestId)
+        assertEquals(1, outbox.completeSaved("owner-a", futurePending.requestId, now + 4_000L, "{}"))
+        val dueRetry = outbox.claimNext("owner-a", now + 3_000L, now + 5_000L)
+        assertEquals(futureRetry.requestId, dueRetry?.requestId)
+        assertEquals(2, dueRetry?.attemptCount)
+    }
+
+    @Test
+    fun activeLeaseDoesNotBlockNewReadyRowOrAllowDuplicateClaim() = runBlocking {
+        val now = 20_000L
+        val outbox = database.outboxDao()
+        val leased = outboxEntry(
+            UUID.randomUUID().toString(), "owner-a", "{}", createdAt = 1_000L,
+        )
+        outbox.insertImmutable(leased)
+        val firstClaim = outbox.claimNext("owner-a", now, now + 3_000L)
+        val fresh = outboxEntry(
+            UUID.randomUUID().toString(), "owner-a", "{}", createdAt = 2_000L,
+        )
+        outbox.insertImmutable(fresh)
+
+        val freshClaim = outbox.claimNext("owner-a", now, now + 2_000L)
+        assertEquals(fresh.requestId, freshClaim?.requestId)
+        assertEquals(firstClaim, outbox.findByRequestId(leased.requestId))
+        assertNull(outbox.claimNext("owner-a", now, now + 4_000L))
+        assertEquals(1, outbox.completeSaved("owner-a", fresh.requestId, now + 2_000L, "{}"))
+        assertEquals(now + 3_000L, outbox.nextWakeAt("owner-a"))
+    }
+
+    @Test
+    fun pendingDiscardRequiresMatchingOwnerAndDeletesOnlyCancellableRequest() = runBlocking {
+        val outbox = database.outboxDao()
+        val entry = outboxEntry(UUID.randomUUID().toString(), "owner-a", "{}")
+        outbox.insertImmutable(entry)
+
+        assertEquals(0, outbox.discard("owner-b", entry.requestId))
+        assertEquals(entry, outbox.findByRequestId(entry.requestId))
+        assertEquals(1, outbox.discard("owner-a", entry.requestId))
+        assertNull(outbox.findByRequestId(entry.requestId))
+        assertEquals(0, outbox.discard("owner-a", entry.requestId))
+    }
+
+    @Test
+    fun staleDiscardAfterClaimCannotDeleteRunningRequestOrItsCompletion() = runBlocking {
+        val now = 20_000L
+        val leaseUntil = now + 1_000L
+        val outbox = database.outboxDao()
+        val entry = outboxEntry(UUID.randomUUID().toString(), "owner-a", "{}")
+        outbox.insertImmutable(entry)
+        // The UI may have observed pending before this worker acquired the row.
+        val claimed = outbox.claimNext("owner-a", now, leaseUntil)
+        assertNotNull(claimed)
+
+        assertEquals(0, outbox.discard("owner-b", entry.requestId))
+        assertEquals(0, outbox.discard("owner-a", entry.requestId))
+        assertEquals(claimed, outbox.findByRequestId(entry.requestId))
+        assertEquals(1, outbox.completeSaved("owner-a", entry.requestId, leaseUntil, "{\"saved\":true}"))
+        assertEquals(OutboxState.SAVED, outbox.findByRequestId(entry.requestId)?.state)
+        assertEquals("{\"saved\":true}", outbox.findByRequestId(entry.requestId)?.resultJson)
+    }
+
+    @Test
+    fun savedReceiptCannotBeDiscardedAndOnlyItsOwnerCanAcknowledgeIt() = runBlocking {
+        val outbox = database.outboxDao()
+        val saved = outboxEntry(UUID.randomUUID().toString(), "owner-a", "{}").copy(
+            state = OutboxState.SAVED,
+            resultJson = "{\"saved\":true}",
+        )
+        outbox.insertImmutable(saved)
+
+        assertEquals(0, outbox.discard("owner-b", saved.requestId))
+        assertEquals(0, outbox.discard("owner-a", saved.requestId))
+        assertEquals(0, outbox.acknowledge("owner-b", saved.requestId))
+        assertEquals(saved, outbox.findByRequestId(saved.requestId))
+        assertEquals(1, outbox.acknowledge("owner-a", saved.requestId))
+        assertNull(outbox.findByRequestId(saved.requestId))
+    }
+
+    @Test
     fun lateResultCannotOverwriteReclaimedLeaseAndSavedReceiptSurvivesReopen() = runBlocking {
         val now = 15_000L
         val entry = outboxEntry(

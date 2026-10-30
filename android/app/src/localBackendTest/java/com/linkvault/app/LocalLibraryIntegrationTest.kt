@@ -81,7 +81,7 @@ class LocalLibraryIntegrationTest {
         }
         fun openEditor() {
             compose.onNodeWithTag("detail-more").performScrollTo().performClick()
-            compose.onNodeWithText("제목/내용 수정").performClick()
+            compose.onNodeWithText("제목/메모 수정").performClick()
             awaitText("변경 사항 저장")
         }
 

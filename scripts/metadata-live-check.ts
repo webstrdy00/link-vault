@@ -20,32 +20,38 @@ const cases = [
     service: "Instagram",
     url: "https://www.instagram.com/p/DYkt640kyfV/",
     excerpt: "Stopped by Mars, took some photos",
+    titleExcerpt: "Stopped by Mars, took some photos",
   },
   {
     service: "X",
     url: "https://x.com/NASAWebb/status/1999132374647427401",
     excerpt: "Webb detected the strongest evidence yet",
+    titleExcerpt: "Webb detected the strongest evidence yet",
   },
   {
     service: "Facebook",
     url:
       "https://www.facebook.com/NASA/posts/first-stop-mars-next-stop-psyche-on-may-15-our-psyche-spacecraft-swung-by-mars-o/1530907268404644",
     excerpt: "First stop, Mars. Next stop, Psyche",
+    titleExcerpt: "First stop, Mars.",
   },
   {
     service: "Bluesky",
     url: "https://bsky.app/profile/stsci.edu/post/3mxysey6oqx2l",
     excerpt: "NASA's Nancy Grace Roman Space Telescope",
+    titleExcerpt: "NASA's Nancy Grace Roman Space Telescope",
   },
   {
     service: "Mastodon",
     url: "https://mastodon.social/@badastro/116913268750685901",
     excerpt: "Astronomers turned to public crowdsourcing",
+    titleExcerpt: "Astronomers turned to public crowdsourcing",
   },
   {
     service: "Instagram / 비짓제주",
     url: "https://www.instagram.com/visitjeju.kr/p/DPDtncZEueq/",
     excerpt: "가을에 제주여행 가고 싶은 사람",
+    titleExcerpt: "가을에 제주여행 가고 싶은 사람",
     expectedCategory: "travel",
   },
 ];
@@ -77,11 +83,26 @@ for (const testCase of cases) {
       problems.push("title does not start with the verified post text");
     }
     if (
+      testCase.titleExcerpt &&
+      !result.fetched_title?.includes(testCase.titleExcerpt)
+    ) {
+      problems.push(
+        "title does not contain the verified representative post text",
+      );
+    }
+    if (
       /HomeCreateSearch|MessagesNotifications|ProfileInsights/.test(
         result.fetched_title ?? "",
       )
     ) {
       problems.push("navigation labels contaminated the title");
+    }
+    if (
+      /(?:["”]\s*\/\s*(?:X|Twitter)|["”]\s*-\s*Mastodon\.social)$/u.test(
+        result.fetched_title ?? "",
+      )
+    ) {
+      problems.push("service wrapper remains in the representative title");
     }
     if (result.extraction_meta.error_code !== null) {
       problems.push(`error=${result.extraction_meta.error_code}`);

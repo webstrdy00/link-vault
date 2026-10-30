@@ -28,6 +28,7 @@ interface RulesConfig {
   categories: CategoryRule[];
   aliases: AliasRule[];
   compounds: Record<string, string[]>;
+  search_compounds: Record<string, string[]>;
 }
 
 const config = rules as RulesConfig;
@@ -130,10 +131,38 @@ const registeredQueryExpressions: RegisteredQueryExpression[] = [
 
 export function prepareSearch(query: string): SearchPlan {
   const normalizedQuery = norm(query);
-  const inputTerms = normalizedQuery.split(" ").filter(Boolean);
-  if ([...normalizedQuery].length > 200 || inputTerms.length > 10) {
+  const originalTerms = normalizedQuery.split(" ").filter(Boolean);
+  if ([...normalizedQuery].length > 200 || originalTerms.length > 10) {
     throw new QueryLimitError();
   }
+  const remainder = normalizedQuery.replace(
+    /^(?:지난번|전에|아까) 저장한 /u,
+    "",
+  );
+  // Only interpret an explicit retrieval prefix when a registered topic remains.
+  // Quoted text and code-like punctuation retain literal query semantics.
+  const retrievalQuery = remainder !== normalizedQuery &&
+      /^[\p{L}\p{M}\p{N}# ]+$/u.test(remainder) &&
+      config.categories.some((category) =>
+        [...category.strong, ...category.weak].flat().some((expression) =>
+          hasTerm(remainder, expression)
+        )
+      )
+    ? remainder
+    : normalizedQuery;
+  const inputTerms = retrievalQuery.split(" ").filter(Boolean).map((term) => {
+    const bare = term.startsWith("#") ? term.slice(1) : term;
+    return term.startsWith("#") &&
+        (registeredQueryExpressions.some((expression) =>
+          expression.tokens.length === 1 && expression.tokens[0] === bare
+        ) ||
+          Object.hasOwn(config.search_compounds, bare) ||
+          config.categories.some((category) =>
+            [...category.strong, ...category.weak].flat().includes(bare)
+          ))
+      ? bare
+      : term;
+  });
 
   const groups: SearchGroup[] = [];
   for (let index = 0; index < inputTerms.length;) {
@@ -150,7 +179,16 @@ export function prepareSearch(query: string): SearchPlan {
     }
 
     if (longest === undefined) {
-      groups.push({ kind: "literal", value: inputTerms[index] });
+      const term = inputTerms[index];
+      const literalTerms = Object.hasOwn(config.search_compounds, term)
+        ? config.search_compounds[term]
+        : [term];
+      groups.push(
+        ...literalTerms.map((value) => ({
+          kind: "literal" as const,
+          value,
+        })),
+      );
       index++;
       continue;
     }
@@ -343,9 +381,38 @@ function classificationFields(
   return Object.fromEntries(
     topicFields.map((field) => [
       field,
-      topicText(norm(snapshot[field]), field),
+      classificationText(topicText(norm(snapshot[field]), field)),
     ]),
   ) as Record<TopicField, string>;
+}
+
+const categoryExpressions = [
+  ...new Set(
+    config.categories.flatMap((category) =>
+      [...category.strong, ...category.weak].flat()
+    ),
+  ),
+].sort((left, right) => right.length - left.length);
+const negatedCategoryExpression = new RegExp(
+  `(^|[^\\p{L}\\p{M}\\p{N}_])(?:${
+    categoryExpressions.map((expression) =>
+      expression.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")
+    ).join("|")
+  })(?:은|는|이|가)? (?:없고|없어요|없습니다|없다|아니고|아니에요|아닙니다|아니다)(?=$|[^\\p{L}\\p{M}\\p{N}_])`,
+  "gu",
+);
+
+function classificationText(text: string): string {
+  if (text === "") {
+    return "";
+  }
+  // This is deliberately not general negation detection: only an adjacent,
+  // explicit absent/not-a cue is removed, leaving other occurrences intact.
+  const result = text.replace(negatedCategoryExpression, "$1 ");
+  return result.replace(
+    /(^|[^\p{L}\p{M}\p{N}_])(?:python regius|ball python|python is a (?:nonvenomous )?snake)(?=$|[^\p{L}\p{M}\p{N}_])/gu,
+    "$1 ",
+  );
 }
 
 export function getRulesMetadata(): DiscoveryRulesMetadata {

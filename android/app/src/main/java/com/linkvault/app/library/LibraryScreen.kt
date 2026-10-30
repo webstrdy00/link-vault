@@ -93,9 +93,6 @@ import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
 import java.text.DateFormat
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 import java.util.Date
 
 @Composable
@@ -109,6 +106,8 @@ fun LibraryScreen(
     onBack: () -> Unit,
     onSignIn: () -> Unit,
     onOpenOriginal: (String) -> Unit,
+    onCaptureSaveStarted: (String, String?) -> Unit,
+    onCaptureSaved: (String) -> Unit,
     initialItemId: String? = null,
     onDiscover: () -> Unit = {},
     onBrowseSource: (DiscoverySource) -> Unit = {},
@@ -168,6 +167,9 @@ fun LibraryScreen(
         libraryViewModel.updateSharedInput(initialUrl, sharedText)
     }
     LaunchedEffect(libraryViewModel, state.receiptsAwaitingAcknowledgement) {
+        state.completedCaptureRequestIds
+            .intersect(state.receiptsAwaitingAcknowledgement)
+            .forEach(onCaptureSaved)
         libraryViewModel.acknowledgeSavedReceipts(state.receiptsAwaitingAcknowledgement)
     }
 
@@ -248,7 +250,10 @@ fun LibraryScreen(
                         delete = state.delete,
                         onRetry = libraryViewModel::retryOperation,
                         onDiscard = libraryViewModel::discardOperation,
-                        onReconfirmSave = libraryViewModel::reconfirmExpiredSave,
+                        onReconfirmSave = { requestId ->
+                            libraryViewModel.reconfirmExpiredSave(requestId)
+                                ?.let { onCaptureSaveStarted(it, requestId) }
+                        },
                         onLoadLatest = libraryViewModel::loadLatestForEdit,
                         onLoadLatestDelete = libraryViewModel::loadLatestForDelete,
                     )
@@ -265,10 +270,15 @@ fun LibraryScreen(
                                     state = state,
                                     onTitleChange = libraryViewModel::updateTitle,
                                     onNoteChange = libraryViewModel::updateNote,
-                                    onSave = libraryViewModel::save,
+                                    onSave = {
+                                        libraryViewModel.save()?.let { onCaptureSaveStarted(it, null) }
+                                    },
                                     onRetrySave = libraryViewModel::retrySave,
                                     onEditAfterFailure = libraryViewModel::editAfterSaveFailure,
-                                    onReconfirmSave = libraryViewModel::reconfirmExpiredSave,
+                                    onReconfirmSave = { requestId ->
+                                        libraryViewModel.reconfirmExpiredSave(requestId)
+                                            ?.let { onCaptureSaveStarted(it, requestId) }
+                                    },
                                 )
                                 HorizontalDivider()
                             } else {
@@ -828,6 +838,12 @@ private fun OutboxContent(
                         fontWeight = FontWeight.SemiBold,
                     )
                     Text(entry.queueMessage())
+                    if (entry.state == OutboxState.RETRY) {
+                        Text(
+                            text = "서버에 이미 반영됐을 수 있어요. 대기 요청 제거는 추가 재전송만 중단하며 서버의 변경을 취소하지 않아요.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (entry.isItemDeleteForScreen() && entry.state != OutboxState.SAVED) {
                         Text(
                             text = "삭제가 동기화될 때까지 이 링크가 보일 수 있어요.",
@@ -853,7 +869,7 @@ private fun OutboxContent(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = MaterialTheme.shapes.small,
                             ) {
-                                Text("변경 취소")
+                                Text("대기 요청 제거")
                             }
                         }
 
@@ -886,7 +902,7 @@ private fun OutboxContent(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = MaterialTheme.shapes.small,
                             ) {
-                                Text("변경 취소")
+                                Text("대기 요청 제거")
                             }
                         }
 
@@ -925,7 +941,7 @@ private fun OutboxContent(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = MaterialTheme.shapes.small,
                             ) {
-                                Text("변경 취소")
+                                Text("대기 요청 제거")
                             }
                         }
 
@@ -937,7 +953,7 @@ private fun OutboxContent(
                             modifier = Modifier.fillMaxWidth(),
                             shape = MaterialTheme.shapes.small,
                         ) {
-                            Text("변경 취소")
+                            Text("대기 요청 제거")
                         }
 
                         OutboxState.RUNNING,
@@ -1047,7 +1063,7 @@ internal fun LibraryItemCard(
     val source = item.source?.takeUnless(String::isBlank)?.let { value ->
         DiscoverySource.entries.firstOrNull { it.apiValue == value }?.displayName ?: value
     }
-    val date = formatLibraryDate(item.updatedAt ?: item.createdAt)
+    val date = formatLibrarySavedDate(item.createdAt)?.let { "저장 · $it" }
     val categoryNames = item.categoryRefs.mapNotNull { it.name?.takeUnless(String::isBlank) }
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1101,7 +1117,7 @@ internal fun LibraryItemCard(
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
-            item.noteExcerpt?.takeUnless(String::isBlank)?.let { note ->
+            item.cardPreview()?.let { note ->
                 Text(
                     text = note,
                     modifier = Modifier.padding(top = 4.dp),
@@ -1475,7 +1491,7 @@ internal fun DetailContent(
                     onDismissRequest = { showMoreMenu = false },
                 ) {
                     DropdownMenuItem(
-                        text = { Text("제목/내용 수정") },
+                        text = { Text("제목/메모 수정") },
                         onClick = {
                             showMoreMenu = false
                             onBeginEdit()
@@ -1513,7 +1529,7 @@ internal fun DetailContent(
         }
         val sourceAndDate = listOfNotNull(
             item.source?.takeUnless(String::isBlank),
-            formatLibraryDate(item.updatedAt ?: item.createdAt),
+            formatLibrarySavedDate(item.createdAt)?.let { "저장 · $it" },
         )
         if (sourceAndDate.isNotEmpty()) {
             Text(
@@ -1524,7 +1540,7 @@ internal fun DetailContent(
         }
         SelectionContainer(modifier = Modifier.fillMaxWidth()) {
             Text(
-                text = item.editableTitle(),
+                text = compactLibraryTitle(item.userTitle?.takeUnless(String::isBlank) ?: item.displayTitle, item.url),
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.fillMaxWidth().testTag("detail-title"),
                 fontWeight = FontWeight.Bold,
@@ -1551,15 +1567,39 @@ internal fun DetailContent(
             Text("원문 열기")
         }
 
-        item.displayedContent()?.let { content ->
+        item.note?.takeUnless(String::isBlank)?.let { note ->
+            Text("내 메모", style = MaterialTheme.typography.titleSmall)
             SelectionContainer {
                 Text(
-                    text = content,
+                    text = note,
+                    modifier = Modifier.fillMaxWidth().testTag("detail-note"),
+                    style = MaterialTheme.typography.bodyLarge,
+                    lineHeight = 28.sp,
+                )
+            }
+        }
+        val sourceContent = item.sourceContent()
+        sourceContent?.let { content ->
+            Text(content.label, style = MaterialTheme.typography.titleSmall)
+            SelectionContainer {
+                Text(
+                    text = content.text,
                     modifier = Modifier.fillMaxWidth().testTag("detail-content"),
                     style = MaterialTheme.typography.bodyLarge,
                     lineHeight = 28.sp,
                 )
             }
+        }
+        item.metadataStatusMessage()?.let { message ->
+            Text(
+                text = message,
+                modifier = Modifier.testTag("detail-metadata-status"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (sourceContent == null && item.note.isNullOrBlank()) {
+            Text("표시할 내용이 없어요. 원문에서 확인해 주세요.", modifier = Modifier.testTag("detail-no-content"))
         }
     }
 }
@@ -1647,7 +1687,7 @@ private fun EditContent(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "제목/내용 수정",
+                text = "제목/메모 수정",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
             )
@@ -1668,11 +1708,11 @@ private fun EditContent(
                 onValueChange = onNoteChange,
                 enabled = canEdit,
                 modifier = Modifier.fillMaxWidth().testTag("detail-edit-content"),
-                label = { Text("내용") },
+                label = { Text("내 메모") },
                 supportingText = {
                     Column {
                         Text("${edit.form.note.codePointLength()} / $LIBRARY_NOTE_MAX_CODE_POINTS")
-                        Text("내용을 비우면 수집한 내용을 다시 보여요.")
+                        Text("메모를 비워도 수집한 내용은 그대로 남아요.")
                     }
                 },
                 isError = issues.any { it.field == LibraryFormField.NOTE },
@@ -1802,7 +1842,7 @@ private fun DraftComparison(form: LibraryEditForm, latest: LibraryItemDetail?) {
             Text("최신 제목", fontWeight = FontWeight.SemiBold)
             SelectionContainer { Text(latest.editableTitle()) }
             Text("최신 내용", fontWeight = FontWeight.SemiBold)
-            SelectionContainer { Text(latest.displayedContent() ?: "없음") }
+            SelectionContainer { Text(latest.note?.takeUnless(String::isBlank) ?: "없음") }
         }
     }
 }
@@ -1891,14 +1931,3 @@ private fun OutboxEntry.isItemDeleteForScreen(): Boolean {
 
 private fun formatCachedAt(timestamp: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))
-
-private fun formatLibraryDate(timestamp: String?): String? = timestamp
-    ?.takeUnless(String::isBlank)
-    ?.let { value ->
-        runCatching {
-            val instant = Instant.from(DateTimeFormatter.ISO_DATE_TIME.parse(value))
-            DateTimeFormatter.ofPattern("yyyy.MM.dd")
-                .withZone(ZoneId.systemDefault())
-                .format(instant)
-        }.getOrNull()
-    }

@@ -46,6 +46,18 @@ const SECOND_CATEGORY_ID = "71baadfe-6a88-43a3-b0fb-f111f18ef97f";
 const VALID_ASSET_ID = "8ff75967-3313-4a63-8131-e606dd63b087";
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const INVALID_JSONB_STRINGS = [
+  "\u0000",
+  "\uD800",
+  "\uDBFF",
+  "\uDC00",
+  "\uDFFF",
+  "\uD800\uD800\uDC00",
+  "\uD800\uDC00\uDC00",
+  "\uDC00\uD800",
+  "🙂\uD800🙂",
+  "🙂\u0000🙂",
+];
 
 Deno.test("private worker routing matches the configured versioned deployment path", () => {
   for (
@@ -634,12 +646,70 @@ Deno.test("POST items validates raw field types, Unicode bounds, and categories"
   }
 
   const boundaryGateway = new FakeGateway();
-  const boundaryResponse = await createHandler(boundaryGateway)(itemRequest({
-    url: "https://example.com",
-    title: "🙂".repeat(300),
-  }));
+  const urlPrefix = "https://example.com/";
+  const supplementaryBounds = String.fromCodePoint(0x10000, 0x10FFFF);
+  const boundaryBody = {
+    url: urlPrefix + "🙂".repeat(4096 - urlPrefix.length - 2) +
+      supplementaryBounds,
+    title: "🙂".repeat(298) + supplementaryBounds,
+    shared_text: "🙂".repeat(3998) + supplementaryBounds,
+    note: "🙂".repeat(3998) + supplementaryBounds,
+  };
+  const boundaryResponse = await createHandler(boundaryGateway)(
+    itemRequest(boundaryBody),
+  );
   assertEquals(boundaryResponse.status, 201);
   assertEquals(boundaryGateway.createCalls.length, 1);
+  assertEquals(boundaryGateway.createCalls[0].body, boundaryBody);
+});
+
+Deno.test("POST items rejects strings not representable by jsonb before gateway writes", async () => {
+  for (const field of ["url", "title", "note", "shared_text"]) {
+    for (const invalidText of INVALID_JSONB_STRINGS) {
+      const gateway = new FakeGateway();
+      const body = {
+        url: "https://example.com/article",
+        [field]: field === "url"
+          ? `https://example.com/before${invalidText}after`
+          : `before${invalidText}after`,
+      };
+
+      const response = await createHandler(gateway)(itemRequest(body));
+
+      assertEquals(response.status, 400, JSON.stringify(body));
+      const payload = await errorPayload(response);
+      assertEquals(payload.error.code, "INVALID_BODY");
+      assertEquals(payload.error.retryable, false);
+      assertEquals(gateway.rpcCalls, []);
+      assertEquals(gateway.createCalls, []);
+    }
+  }
+});
+
+Deno.test("POST items preserves escaped surrogate pairs and literal Unicode escapes", async () => {
+  const gateway = new FakeGateway();
+  const response = await createHandler(gateway)(request(
+    "/functions/v1/library-api/v1/items",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: String.raw`{
+        "url": "https://example.com/\uD83D\uDE42",
+        "title": "\uD83D\uDE42 \\u0000",
+        "note": "\\uD800 \\uDC00",
+        "shared_text": "\\u0000 \uD83D\uDE42"
+      }`,
+    },
+  ));
+
+  assertEquals(response.status, 201);
+  assertEquals(gateway.createCalls.length, 1);
+  assertEquals(gateway.createCalls[0].body, {
+    url: "https://example.com/🙂",
+    title: "🙂 \\u0000",
+    note: "\\uD800 \\uDC00",
+    shared_text: "\\u0000 🙂",
+  });
 });
 
 Deno.test("POST items rejects invalid or unsafe URLs", async () => {
@@ -1687,6 +1757,30 @@ Deno.test("PATCH item requires a positive expected version and one editable fiel
   }
 });
 
+Deno.test("PATCH item rejects strings not representable by jsonb before any item gateway call", async () => {
+  for (const field of ["title", "note"]) {
+    for (const invalidText of INVALID_JSONB_STRINGS) {
+      const gateway = new FakeGateway();
+      gateway.rpcResult = { data: itemSnapshot(), error: null };
+      const body = {
+        expected_version: 4,
+        category_ids: [VALID_CATEGORY_ID],
+        [field]: `before${invalidText}after`,
+      };
+
+      const response = await createHandler(gateway)(updateRequest(body));
+
+      assertEquals(response.status, 400, JSON.stringify(body));
+      const payload = await errorPayload(response);
+      assertEquals(payload.error.code, "INVALID_BODY");
+      assertEquals(payload.error.retryable, false);
+      assertEquals(gateway.rpcCalls, []);
+      assertEquals(gateway.categoryCalls, []);
+      assertEquals(gateway.updateCalls, []);
+    }
+  }
+});
+
 Deno.test("PATCH item rejects immutable, identity, and prepared fields", async () => {
   for (
     const field of [
@@ -1751,6 +1845,50 @@ Deno.test("PATCH item distinguishes null, string, and omitted text fields", asyn
       "업무 자료",
     );
     assertEquals(gateway.categoryCalls, []);
+  }
+});
+
+Deno.test("PATCH item preserves supplementary Unicode bounds and literal Unicode escapes", async () => {
+  const supplementaryBounds = String.fromCodePoint(0x10000, 0x10FFFF);
+  const boundaryBody = {
+    expected_version: 4,
+    title: "🙂".repeat(298) + supplementaryBounds,
+    note: "🙂".repeat(3998) + supplementaryBounds,
+  };
+  const cases = [
+    {
+      rawBody: JSON.stringify(boundaryBody),
+      body: boundaryBody,
+    },
+    {
+      rawBody: String.raw`{
+        "expected_version": 4,
+        "title": "\uD83D\uDE42 \\u0000",
+        "note": "\\uD800 \\uDC00 \uD83D\uDE42"
+      }`,
+      body: {
+        expected_version: 4,
+        title: "🙂 \\u0000",
+        note: "\\uD800 \\uDC00 🙂",
+      },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const gateway = new FakeGateway();
+    gateway.rpcResult = { data: itemSnapshot(), error: null };
+    const response = await createHandler(gateway)(request(
+      `/functions/v1/library-api/v1/items/${VALID_ITEM_ID}`,
+      {
+        method: "PATCH",
+        headers: authenticatedJsonHeaders(),
+        body: testCase.rawBody,
+      },
+    ));
+
+    assertEquals(response.status, 200);
+    assertEquals(gateway.updateCalls.length, 1);
+    assertEquals(gateway.updateCalls[0].body, testCase.body);
   }
 });
 

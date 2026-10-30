@@ -21,6 +21,98 @@ class LibraryModelsTest {
     private val otherItemId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 
     @Test
+    fun cardPreviewChoosesMemoThenCollectedExcerptWithoutChangingEither() {
+        val cases = listOf(
+            Triple("내 메모", "수집한 내용", "내 메모"),
+            Triple(null, "수집한 내용", "수집한 내용"),
+            Triple(" \n\t", "수집한 내용", "수집한 내용"),
+            Triple(null, " \n", null),
+            Triple(null, null, null),
+            Triple(" https://example.com ", "수집한 내용", " https://example.com "),
+            Triple("  줄 하나\n줄 둘  ", null, "  줄 하나\n줄 둘  "),
+        )
+        cases.forEach { (note, content, expected) ->
+            val item = LibraryItemSummary("preview", url = "https://example.com", noteExcerpt = note, contentExcerpt = content)
+            assertEquals(expected, item.cardPreview())
+            assertEquals(note, item.noteExcerpt)
+            assertEquals(content, item.contentExcerpt)
+        }
+    }
+
+    @Test
+    fun excerptContractParsesBothSummaryAndDetailIncludingNullableAndMissingValues() {
+        listOf("본문 미리보기", "", null).forEach { content ->
+            val json = buildJsonObject {
+                put("id", "preview")
+                put("url", "https://example.com")
+                put("note_excerpt", "내 메모")
+                put("content_excerpt", content)
+            }
+            assertEquals(content, parseLibrarySummaryResponse(json).contentExcerpt)
+            assertEquals(content, parseLibraryDetailResponse(json).contentExcerpt)
+            assertEquals("내 메모", parseLibrarySummaryResponse(json).cardPreview())
+        }
+        val missing = buildJsonObject { put("id", "missing"); put("url", "https://example.com") }
+        assertNull(parseLibrarySummaryResponse(missing).cardPreview())
+        assertNull(parseLibraryDetailResponse(missing).contentExcerpt)
+    }
+
+    @Test
+    fun detailSeparatesBodyDescriptionSharedTextMemoAndEmptySources() {
+        val detail = LibraryItemDetail("split", url = "https://example.com", bodyText = "원문", description = "설명", sharedText = "공유 글", note = "메모")
+        assertEquals(LibrarySourceContent("본문", "원문"), detail.sourceContent())
+        assertEquals("메모", detail.editForm().note)
+        assertEquals(LibrarySourceContent("미리보기", "설명"), detail.copy(bodyText = " \n").sourceContent())
+        assertEquals(LibrarySourceContent("공유한 내용", "공유 글"), detail.copy(bodyText = null, description = "https://example.com").sourceContent())
+        assertNull(detail.copy(bodyText = null, description = null, sharedText = "WWW.example.com").sourceContent())
+        assertNull(detail.copy(note = " 원문 \n").sourceContent())
+        assertEquals("", detail.copy(note = null).editForm().note)
+        assertEquals(LibrarySourceContent("본문", "원문"), detail.copy(note = null).sourceContent())
+    }
+
+    @Test
+    fun metadataMessagesDistinguishWaitingRetryRunningFailureUnsupportedAndPartialWithoutInventingSuccess() {
+        val detail = LibraryItemDetail("status", url = "https://example.com")
+        val messages = mapOf(
+            "queued" to "링크 정보를 가져오기 위해 대기 중이에요.",
+            "running" to "링크 정보를 가져오고 있어요.",
+            "failed" to "링크 정보를 가져오지 못했어요.",
+            "unsupported" to "이 링크는 내용 수집을 지원하지 않아요.",
+            "partial" to "링크 정보의 일부만 가져왔어요.",
+            "ready" to null,
+            "unknown" to null,
+        )
+        messages.forEach { (state, message) ->
+            assertEquals(message, detail.copy(metadataState = state).metadataStatusMessage())
+        }
+        assertEquals(
+            "링크 정보를 다시 가져오기 위해 대기 중이에요.",
+            detail.copy(metadataState = "queued", extractionMeta = LibraryExtractionMeta(errorCode = "NETWORK_ERROR")).metadataStatusMessage(),
+        )
+        assertNull(detail.metadataStatusMessage())
+    }
+
+    @Test
+    fun savedDatesUseCreationInstantAndNeverModificationOrInvalidFallback() {
+        val originalZone = java.util.TimeZone.getDefault()
+        try {
+            java.util.TimeZone.setDefault(java.util.TimeZone.getTimeZone("Asia/Seoul"))
+            assertEquals("2026.10.25", formatLibrarySavedDate("2026-10-24T16:00:00Z"))
+            assertEquals("2026.10.24", formatLibrarySavedDate("2026-10-24T12:00:00+09:00"))
+            assertEquals("2026.10.25", formatLibrarySavedDate("2026-10-24T16:00:00.123Z"))
+            assertNull(formatLibrarySavedDate("not-a-date"))
+            assertNull(formatLibrarySavedDate("2026-10-24"))
+            assertNull(formatLibrarySavedDate(" "))
+            assertNull(formatLibrarySavedDate(null))
+            val item = LibraryItemSummary("date", url = "https://example.com", createdAt = "2026-10-24T12:00:00+09:00", updatedAt = "2026-10-28T12:00:00+09:00")
+            assertEquals("2026.10.24", formatLibrarySavedDate(item.createdAt))
+            assertEquals("2026-10-28T12:00:00+09:00", item.updatedAt)
+        } finally {
+            java.util.TimeZone.setDefault(originalZone)
+        }
+    }
+
+    @Test
     fun repeatedDeletionNoticesAreDistinctAndOldDismissalCannotClearNewNotice() {
         val initial = LibraryUiState(LibraryAvailability.Ready, LibrarySaveForm(null, ""))
         val first = initial.withDeletedItems(setOf(deleteItemId), "링크를 삭제했어요.")
@@ -128,7 +220,8 @@ class LibraryModelsTest {
         assertEquals(sharedText, detail.sharedText)
         assertEquals("수동 메모", detail.note)
         assertEquals(userTitle, detail.editableTitle())
-        assertEquals("수동 메모", detail.displayedContent())
+        assertEquals("수동 메모", detail.editForm().note)
+        assertEquals(bodyText, detail.sourceContent()?.text)
 
         val preparation = prepareLibraryEdit(
             ownerId = "member-a",
@@ -149,15 +242,15 @@ class LibraryModelsTest {
     }
 
     @Test
-    fun editFormPrefillsCompactGeneratedTitleAndFullKoreanContentWithoutChangingRawFields() {
+    fun editFormPrefillsCompactGeneratedTitleButNeverCopiesCollectedContentIntoMemo() {
         val detail = generatedEditDetail()
 
         val form = detail.editForm()
 
         assertEquals("자동으로 수집한 제목입니다.", form.title)
         assertEquals(detail.editableTitle(), form.title)
-        assertEquals(detail.bodyText, form.note)
-        assertEquals(detail.displayedContent(), form.note)
+        assertEquals("", form.note)
+        assertEquals(detail.bodyText, detail.sourceContent()?.text)
         assertEquals("  자동으로 수집한 제목입니다.  후속 문장입니다.\n마지막 줄", detail.displayTitle)
         assertEquals("  수집한 한국어 본문입니다.\r\n둘째 줄 😀\n마지막 줄  ", detail.bodyText)
         assertEquals("미리보기 설명\n원본 그대로", detail.description)
@@ -199,7 +292,7 @@ class LibraryModelsTest {
     }
 
     @Test
-    fun displayedContentSkipsBlankAndUrlOnlyAcquiredFieldsButNeverFiltersAManualOverride() {
+    fun sourceContentSkipsBlankAndUrlOnlyAcquiredFieldsWithoutChangingManualMemo() {
         val urls = " \nHTTPS://example.com/one\tHttp://example.com/two\r\nWWW.example.com/three  "
         val description = "  설명 첫 줄\r\n둘째 줄을 생략하지 않습니다.  "
         val sharedText = "공유한 한국어 원문\nhttps://example.com/article"
@@ -210,29 +303,26 @@ class LibraryModelsTest {
             sharedText = sharedText,
         )
 
-        assertEquals(description, detail.displayedContent())
-        assertEquals(sharedText, detail.copy(description = urls).displayedContent())
-        assertNull(detail.copy(description = " \n", sharedText = urls).displayedContent())
-        assertNull(detail.copy(bodyText = null, description = null, sharedText = null).displayedContent())
-        assertEquals(urls, detail.copy(note = urls).displayedContent())
+        assertEquals(LibrarySourceContent("미리보기", description), detail.sourceContent())
+        assertEquals(LibrarySourceContent("공유한 내용", sharedText), detail.copy(description = urls).sourceContent())
+        assertNull(detail.copy(description = " \n", sharedText = urls).sourceContent())
+        assertNull(detail.copy(bodyText = null, description = null, sharedText = null).sourceContent())
+        assertEquals(urls, detail.copy(note = urls).editForm().note)
         assertEquals(urls, detail.bodyText)
         assertEquals(" \t\r\n", detail.note)
     }
 
     @Test
-    fun oversizedGeneratedContentRemainsCompleteAndProducesVisibleEditValidation() {
+    fun oversizedGeneratedContentDoesNotBlockEditingTheManualTitle() {
         val content = "한글😀\r\n".repeat(801)
         val detail = generatedEditDetail().copy(bodyText = content)
         val form = detail.editForm()
 
         assertTrue(content.codePointLength() > LIBRARY_NOTE_MAX_CODE_POINTS)
-        assertEquals(content, form.note)
-        val issue = validateLibraryEditForm(form).single()
-        assertEquals(LibraryFormField.NOTE, issue.field)
-        assertEquals("내용은 최대 4000자까지 입력할 수 있어요.", issue.message)
+        assertEquals("", form.note)
+        assertTrue(validateLibraryEditForm(form).isEmpty())
         val preparation = prepareEdit(detail, form.copy(title = "제목만 변경"))
-        assertTrue(preparation is LibraryEditPreparation.Invalid)
-        assertTrue((preparation as LibraryEditPreparation.Invalid).issues.contains(issue))
+        assertTrue(preparation is LibraryEditPreparation.Valid)
         assertEquals(content, detail.bodyText)
         assertTrue(
             validateLibraryEditForm(form.copy(note = "😀".repeat(LIBRARY_NOTE_MAX_CODE_POINTS)))
@@ -260,7 +350,7 @@ class LibraryModelsTest {
         assertEquals("내가 바꾼 제목 😀", body.getValue("title").jsonPrimitive.content)
         assertNull(operation.originalTitle)
         assertNull(operation.originalNote)
-        assertEquals(detail.bodyText, operation.form.note)
+        assertEquals("", operation.form.note)
         assertEquals(request, operation.requestArguments())
         assertEquals(requestId, request.requestId)
         assertEquals("PATCH", request.method)
@@ -281,7 +371,7 @@ class LibraryModelsTest {
         assertNull(preparation.operation.originalTitle)
         assertNull(preparation.operation.originalNote)
         assertEquals(detail.editableTitle(), preparation.operation.form.title)
-        assertEquals(content, detail.copy(note = content).displayedContent())
+        assertEquals(content, detail.copy(note = content).editForm().note)
         assertEquals(generatedEditDetail().bodyText, detail.bodyText)
     }
 
@@ -319,7 +409,7 @@ class LibraryModelsTest {
             assertEquals(JsonNull, body.getValue("note"))
             assertEquals(detail.note, preparation.operation.originalNote)
             assertEquals(blank, preparation.operation.form.note)
-            assertEquals(detail.bodyText, detail.copy(note = null).displayedContent())
+            assertEquals(detail.bodyText, detail.copy(note = null).sourceContent()?.text)
             assertEquals("  이전 수동 내용\n그대로 보관  ", detail.note)
         }
     }
@@ -336,7 +426,7 @@ class LibraryModelsTest {
             setOf("expected_version", "title"),
             Json.parseToJsonElement(titleOnly.operation.body).jsonObject.keys,
         )
-        assertEquals(detail.bodyText, detail.displayedContent())
+        assertEquals(detail.bodyText, detail.sourceContent()?.text)
     }
 
     @Test
@@ -443,7 +533,7 @@ class LibraryModelsTest {
         val reviewed = draft.withLatestForm(latest)
 
         assertEquals("수정한 제목", reviewed.form.title)
-        assertEquals(latest.bodyText, reviewed.form.note)
+        assertEquals("", reviewed.form.note)
         assertEquals(7L, reviewed.expectedVersion)
         assertNull(reviewed.originalTitle)
         assertNull(reviewed.originalNote)

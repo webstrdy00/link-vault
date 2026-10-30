@@ -153,7 +153,10 @@ export const productionMetadataTransport: MetadataTransport = {
               : undefined,
           }, callback);
         },
-        pipelining: 0,
+        // Zero sends Connection: close, which can make peers close TLS before
+        // Edge has finished consuming the body. Keep this single request alive
+        // until body completion; its owned client is still destroyed afterwards.
+        pipelining: 1,
         headersTimeout: REQUEST_TIMEOUT_MS,
         bodyTimeout: REQUEST_TIMEOUT_MS,
         maxHeaderSize: 16 * 1024,
@@ -601,24 +604,27 @@ function extractPageMetadata(
     parsed.meta.get("og:description"),
     parsed.meta.get("twitter:description"),
     parsed.meta.get("description"),
-  ].find(isMeaningfulDescription) ?? null;
+  ].map((value) => cleanSocialText(value, finalUrl))
+    .find(isMeaningfulDescription) ?? null;
   const rawTitle = [
     parsed.meta.get("og:title"),
     parsed.meta.get("twitter:title"),
     parsed.title,
     ...parsed.headings,
-  ].find((value) =>
-    isMeaningfulTitle(value) &&
-    norm(value) !== norm(parsed.meta.get("og:site_name"))
+  ].map((value) => cleanSocialText(value, finalUrl)).find((value) =>
+    value !== null && isMeaningfulTitle(value) &&
+    norm(value) !== norm(parsed.meta.get("og:site_name")) &&
+    !isAccountTitle(value, parsed, finalUrl)
   ) ?? null;
-  const descriptionTitle = rawDescription?.split("\n")[0];
+  const descriptionTitle = rawDescription?.split("\n")[0]
+    .match(/^.*?[.!?。！？](?=\s|$)|^.+/u)?.[0];
   const title = rawTitle !== null
     ? truncateMetadataField(cleanText(rawTitle), 300)
     : truncateMetadataField(
       isMeaningfulTitle(descriptionTitle) ? cleanText(descriptionTitle) : null,
       120,
     );
-  const description = truncateMetadataField(cleanText(rawDescription), 4000);
+  const description = truncateMetadataField(rawDescription, 4000);
   const metadataState: MetadataState = title.value === null ||
       description.value === null
     ? "partial"
@@ -642,6 +648,94 @@ function extractPageMetadata(
       error_code: errorCode,
     },
   };
+}
+
+// These are metadata-only adapters: never apply them to user titles or notes.
+function cleanSocialText(
+  value: string | null | undefined,
+  finalUrl: string,
+): string | null {
+  if (value === null || value === undefined) return null;
+  if (!isSocialMetadataUrl(new URL(finalUrl))) return value;
+  const cleaned = value.replace(
+    /^.{1,150}? on (?:instagram|threads|x|twitter):\s*/iu,
+    "",
+  ).replace(
+    /^\d[\d,.]*[kmb]? likes?, \d[\d,.]*[kmb]? comments? - [^:]{1,200}:\s*/iu,
+    "",
+  ).replace(
+    /^(["“][\s\S]*["”])\s*\/\s*(?:X|Twitter)$/u,
+    "$1",
+  );
+  // Quotes around an entire caption are presentation, not post content.
+  return cleanMetadataText(cleaned.replace(/^["“]([\s\S]*)["”]$/u, "$1"));
+}
+
+function isSocialMetadataUrl(url: URL): boolean {
+  const host = url.hostname.replace(/^www\./u, "");
+  const socialHost =
+    /^(?:x\.com|twitter\.com|facebook\.com|m\.facebook\.com|bsky\.app|instagram\.com|threads\.(?:net|com))$/u
+      .test(host);
+  // Federated hosts are identified by their post path, not a host allowlist.
+  const federatedPost = /^\/@[^/]+\/\d+\/?$/u.test(url.pathname);
+  return socialHost || federatedPost;
+}
+
+function isAccountTitle(
+  title: string,
+  parsed: ParsedMetadataHtml,
+  finalUrl: string,
+): boolean {
+  const url = new URL(finalUrl);
+  if (!isSocialMetadataUrl(url)) return false;
+  const label = norm(title);
+  if (
+    /^(?:x|twitter|facebook|bluesky|mastodon|instagram|threads|profile|posts)$/u
+      .test(label) ||
+    /^.{1,150}\s+on\s+(?:x|twitter|facebook|bluesky|mastodon|instagram|threads)$/u
+      .test(label) ||
+    /^.{1,150}\s*\(@[^)]+\)(?:\s*[-|·/]\s*(?:bluesky|mastodon|x|twitter))?$/u
+      .test(label)
+  ) return true;
+  const account = url.pathname.match(/^\/profile\/([^/]+)\/post\//u)?.[1] ??
+    url.pathname.match(/^\/@?([^/]+)\/(?:status|posts|\d+)/u)?.[1];
+  // Expanded Facebook account labels need corroborating metadata, not merely
+  // a social hostname: real article headlines must remain titles.
+  const accountLabel = norm(parsed.meta.get("og:image:alt"));
+  if (
+    /^(?:www\.|m\.)?facebook\.com$/u.test(url.hostname) &&
+    account !== undefined && accountLabel.startsWith(`${norm(account)} - `) &&
+    accountLabel === norm(parsed.meta.get("og:title")) &&
+    parsed.meta.get("og:url")?.replace(/\/$/u, "") ===
+      finalUrl.replace(/\/$/u, "")
+  ) {
+    if (
+      label === accountLabel ||
+      label === `${accountLabel}님의 게시물`
+    ) return true;
+    const suffix = ` - ${accountLabel}`;
+    if (label.endsWith(suffix)) {
+      const clipped = label.slice(0, -suffix.length).match(
+        /^(.+?)(?:\.{3}|…)$/u,
+      );
+      if (
+        clipped !== null &&
+        norm(parsed.meta.get("og:description")).startsWith(clipped[1])
+      ) return true;
+    }
+  }
+  const quotedPost = /^.{1,150}:\s*["“](.+?)…?["”]\s*-\s*(.+)$/u.exec(title);
+  if (
+    /^\/@[^/]+\/\d+\/?$/u.test(url.pathname) &&
+    quotedPost !== null && norm(quotedPost[2]) === url.hostname &&
+    norm(parsed.meta.get("og:description")).startsWith(norm(quotedPost[1]))
+  ) return true;
+  return (account !== undefined && label === norm(account)) ||
+    ["author", "twitter:creator"].some((key) => {
+      const author = parsed.meta.get(key);
+      return author !== undefined &&
+        label.replace(/^@/u, "") === norm(author).replace(/^@/u, "");
+    });
 }
 
 interface ParsedMetadataHtml {
@@ -694,7 +788,9 @@ function parseMetadataHtml(html: string): ParsedMetadataHtml {
           content !== null &&
           (key === "og:title" || key === "og:description" ||
             key === "twitter:title" || key === "twitter:description" ||
-            key === "description" || key === "og:site_name") &&
+            key === "description" || key === "og:site_name" ||
+            key === "author" || key === "twitter:creator" ||
+            key === "og:url" || key === "og:image:alt") &&
           !meta.has(key)
         ) {
           meta.set(key, content);
@@ -876,9 +972,9 @@ function cleanMetadataText(value: string | undefined): string | null {
     return null;
   }
   const cleaned = value.replace(/\r\n?/gu, "\n").split("\n")
-    .map((line) => line.replace(/\s+/gu, " ").trim()).filter(Boolean).join(
+    .map((line) => line.replace(/\s+/gu, " ").trim()).join(
       "\n",
-    );
+    ).trim();
   return cleaned.length === 0 ? null : cleaned;
 }
 

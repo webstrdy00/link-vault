@@ -7,6 +7,21 @@ import org.junit.Test
 
 class CaptureInputTest {
     @Test
+    fun `preserves valid trailing characters in standalone URLs`() {
+        for (suffix in listOf("!", ";", ",", ":", ".", "?", "'", ")", "%21", "#section!")) {
+            val url = "https://example.com/path?value=abc$suffix"
+            val result = CaptureInput.parse(" \n$url\t ")
+
+            assertEquals(url, listOf(url), result.urls)
+            assertTrue(result.rejected.isEmpty())
+        }
+        assertEquals(
+            listOf("https://example.com/path;"),
+            CaptureInput.parse("https://example.com/path;").urls,
+        )
+    }
+
+    @Test
     fun `extracts multiple unique URLs in encounter order`() {
         val result = CaptureInput.parse(
             "첫 링크 https://example.com/a 다음 http://other.test/path " +

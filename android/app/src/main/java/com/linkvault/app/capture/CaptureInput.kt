@@ -17,6 +17,12 @@ object CaptureInput {
             return ParseResult(inputTooLong = true)
         }
 
+        // A standalone URL is authoritative; punctuation may be part of its path or query.
+        val standalone = validate(text)
+        if (standalone is UrlValidation.Valid) {
+            return ParseResult(urls = listOf(standalone.url))
+        }
+
         val urls = linkedSetOf<String>()
         val rejected = mutableListOf<RejectedCandidate>()
 

@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -573,7 +574,15 @@ internal class AttachmentViewModel(
             it.requestId == requestId && it.state in DISCARDABLE_OUTBOX_STATES
         } ?: return
         launchAction("요청을 버리지 못했어요.") {
-            outbox.discard(boundOwner, entry.requestId)
+            val removed = outbox.discard(boundOwner, entry.requestId)
+            if (!identityMatches()) return@launchAction
+            if (!removed) {
+                mutableUiState.value = mutableUiState.value.copy(
+                    message = null,
+                    actionError = "요청을 버리지 못했어요. 이미 처리 중이거나 완료됐을 수 있어요. 최신 상태를 확인해 주세요.",
+                )
+                return@launchAction
+            }
             mutableUiState.value = mutableUiState.value.copy(
                 commandReview = null,
                 message = "대기 요청을 버렸어요. 서버에 완료된 변경은 되돌리지 않았어요.",
@@ -646,21 +655,30 @@ internal class AttachmentViewModel(
                 val requestId = UUID.randomUUID().toString()
                 outbox.enqueue(boundOwner, requestId, method, path, body)
                 if (!identityMatches()) return@launch
+                var previousRequestRetained = false
                 if (replacesRequestId != null) {
-                    replacedOutboxRequests += replacesRequestId
-                    outbox.discard(boundOwner, replacesRequestId)
+                    val removed = outbox.discard(boundOwner, replacesRequestId)
                     if (!identityMatches()) return@launch
+                    previousRequestRetained = !removed && outbox.observeOutbox(boundOwner).first().any {
+                        it.requestId == replacesRequestId
+                    }
+                    if (!identityMatches()) return@launch
+                    if (!previousRequestRetained) replacedOutboxRequests += replacesRequestId
                 }
                 mutableUiState.value = mutableUiState.value.copy(
                     actionRunning = false,
                     deleteConfirmation = if (kind == AttachmentCommandKind.DELETE) null else {
                         mutableUiState.value.deleteConfirmation
                     },
-                    commandReview = null,
+                    commandReview = mutableUiState.value.commandReview.takeIf { previousRequestRetained },
                     message = when (kind) {
                         AttachmentCommandKind.DELETE -> "이미지 삭제 요청을 이 기기에 보관했어요. 기존 이미지는 서버 처리가 끝날 때까지 보여요."
                         AttachmentCommandKind.OCR -> "OCR 저장 요청을 이 기기에 보관했어요."
                         AttachmentCommandKind.METADATA -> "메타데이터 다시 조회 요청을 이 기기에 보관했어요."
+                    } + if (previousRequestRetained) {
+                        " 이전 요청은 버리지 못해 처리 상태를 계속 확인해요. 서버에 완료된 변경은 되돌리지 않아요."
+                    } else {
+                        ""
                     },
                 )
             } catch (error: CancellationException) {

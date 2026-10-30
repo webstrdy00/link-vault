@@ -103,10 +103,10 @@ class OutboxRepository(
         }
     }
 
-    suspend fun discard(ownerId: String, requestId: String) {
+    suspend fun discard(ownerId: String, requestId: String): Boolean {
         val normalizedOwnerId = ownerId.requireOwnerId()
-        client.withSessionOwner(normalizedOwnerId) {
-            outbox.discard(normalizedOwnerId, requestId)
+        return client.withSessionOwner(normalizedOwnerId) {
+            outbox.discard(normalizedOwnerId, requestId) == 1
         }
     }
 
@@ -559,7 +559,11 @@ class OutboxRepository(
                     action.nextAttemptAt,
                     errorCode,
                     errorMessage,
-                    UploadOutcome.Retry,
+                    if (errorCode == "SESSION_REFRESH_UNAVAILABLE") {
+                        UploadOutcome.Retry
+                    } else {
+                        UploadOutcome.Continue
+                    },
                 )
             }
             FailureAction.Fail -> {

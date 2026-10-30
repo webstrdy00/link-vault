@@ -20,14 +20,21 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.AnnotatedString
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.test.core.app.ActivityScenario
 import androidx.test.espresso.intent.Intents
 import androidx.test.espresso.intent.matcher.IntentMatchers.hasAction
 import androidx.test.espresso.intent.matcher.IntentMatchers.hasData
@@ -35,9 +42,14 @@ import com.linkvault.app.library.LIBRARY_NOTE_MAX_CODE_POINTS
 import com.linkvault.app.library.LIBRARY_TITLE_MAX_CODE_POINTS
 import com.linkvault.app.library.LibraryAvailability
 import com.linkvault.app.library.LibrarySaveForm
+import com.linkvault.app.library.LibrarySaveStatus
 import com.linkvault.app.library.LibraryUiState
+import com.linkvault.app.library.LibraryViewModel
 import com.linkvault.app.library.SaveFormContent
+import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxState
 import com.linkvault.app.ui.VaultTheme
+import kotlinx.coroutines.runBlocking
 import org.hamcrest.Matchers.allOf
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -71,16 +83,23 @@ class CaptureFlowTest {
         multiple: Boolean = false,
         subject: String? = null,
     ) {
+        val deliveryId = java.util.UUID.randomUUID().toString()
         compose.runOnUiThread {
             compose.activity.startActivity(
                 Intent(compose.activity, MainActivity::class.java).apply {
                     action = if (multiple) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND
                     type = mimeType
                     addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    putExtra("test-share-delivery", deliveryId)
                     if (text != null) putExtra(Intent.EXTRA_TEXT, text)
                     if (subject != null) putExtra(Intent.EXTRA_SUBJECT, subject)
                 },
             )
+        }
+        // startActivity returns before the OS delivers onNewIntent; Compose idleness alone
+        // does not prove that the new share replaced the previous Activity intent.
+        compose.waitUntil(10_000) {
+            compose.activity.intent.getStringExtra("test-share-delivery") == deliveryId
         }
         compose.waitForIdle()
     }
@@ -376,5 +395,195 @@ class LinkFirstSaveFormTest {
             .performTextReplacement("수정한 메모")
         compose.onNodeWithText("메모 (선택 사항)").assertTextContains("수정한 메모")
         compose.onNodeWithText("저장").performScrollTo().assertIsEnabled()
+    }
+}
+
+class CaptureCompletionFlowTest {
+    @get:Rule val compose = createEmptyComposeRule()
+    private lateinit var fixture: CaptureCompletionFixture
+
+    @Before
+    fun setUp() {
+        fixture = CaptureCompletionFixture()
+    }
+
+    @After
+    fun tearDown() {
+        if (::fixture.isInitialized) fixture.close()
+    }
+
+    @Test
+    fun savedReceiptClearsCaptureTextAndResumeBanner(): Unit = runBlocking {
+        withCapture("https://example.com/completed-capture") {
+            val request = submit()
+            fixture.complete(request)
+            awaitText("저장했어요.")
+            fixture.awaitAcknowledged(request.requestId, compose)
+            compose.onNodeWithTag("root-library").performClick()
+            assertCaptureCleared()
+        }
+    }
+
+    @Test
+    fun duplicateReceiptClearsBannerAfterReturningToLibrary(): Unit = runBlocking {
+        withCapture("https://example.com/duplicate-capture") {
+            val request = submit()
+            compose.onNodeWithTag("root-library").performClick()
+            compose.onNodeWithText("이어쓰기").assertExists()
+            fixture.complete(request, duplicate = true)
+            fixture.awaitAcknowledged(request.requestId, compose)
+            compose.waitForIdle()
+            assertCaptureCleared()
+        }
+    }
+
+    @Test
+    fun pendingAndFailedRequestsKeepCaptureAndResumeBanner(): Unit = runBlocking {
+        val text = "https://example.com/pending-capture"
+        withCapture(text) {
+            val request = submit()
+            compose.onNodeWithTag("root-library").performClick()
+            compose.onNodeWithText("이어쓰기").assertExists()
+            assertEquals(OutboxState.PENDING, fixture.database.outboxDao()
+                .findByRequestId(request.requestId)?.state)
+            fixture.fail(request)
+            awaitText("입력 내용을 확인해 주세요.")
+            compose.onNodeWithText("이어쓰기").performClick()
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertTextContains(text)
+            fixture.awaitDraftWrites()
+            assertEquals(text, fixture.outbox.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID)?.text)
+        }
+    }
+
+    @Test
+    fun oldCompletionCannotEraseNewIdenticalShareOrItsSelection(): Unit = runBlocking {
+        val firstUrl = "https://example.com/share-first"
+        val secondUrl = "https://example.com/share-second"
+        val text = "$firstUrl $secondUrl"
+        withCapture(text) { scenario ->
+            compose.onNodeWithText(secondUrl).performScrollTo().performClick()
+            val request = submit()
+            share(scenario, text)
+            compose.onNodeWithText("원문 열기").performScrollTo().assertIsNotEnabled()
+            compose.onNodeWithText(firstUrl).performScrollTo().performClick()
+            compose.onNodeWithTag("root-library").performClick()
+            fixture.complete(request)
+            fixture.awaitAcknowledged(request.requestId, compose)
+            compose.waitForIdle()
+            compose.onNodeWithText("이어쓰기").performClick()
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertTextContains(text)
+            compose.onNodeWithText("원문 열기").performScrollTo().assertIsEnabled()
+            fixture.awaitDraftWrites()
+            val draft = fixture.outbox.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID)
+            assertEquals(text, draft?.text)
+            assertEquals(firstUrl, draft?.selectedUrl)
+        }
+    }
+
+    @Test
+    fun retryRemovalExplainsServerUncertaintyAndKeepsCapture(): Unit = runBlocking {
+        val text = "https://example.com/retry-removal"
+        withCapture(text) {
+            val request = submit()
+            compose.onNodeWithTag("root-library").performClick()
+            fixture.fail(request, OutboxState.RETRY)
+            awaitText("연결되면 다시 동기화")
+            compose.onNodeWithText(
+                "서버에 이미 반영됐을 수 있어요. 대기 요청 제거는 추가 재전송만 중단하며 서버의 변경을 취소하지 않아요.",
+            ).assertExists()
+            compose.onNodeWithText("대기 요청 제거").performScrollTo().performClick()
+            fixture.awaitAcknowledged(request.requestId, compose)
+            compose.onNodeWithText("이어쓰기").performClick()
+            compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertTextContains(text)
+        }
+    }
+
+    @Test
+    fun runningRequestCannotBeDiscardedOrReleaseSaveState(): Unit = runBlocking {
+        val store = ViewModelStore()
+        lateinit var model: LibraryViewModel
+        try {
+            compose.runOnUiThread {
+                model = ViewModelProvider(
+                    store,
+                    LibraryViewModel.factory(
+                        client = fixture.client,
+                        outbox = fixture.outbox,
+                        attachments = fixture.attachments,
+                        ownerId = fixture.ownerId,
+                        sessionGeneration = fixture.client.sessionState.value.generation,
+                        initialUrl = "https://example.com/discard-race",
+                        sharedText = "https://example.com/discard-race",
+                    ),
+                )[LibraryViewModel::class.java]
+                model.save()
+            }
+            val request = fixture.awaitRequest()
+            fixture.claim(request)
+            compose.runOnUiThread { model.discardOperation(request.requestId) }
+            compose.waitUntil(10_000) { model.uiState.value.queueError != null }
+            assertEquals(
+                "이미 전송 중이거나 완료되어 대기 요청을 취소할 수 없습니다.",
+                model.uiState.value.queueError,
+            )
+            assertEquals(LibrarySaveStatus.Queued(request.requestId), model.uiState.value.saveStatus)
+            assertEquals(OutboxState.RUNNING, fixture.database.outboxDao()
+                .findByRequestId(request.requestId)?.state)
+            assertEquals("https://example.com/discard-race", model.uiState.value.form.initialUrl)
+        } finally {
+            compose.runOnUiThread { store.clear() }
+        }
+    }
+
+    private suspend fun withCapture(
+        text: String,
+        block: suspend (ActivityScenario<MainActivity>) -> Unit,
+    ) {
+        val launchIntent = Intent(fixture.app, MainActivity::class.java).apply {
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        ActivityScenario.launch<MainActivity>(launchIntent).use { scenario ->
+            try {
+                share(scenario, text)
+                block(scenario)
+            } finally {
+                scenario.onActivity { it.intent = Intent(launchIntent) }
+            }
+        }
+    }
+
+    private fun share(scenario: ActivityScenario<MainActivity>, text: String) {
+        scenario.onActivity { activity ->
+            activity.startActivity(Intent(activity, MainActivity::class.java).apply {
+                action = Intent.ACTION_SEND
+                type = "text/plain"
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra(Intent.EXTRA_TEXT, text)
+            })
+        }
+        awaitText(text)
+    }
+
+    private suspend fun submit(): OutboxEntry {
+        compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
+        awaitText("저장")
+        compose.onNodeWithText("저장").performScrollTo().performClick()
+        return fixture.awaitRequest()
+    }
+
+    private fun assertCaptureCleared() {
+        compose.onNodeWithText("이어쓰기").assertDoesNotExist()
+        compose.onNodeWithTag("root-capture").performClick()
+        compose.onNodeWithText("공유 텍스트 또는 원문 URL").assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")),
+        )
+        compose.onNodeWithText("원문 열기").performScrollTo().assertIsNotEnabled()
+    }
+
+    private fun awaitText(text: String) {
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
+        }
     }
 }

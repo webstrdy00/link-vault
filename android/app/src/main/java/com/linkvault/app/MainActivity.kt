@@ -101,7 +101,8 @@ class MainActivity : ComponentActivity() {
         handledLogoutGeneration = currentLogout
         if (staleState) setIntent(Intent(this, MainActivity::class.java))
 
-        capture = readIncomingCapture(intent, sequence = 0)
+        nextSequence = if (staleState) 0 else savedInstanceState?.getInt("capture_sequence", 0) ?: 0
+        capture = readIncomingCapture(intent, sequence = nextSequence)
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         if (fromHistory && savedInstanceState == null) capture = IncomingCapture()
         if (capture.isExternalShare && !staleState && savedInstanceState == null && !fromHistory) {
@@ -144,6 +145,7 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putLong("capture_logout_generation", handledLogoutGeneration)
+        outState.putInt("capture_sequence", nextSequence)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -175,6 +177,12 @@ class MainActivity : ComponentActivity() {
         var discoveryEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
         var saveUrl by rememberSaveable { mutableStateOf<String?>(null) }
         var saveSharedText by rememberSaveable { mutableStateOf("") }
+        // Match receipts to an input revision, not to text or URLs that a later share may repeat.
+        var inputRevision by rememberSaveable { mutableIntStateOf(0) }
+        var appliedCaptureSequence by rememberSaveable { mutableIntStateOf(capture.sequence) }
+        var saveCaptureRevision by rememberSaveable { mutableIntStateOf(0) }
+        var saveCaptureSequence by rememberSaveable { mutableIntStateOf(capture.sequence) }
+        var captureSaveRequestIds by rememberSaveable { mutableStateOf(emptyList<String>()) }
 
         var input by rememberSaveable { mutableStateOf(capture.text) }
         var selectedUrl by rememberSaveable { mutableStateOf(capture.selectedUrl) }
@@ -247,6 +255,8 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(logoutGeneration) {
             if (logoutGeneration != handledLogoutGeneration) {
+                inputRevision += 1
+                captureSaveRequestIds = emptyList()
                 input = ""
                 selectedUrl = null
                 closePrivateRoutes()
@@ -266,7 +276,10 @@ class MainActivity : ComponentActivity() {
         }
 
         LaunchedEffect(capture.sequence) {
-            if (capture.sequence > 0) {
+            if (capture.sequence != appliedCaptureSequence) {
+                appliedCaptureSequence = capture.sequence
+                inputRevision += 1
+                captureSaveRequestIds = emptyList()
                 input = capture.text
                 selectedUrl = capture.selectedUrl
                 inputLimitExceeded = capture.text.length > CaptureInput.MAX_INPUT_LENGTH
@@ -316,11 +329,37 @@ class MainActivity : ComponentActivity() {
             saveEntryId = UUID.randomUUID().toString()
             saveUrl = url
             saveSharedText = sharedText
+            saveCaptureRevision = inputRevision
+            saveCaptureSequence = capture.sequence
             showCapture = false
             showPrivacy = false
             discoveryItemId = null
             pendingDiscoverySource = null
             saveFlowActive = true
+        }
+        val captureSaved: (String) -> Unit = { requestId ->
+            if (requestId in captureSaveRequestIds &&
+                appliedCaptureSequence == this@MainActivity.capture.sequence
+            ) {
+                inputRevision += 1
+                captureSaveRequestIds = emptyList()
+                draftTouched = true
+                input = ""
+                selectedUrl = null
+                inputLimitExceeded = false
+                openError = null
+                app.persistCapture("", null)
+                if (!capture.isImageShare) {
+                    setIntent(Intent(this@MainActivity, MainActivity::class.java))
+                }
+            }
+        }
+        val captureSaveReplaced: (String, String?) -> Unit = { requestId, previousRequestId ->
+            if (previousRequestId != null && previousRequestId in captureSaveRequestIds &&
+                appliedCaptureSequence == this@MainActivity.capture.sequence
+            ) {
+                captureSaveRequestIds = captureSaveRequestIds + requestId
+            }
         }
 
         val openCapture: () -> Unit = {
@@ -406,6 +445,8 @@ class MainActivity : ComponentActivity() {
                         onToggleHelp = { showCaptureHelp = !showCaptureHelp },
                         onInputChange = { newValue ->
                             draftTouched = true
+                            inputRevision += 1
+                            captureSaveRequestIds = emptyList()
                             input = newValue
                             selectedUrl = null
                             inputLimitExceeded = newValue.length > CaptureInput.MAX_INPUT_LENGTH
@@ -413,6 +454,8 @@ class MainActivity : ComponentActivity() {
                             app.persistCapture(newValue, null)
                         },
                         onUrlSelected = { url ->
+                            inputRevision += 1
+                            captureSaveRequestIds = emptyList()
                             selectedUrl = url
                             openError = null
                             draftTouched = true
@@ -431,6 +474,8 @@ class MainActivity : ComponentActivity() {
                         },
                         onClear = {
                             draftTouched = true
+                            inputRevision += 1
+                            captureSaveRequestIds = emptyList()
                             input = ""
                             selectedUrl = null
                             inputLimitExceeded = false
@@ -456,6 +501,17 @@ class MainActivity : ComponentActivity() {
                                 entryId = saveEntryId,
                                 initialUrl = saveUrl,
                                 sharedText = saveSharedText,
+                                onCaptureSaveStarted = { requestId, previousRequestId ->
+                                    if (previousRequestId == null &&
+                                        saveCaptureRevision == inputRevision &&
+                                        saveCaptureSequence == this@MainActivity.capture.sequence
+                                    ) {
+                                        captureSaveRequestIds = captureSaveRequestIds + requestId
+                                    } else {
+                                        captureSaveReplaced(requestId, previousRequestId)
+                                    }
+                                },
+                                onCaptureSaved = captureSaved,
                                 incomingImageUri = incomingImageDraft?.uri,
                                 onIncomingImageConsumed = consumeIncomingImage,
                                 onBack = {
@@ -482,6 +538,8 @@ class MainActivity : ComponentActivity() {
                                 initialUrl = null,
                                 sharedText = "",
                                 initialItemId = discoveryItemId,
+                                onCaptureSaveStarted = captureSaveReplaced,
+                                onCaptureSaved = captureSaved,
                                 incomingImageUri = incomingImageDraft?.uri,
                                 onIncomingImageConsumed = consumeIncomingImage,
                                 onBack = { discoveryItemId = null },
@@ -502,6 +560,8 @@ class MainActivity : ComponentActivity() {
                                 onAdd = openCapture,
                                 initialUrl = null,
                                 sharedText = "",
+                                onCaptureSaveStarted = captureSaveReplaced,
+                                onCaptureSaved = captureSaved,
                                 incomingImageUri = incomingImageDraft?.uri,
                                 onIncomingImageConsumed = consumeIncomingImage,
                                 onBack = {},

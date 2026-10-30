@@ -1169,6 +1169,7 @@ function validateItemBody(value: unknown): ItemPreparationInput {
       `url must be a string of at most ${MAX_URL_CHARACTERS} characters.`,
     );
   }
+  validatePostgresJsonbString(value.url, "url");
   validateOptionalString(value, "title", MAX_TITLE_CHARACTERS);
   validateOptionalString(value, "shared_text", MAX_TEXT_CHARACTERS);
   validateOptionalString(value, "note", MAX_TEXT_CHARACTERS);
@@ -1377,6 +1378,7 @@ function validateOptionalString(
       `${field} must be a string of at most ${maxCharacters} characters.`,
     );
   }
+  validatePostgresJsonbString(fieldValue, field);
 }
 
 function validateOptionalNullableString(
@@ -1394,6 +1396,19 @@ function validateOptionalNullableString(
   ) {
     throw invalidItemBodyError(
       `${field} must be null or a string of at most ${maxCharacters} characters.`,
+    );
+  }
+  validatePostgresJsonbString(fieldValue, field);
+}
+
+function validatePostgresJsonbString(
+  value: string,
+  field: "url" | "title" | "shared_text" | "note",
+): void {
+  // Unicode mode matches code points, leaving valid surrogate pairs intact.
+  if (value.includes("\u0000") || /[\uD800-\uDFFF]/u.test(value)) {
+    throw invalidItemBodyError(
+      `${field} must not contain NUL or unpaired Unicode surrogates.`,
     );
   }
 }

@@ -1,6 +1,9 @@
 package com.linkvault.app.library
 
 import java.net.URI
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -24,7 +27,19 @@ private val libraryJson = Json { ignoreUnknownKeys = true }
 private const val LIBRARY_COMPACT_TITLE_MAX_CODE_POINTS = 60
 private val libraryTitleWhitespace = Regex("[\\s\\p{Z}]+")
 private val libraryTitleSentenceEnd = Regex("""[.!?。！？]+["'”’」』)]*(?= |$)""")
-private val libraryContentWhitespace = Regex("\\s+")
+private val libraryContentWhitespace = Regex("[\\s\\p{Z}]+")
+
+internal fun LibraryItemSummary.cardPreview(): String? =
+    noteExcerpt?.takeUnless(String::isBlank) ?: contentExcerpt?.takeUnless(String::isBlank)
+
+internal fun formatLibrarySavedDate(createdAt: String?): String? =
+    createdAt?.takeUnless(String::isBlank)?.let { value ->
+        runCatching {
+            DateTimeFormatter.ofPattern("yyyy.MM.dd")
+                .withZone(ZoneId.systemDefault())
+                .format(Instant.from(DateTimeFormatter.ISO_DATE_TIME.parse(value)))
+        }.getOrNull()
+    }
 
 internal fun compactLibraryTitle(title: String?, url: String): String {
     val original = title?.takeUnless(String::isBlank) ?: url
@@ -95,7 +110,7 @@ data class LibraryEditForm(
 
 internal fun LibraryItemDetail.editForm() = LibraryEditForm(
     title = editableTitle(),
-    note = displayedContent().orEmpty(),
+    note = note.orEmpty(),
 )
 
 sealed interface LibraryEditPreparation {
@@ -525,6 +540,7 @@ data class LibraryItemSummary(
     @SerialName("display_title") val displayTitle: String? = null,
     val source: String? = null,
     @SerialName("note_excerpt") val noteExcerpt: String? = null,
+    @SerialName("content_excerpt") val contentExcerpt: String? = null,
     @SerialName("category_refs") val categoryRefs: List<LibraryCategoryRef> = emptyList(),
     @SerialName("has_attachment") val hasAttachment: Boolean? = null,
     @SerialName("metadata_state") val metadataState: String? = null,
@@ -546,6 +562,7 @@ data class LibraryItemDetail(
     @SerialName("display_title") val displayTitle: String? = null,
     val source: String? = null,
     @SerialName("note_excerpt") val noteExcerpt: String? = null,
+    @SerialName("content_excerpt") val contentExcerpt: String? = null,
     @SerialName("category_refs") val categoryRefs: List<LibraryCategoryRef> = emptyList(),
     @SerialName("has_attachment") val hasAttachment: Boolean? = null,
     @SerialName("metadata_state") val metadataState: String? = null,
@@ -578,15 +595,36 @@ data class LibraryItemDetail(
 fun LibraryItemDetail.editableTitle(): String =
     userTitle?.takeUnless(String::isBlank) ?: compactLibraryTitle(displayTitle, url)
 
-fun LibraryItemDetail.displayedContent(): String? =
-    note?.takeUnless(String::isBlank)
-        ?: listOf(bodyText, description, sharedText).firstOrNull { text ->
+internal data class LibrarySourceContent(val label: String, val text: String)
+
+internal fun LibraryItemDetail.sourceContent(): LibrarySourceContent? {
+    val content = listOf("본문" to bodyText, "미리보기" to description, "공유한 내용" to sharedText)
+        .firstOrNull { (_, text) ->
             !text.isNullOrBlank() && !text.trim().split(libraryContentWhitespace).all { part ->
                 part.startsWith("https://", ignoreCase = true) ||
                     part.startsWith("http://", ignoreCase = true) ||
                     part.startsWith("www.", ignoreCase = true)
             }
-        }
+        } ?: return null
+    val text = content.second ?: return null
+    if (text.replace(libraryContentWhitespace, " ").trim() ==
+        note?.replace(libraryContentWhitespace, " ")?.trim()
+    ) return null
+    return LibrarySourceContent(content.first, text)
+}
+
+internal fun LibraryItemDetail.metadataStatusMessage(): String? = when (metadataState) {
+    "queued" -> if (extractionMeta.errorCode.isNullOrBlank()) {
+        "링크 정보를 가져오기 위해 대기 중이에요."
+    } else {
+        "링크 정보를 다시 가져오기 위해 대기 중이에요."
+    }
+    "running" -> "링크 정보를 가져오고 있어요."
+    "failed" -> "링크 정보를 가져오지 못했어요."
+    "unsupported" -> "이 링크는 내용 수집을 지원하지 않아요."
+    "partial" -> "링크 정보의 일부만 가져왔어요."
+    else -> null
+}
 
 fun LibraryItemDetail.currentClassificationExplanations(
     category: LibraryCategoryRef,

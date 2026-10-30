@@ -15,6 +15,7 @@ import android.os.Build
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.junit4.ComposeTestRule
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -22,21 +23,53 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
+import androidx.room.Room
 import androidx.test.filters.SdkSuppress
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.espresso.intent.Intents
 import androidx.test.espresso.intent.matcher.IntentMatchers.hasAction
 import androidx.test.espresso.intent.matcher.IntentMatchers.hasData
+import androidx.work.Configuration
+import androidx.work.ListenableWorker
+import androidx.work.Worker
+import androidx.work.WorkerFactory
+import androidx.work.WorkerParameters
+import androidx.work.WorkManager
+import androidx.work.testing.SynchronousExecutor
+import androidx.work.testing.WorkManagerTestInitHelper
+import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.attachment.IncomingImageCaptureException
 import com.linkvault.app.attachment.IncomingImageCaptureFailure
 import com.linkvault.app.attachment.IncomingImageStore
+import com.linkvault.app.auth.AccountClient
+import com.linkvault.app.auth.SessionBoundary
+import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxRepository
+import com.linkvault.app.storage.OutboxState
+import com.linkvault.app.storage.UploadWorker
+import com.linkvault.app.storage.VaultDatabase
 import com.linkvault.app.test.FixtureImageProvider
+import io.github.jan.supabase.SupabaseClient
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.auth.status.RefreshFailureCause
+import io.github.jan.supabase.auth.status.SessionStatus
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.hamcrest.Matchers.allOf
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -94,6 +127,45 @@ class CapturePersistenceTest {
     }
 
     @Test
+    fun pendingCaptureCompletionSurvivesRecreationAndDoesNotRestoreOnFreshLaunch(): Unit = runBlocking {
+        CaptureCompletionFixture().use { fixture ->
+            val shareIntent = Intent(fixture.app, MainActivity::class.java).apply {
+                action = Intent.ACTION_SEND
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, "https://example.com/recreated-completion")
+            }
+            ActivityScenario.launch<MainActivity>(shareIntent).use { scenario ->
+                try {
+                    compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
+                    compose.waitUntil(10_000) {
+                        compose.onAllNodesWithText("저장").fetchSemanticsNodes().isNotEmpty()
+                    }
+                    compose.onNodeWithText("저장").performScrollTo().performClick()
+                    val request = fixture.awaitRequest()
+                    scenario.recreate()
+                    fixture.complete(request)
+                    fixture.awaitAcknowledged(request.requestId, compose)
+                    compose.onNodeWithTag("root-library").performClick()
+                    compose.onNodeWithText("이어쓰기").assertDoesNotExist()
+                    fixture.awaitDraftWrites()
+                    assertNull(fixture.outbox.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID))
+                } finally {
+                    scenario.onActivity { it.intent = Intent(shareIntent) }
+                }
+            }
+            val launchIntent = Intent(fixture.app, MainActivity::class.java).apply {
+                action = Intent.ACTION_MAIN
+                addCategory(Intent.CATEGORY_LAUNCHER)
+            }
+            ActivityScenario.launch<MainActivity>(launchIntent).use {
+                compose.onNodeWithText("이어쓰기").assertDoesNotExist()
+                compose.onNodeWithTag("root-capture").performClick()
+                compose.onNodeWithText("선택한 링크 보관").performScrollTo().assertIsNotEnabled()
+            }
+        }
+    }
+
+    @Test
     @SdkSuppress(minSdkVersion = Build.VERSION_CODES.Q)
     @TargetApi(Build.VERSION_CODES.Q)
     fun incomingImagePointerSurvivesRecreationAndRejectsOversizeAndStaleCapture() = runBlocking {
@@ -116,6 +188,7 @@ class CapturePersistenceTest {
             store.clear()
             val smallUri = FixtureImageProvider.uriForFile(smallSource)
             val oversizedUri = FixtureImageProvider.uriForFile(oversizedSource)
+            assertEquals("${app.packageName}.test.fixture-images", smallUri.authority)
             assertEquals("image/png", app.contentResolver.getType(smallUri))
             assertEquals("image/png", app.contentResolver.getType(oversizedUri))
 
@@ -348,5 +421,146 @@ class CapturePersistenceTest {
             selection: String?,
             selectionArgs: Array<out String>?,
         ): Int = 0
+    }
+}
+
+/** Offline receipt fixture: real enqueue, Room, ViewModels and acknowledgement; no HTTP upload. */
+internal class CaptureCompletionFixture : AutoCloseable {
+    val app = ApplicationProvider.getApplicationContext<LinkVaultApplication>()
+    val ownerId = "f0000000-0000-4000-8000-000000000001"
+    val database: VaultDatabase
+    val client: AccountClient
+    val outbox: OutboxRepository
+    val attachments: AttachmentRepository
+    private val originalDelegates = mutableMapOf<String, Any>()
+    private val originalWorkManager: WorkManager
+
+    init {
+        awaitDraftWrites()
+        check(!app.accountClient.hasSession()) { "Capture fixture requires a signed-out test app." }
+        database = Room.inMemoryDatabaseBuilder(app, VaultDatabase::class.java).build()
+        client = AccountClient(
+            context = app,
+            url = "https://capture-fixture.invalid",
+            key = "fixture-public-key",
+            googleWebClientId = "fixture-client",
+            debug = true,
+            localDataOwner = { ownerId },
+            beforeSignOut = {},
+            onSessionOwner = {},
+        )
+        // Keep list recovery offline without clearing the owner-bound session or making requests.
+        val supabase = field(client, "supabase").get(client) as SupabaseClient
+        @Suppress("UNCHECKED_CAST")
+        val status = field(supabase.auth, "_sessionStatus").get(supabase.auth)
+            as MutableStateFlow<SessionStatus>
+        status.value = SessionStatus.RefreshFailure(
+            RefreshFailureCause.NetworkError(IOException("Offline capture fixture")),
+        )
+        val boundary = field(client, "sessionBoundary").get(client) as SessionBoundary
+        runBlocking {
+            boundary.locked {
+                beginRestore(ownerId)
+                markInitialized()
+            }
+        }
+        outbox = OutboxRepository(app, client, database)
+        attachments = AttachmentRepository(app, client, outbox, database)
+        originalWorkManager = WorkManager.getInstance(app)
+        WorkManagerTestInitHelper.initializeTestWorkManager(
+            app,
+            Configuration.Builder()
+                .setExecutor(SynchronousExecutor())
+                .setWorkerFactory(object : WorkerFactory() {
+                    override fun createWorker(
+                        appContext: Context,
+                        workerClassName: String,
+                        workerParameters: WorkerParameters,
+                    ): ListenableWorker? = if (workerClassName == UploadWorker::class.java.name) {
+                        object : Worker(appContext, workerParameters) {
+                            override fun doWork(): Result = Result.success()
+                        }
+                    } else {
+                        null
+                    }
+                })
+                .build(),
+        )
+        install("accountClient", client)
+        install("outboxRepository", outbox)
+        install("attachmentRepository", attachments)
+    }
+
+    suspend fun awaitRequest(): OutboxEntry = withTimeout(10_000) {
+        database.outboxDao().observe(ownerId).first { entries ->
+            entries.any { it.method == "POST" && it.path == "/items" }
+        }.single { it.method == "POST" && it.path == "/items" }
+    }
+
+    suspend fun complete(entry: OutboxEntry, duplicate: Boolean = false) {
+        val url = Json.parseToJsonElement(entry.payloadJson).jsonObject.getValue("url")
+            .jsonPrimitive.content
+        val result = buildJsonObject {
+            put("duplicate", duplicate)
+            put("item", buildJsonObject {
+                put("id", "f0000000-0000-4000-8000-000000000002")
+                put("version", 1)
+                put("url", url)
+                put("display_title", "완료한 링크")
+            })
+        }
+        val claimed = claim(entry)
+        check(database.outboxDao().completeSaved(
+            ownerId, entry.requestId, checkNotNull(claimed.leaseUntil), result.toString(),
+        ) == 1)
+    }
+
+    suspend fun fail(entry: OutboxEntry, state: OutboxState = OutboxState.FAILED) {
+        val claimed = claim(entry)
+        check(database.outboxDao().completeFailure(
+            ownerId, entry.requestId, checkNotNull(claimed.leaseUntil), state,
+            System.currentTimeMillis() + 60_000L,
+            if (state == OutboxState.RETRY) "DEPENDENCY_UNAVAILABLE" else "INVALID_BODY",
+            "입력 내용을 확인해 주세요.",
+        ) == 1)
+    }
+
+    suspend fun claim(entry: OutboxEntry): OutboxEntry {
+        val now = System.currentTimeMillis()
+        return checkNotNull(database.outboxDao().claimNext(ownerId, now, now + 60_000L)).also {
+            check(it.requestId == entry.requestId)
+        }
+    }
+
+    fun awaitAcknowledged(requestId: String, compose: ComposeTestRule) {
+        // Acknowledgement starts in LaunchedEffect after recomposition, so advance test frames.
+        compose.waitUntil(10_000) {
+            runBlocking { database.outboxDao().findByRequestId(requestId) == null }
+        }
+    }
+
+    fun awaitDraftWrites() = runBlocking {
+        val scope = field(app, "applicationScope").get(app) as CoroutineScope
+        scope.coroutineContext[Job]?.children?.toList()?.forEach { it.join() }
+    }
+
+    private fun install(name: String, value: Any) {
+        val delegate = field(app, "$name\$delegate")
+        originalDelegates[name] = checkNotNull(delegate.get(app))
+        delegate.set(app, lazyOf(value))
+    }
+
+    override fun close() {
+        awaitDraftWrites()
+        WorkManager.getInstance(app).cancelAllWork().result.get(10, TimeUnit.SECONDS)
+        originalDelegates.forEach { (name, original) -> field(app, "$name\$delegate").set(app, original) }
+        WorkManagerTestInitHelper.closeWorkDatabase()
+        val managerClass = Class.forName("androidx.work.impl.WorkManagerImpl")
+        managerClass.getDeclaredMethod("setDelegate", managerClass).invoke(null, originalWorkManager)
+        database.close()
+    }
+
+    private fun field(target: Any, name: String) = target.javaClass.getDeclaredField(name).apply {
+        isAccessible = true
     }
 }

@@ -71,12 +71,16 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.library.LibraryItemSummary
+import com.linkvault.app.library.cardPreview
 import com.linkvault.app.library.codePointLength
+import com.linkvault.app.library.compactLibraryTitle
+import com.linkvault.app.library.formatLibrarySavedDate
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
@@ -843,7 +847,7 @@ private fun SearchResults(
 }
 
 @Composable
-private fun SearchResultCard(
+internal fun SearchResultCard(
     item: LibraryItemSummary,
     onOpen: () -> Unit,
     onOpenAliasDisclosure: () -> Unit,
@@ -861,18 +865,31 @@ private fun SearchResultCard(
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        formatLibrarySavedDate(item.createdAt)?.let { date ->
+            Text(
+                text = "저장 · $date",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Text(
-            text = item.displayTitle?.takeUnless(String::isBlank) ?: item.url,
+            text = compactLibraryTitle(item.displayTitle, item.url),
+            modifier = Modifier.testTag("search-item-title-${item.id}"),
             fontSize = 17.sp,
             lineHeight = 24.sp,
             fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
-        item.noteExcerpt?.takeUnless(String::isBlank)?.let { excerpt ->
+        item.cardPreview()?.let { excerpt ->
             Text(
                 text = excerpt,
+                modifier = Modifier.testTag("search-item-preview-${item.id}"),
                 fontSize = 13.sp,
                 lineHeight = 20.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
         if (item.categoryRefs.isEmpty()) {

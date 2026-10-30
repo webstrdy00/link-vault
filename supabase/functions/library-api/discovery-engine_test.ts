@@ -820,3 +820,214 @@ Deno.test("rules metadata returns isolated arrays for read-only responses", () =
   );
   assert(first.aliases.length > 0);
 });
+
+Deno.test("common SNS compounds classify conservatively in authored and metadata fields", () => {
+  const cases: Array<[string, string[]]> = [
+    ["제주여행 맛집추천", ["travel", "food"]],
+    ["제주 여행 맛집 추천", ["travel", "food"]],
+    ["#제주여행 #맛집추천", ["travel", "food"]],
+    ["제주여행은 맛집추천과 함께", ["travel", "food"]],
+    ["해외여행 국내여행", ["travel"]],
+    ["식당추천 카페추천", ["food"]],
+    ["초제주여행 맛집추천서 제주여행객 _맛집추천", []],
+    ["𐐀제주여행 맛집추천𐒠", []],
+    ["Python regius is a nonvenomous snake", []],
+    ["ball python", []],
+    ["python is a nonvenomous snake", []],
+    ["Python regius 관찰 기록을 python으로 분석", ["work"]],
+    ["파이썬 python SQL", ["work"]],
+    ["요리법은 없고 여행 얘기만 있어요", ["travel"]],
+    ["맛집추천은 아니고 숙소 이야기", ["travel"]],
+    ["요리법은 없고 다른 레시피를 소개합니다", ["food"]],
+    ["요리법은 없고 요리법은 없어요", []],
+    ["맛집은 없다는 소문", ["food"]],
+  ];
+  for (const [text, expected] of cases) {
+    for (
+      const field of ["user_title", "shared", "description", "body"] as const
+    ) {
+      assertEquals(
+        classifyItem({ [field]: text }).categories.map((category) =>
+          category.code
+        ),
+        expected,
+        `${field}: ${text}`,
+      );
+    }
+  }
+  assertEquals(
+    referenceClassification({
+      title: "제주여행 맛집추천",
+      manual_override: true,
+      manual_categories: ["work"],
+    }),
+    ["work"],
+  );
+});
+
+Deno.test("single-pass negation preserves adjacent cues and Unicode boundaries", () => {
+  const cases: Array<[string, string[]]> = [
+    ["요리법은 없고 여행은 없어요", []],
+    ["여행은 없고 요리법은 없어요", []],
+    ["맛집추천은 아니고 카페 추천은 없고 SQL은 없습니다", []],
+    ["여행 일정은 없고 여행은 없고 맛집은 없어요", []],
+    ["요리법은 없고 요리법은 없어요 여행", ["travel"]],
+    ["여행은 없고 맛집은 없고 엑셀은 없고 수면", ["life"]],
+    ["요리법은 없고,여행은 없어요!SQL", ["work"]],
+    ["😀요리법은 없고😀여행은 없어요", []],
+    ["맛집은 없고𐐀 여행", ["travel", "food"]],
+    ["맛집은 없다는 소문 여행은 없어요", ["food"]],
+    ["", []],
+  ];
+  // Repeat across fields/calls to detect accidental state from the global regex.
+  for (const field of ["note", "fetched_title", "body"] as const) {
+    for (const [text, expected] of cases) {
+      assertEquals(
+        classifyItem({ [field]: text }).categories.map((category) =>
+          category.code
+        ),
+        expected,
+        `${field}: ${text}`,
+      );
+    }
+  }
+});
+
+Deno.test("negated and snake cues cannot leak into classification explanations", () => {
+  const snapshot = {
+    fetched_title: "요리법은 없고 여행 얘기만 있어요",
+    body: "Python regius is a nonvenomous snake",
+  };
+  const result = classifyItem(snapshot);
+  assertEquals(result.categories.map((category) => category.code), ["travel"]);
+  assertEquals(explainClassification(snapshot, result), [{
+    category_code: "travel",
+    rule_id: "travel:strong:0",
+    field: "fetched_title",
+    expression: "여행",
+  }]);
+});
+
+Deno.test("casual retrieval prefixes remove only scoped mandatory terms", () => {
+  for (const prefix of ["지난번 저장한", "전에 저장한", "아까 저장한"]) {
+    const query = `${prefix} 제주 숙소`;
+    const plan = prepareSearch(query);
+    assertEquals(plan, {
+      query,
+      terms: ["제주", "숙소"],
+      groups: [
+        { kind: "literal", value: "제주" },
+        { kind: "literal", value: "숙소" },
+      ],
+    });
+    assertEquals(scoreReferenceSearch({ body: "제주 숙소" }, plan), {
+      mode: "literal",
+      bucket: 0,
+      score: 6,
+    });
+    assertEquals(scoreReferenceSearch({ body: "제주 맛집" }, plan), null);
+  }
+  for (
+    const query of [
+      "지난번 저장한",
+      "지난번 저장한 unknown",
+      "지난번 저장한 python_regius()",
+      '"지난번 저장한 제주 숙소"',
+      "지난번 저장한 제주 숙소 코드()",
+      "메모 지난번 저장한 제주 숙소",
+    ]
+  ) {
+    const plan = prepareSearch(query);
+    assertEquals(plan.terms, [...new Set(query.split(" "))], query);
+    assertEquals(
+      scoreReferenceSearch({ body: "제주 숙소" }, plan),
+      null,
+      query,
+    );
+  }
+});
+
+Deno.test("SNS query compounds work against existing literal indexes and known aliases", () => {
+  const cases: Array<[string, string[], string[], string]> = [
+    ["제주여행 맛집추천", ["제주여행", "맛집추천"], [
+      "제주",
+      "여행",
+      "맛집",
+      "추천",
+    ], "제주 여행 맛집 추천"],
+    ["#제주여행 #맛집추천", ["제주여행", "맛집추천"], [
+      "제주",
+      "여행",
+      "맛집",
+      "추천",
+    ], "제주 여행 맛집 추천"],
+    [
+      "식당추천 카페추천",
+      ["식당추천", "카페추천"],
+      ["식당", "추천", "카페"],
+      "식당 추천 카페 추천",
+    ],
+    ["#제주 #숙소", ["제주", "숙소"], ["제주", "숙소"], "제주 숙소"],
+    ["제주 여행 맛집 추천", ["제주", "여행", "맛집", "추천"], [
+      "제주",
+      "여행",
+      "맛집",
+      "추천",
+    ], "#제주여행 #맛집추천"],
+  ];
+  for (const [query, terms, groups, body] of cases) {
+    const plan = prepareSearch(query);
+    assertEquals(plan.terms, terms, query);
+    assertEquals(
+      plan.groups,
+      groups.map((value) => ({ kind: "literal", value })),
+      query,
+    );
+    assert(scoreReferenceSearch({ body }, plan) !== null, query);
+    assertEquals(scoreReferenceSearch({ body: "제주" }, plan), null, query);
+  }
+  const aliasPlan = prepareSearch("#카톡프사");
+  assertEquals(aliasPlan.terms, ["카톡프사"]);
+  assertEquals(aliasPlan.groups, [
+    { kind: "concept", value: "kakaotalk" },
+    { kind: "concept", value: "profile_photo" },
+  ]);
+  assertEquals(
+    scoreReferenceSearch({ body: "카카오톡 프로필 사진" }, aliasPlan),
+    { mode: "alias", bucket: 1, score: 6 },
+  );
+  for (
+    const query of [
+      "#미등록태그",
+      "제주여행객",
+      "맛집추천서",
+      "C#",
+      "python_regius",
+      "__proto__",
+      "constructor",
+    ]
+  ) {
+    assertEquals(prepareSearch(query), {
+      query: query.toLowerCase(),
+      terms: [query.toLowerCase()],
+      groups: [{ kind: "literal", value: query.toLowerCase() }],
+    });
+  }
+});
+
+Deno.test("query limits apply before retrieval cleanup and after compound expansion", () => {
+  assertThrows(
+    () => prepareSearch(`지난번 저장한 제주 숙소 ${"a".repeat(200)}`),
+    QueryLimitError,
+  );
+  assertThrows(
+    () => prepareSearch("지난번 저장한 제주 숙소 a b c d e f g"),
+    QueryLimitError,
+  );
+  assertThrows(
+    () => prepareSearch("제주여행 맛집추천 a b c d e f g"),
+    QueryLimitError,
+  );
+  assertEquals(prepareSearch("a".repeat(200)).terms, ["a".repeat(200)]);
+  assertEquals(prepareSearch("a b c d e f g h i j").groups.length, 10);
+});

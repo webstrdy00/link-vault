@@ -52,6 +52,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
@@ -443,8 +444,9 @@ private fun ControlOutboxContent(
                             modifier = Modifier.fillMaxWidth(),
                             shape = MaterialTheme.shapes.small,
                         ) {
-                            Text("변경 취소")
+                            Text("대기 요청 버리기")
                         }
+                        Text("대기 요청만 지워요. 서버에 완료된 변경은 되돌리지 않아요.")
                     }
                 }
             }
@@ -773,7 +775,15 @@ private class ClassificationControlsViewModel(
         actionJob = viewModelScope.launch {
             try {
                 if (!identityMatches()) return@launch
-                outbox.discard(boundOwner, entry.requestId)
+                val removed = outbox.discard(boundOwner, entry.requestId)
+                if (!identityMatches()) return@launch
+                if (!removed) {
+                    mutableUiState.value = mutableUiState.value.copy(
+                        message = null,
+                        actionError = "요청을 버리지 못했어요. 이미 처리 중이거나 완료됐을 수 있어요. 최신 상태를 확인해 주세요.",
+                    )
+                    return@launch
+                }
                 val currentState = mutableUiState.value
                 val categoryIntent = if (entry.controlKind() == ControlKind.CATEGORIES) {
                     currentState.categoryIntent.discardAt(currentState.item.version)
@@ -785,11 +795,12 @@ private class ClassificationControlsViewModel(
                     readyToReconfirmRequestId = currentState.readyToReconfirmRequestId
                         ?.takeUnless { it == entry.requestId },
                     actionError = null,
-                    message = "요청을 버렸어요. 선택 내용은 이 화면에 남겨 두었어요.",
+                    message = "대기 요청을 버렸어요. 선택 내용은 이 화면에 남겨 두었어요. 서버에 완료된 변경은 되돌리지 않았어요.",
                 )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
+                if (!identityMatches()) return@launch
                 showActionError(error.classificationMessage("요청을 버리지 못했어요."))
             }
         }
@@ -878,19 +889,32 @@ private class ClassificationControlsViewModel(
                     path = "/items/${operation.itemId}",
                     payloadJson = operation.body,
                 )
+                if (!identityMatches()) return@launch
+                var previousRequestRetained = false
                 if (replacesRequestId != null) {
-                    replacedRequestIds += replacesRequestId
-                    outbox.discard(boundOwner, replacesRequestId)
+                    val removed = outbox.discard(boundOwner, replacesRequestId)
+                    if (!identityMatches()) return@launch
+                    previousRequestRetained = !removed && outbox.observeOutbox(boundOwner).first().any {
+                        it.requestId == replacesRequestId
+                    }
+                    if (!identityMatches()) return@launch
+                    if (!previousRequestRetained) replacedRequestIds += replacesRequestId
                 }
                 mutableUiState.value = mutableUiState.value.copy(
                     categoryQueuing = false,
-                    readyToReconfirmRequestId = null,
-                    message = "분류 요청을 이 기기에 보관했어요.",
+                    readyToReconfirmRequestId = mutableUiState.value.readyToReconfirmRequestId
+                        .takeIf { previousRequestRetained },
+                    message = "분류 요청을 이 기기에 보관했어요." + if (previousRequestRetained) {
+                        " 이전 요청은 버리지 못해 처리 상태를 계속 확인해요. 서버에 완료된 변경은 되돌리지 않아요."
+                    } else {
+                        ""
+                    },
                 )
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
                 if (replacesRequestId != null) replacedRequestIds -= replacesRequestId
+                if (!identityMatches()) return@launch
                 mutableUiState.value = mutableUiState.value.copy(
                     categoryQueuing = false,
                     actionError = error.classificationMessage("분류 요청을 기기에 보관하지 못했어요."),

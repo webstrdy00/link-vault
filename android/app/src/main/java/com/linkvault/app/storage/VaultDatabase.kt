@@ -277,7 +277,14 @@ abstract class OutboxDao {
     )
     abstract suspend fun acknowledge(ownerId: String, requestId: String): Int
 
-    @Query("DELETE FROM outbox WHERE owner_id = :ownerId AND request_id = :requestId")
+    @Query(
+        """
+        DELETE FROM outbox
+        WHERE owner_id = :ownerId
+          AND request_id = :requestId
+          AND state IN ('pending', 'retry', 'waiting_login', 'failed', 'conflict', 'expired')
+        """,
+    )
     abstract suspend fun discard(ownerId: String, requestId: String): Int
 
     @Query(

@@ -87,3 +87,22 @@ Deno.test("prepareItem retains the maximum expanded title and note", async () =>
     "https://example.com/normalized-text-bounds",
   );
 });
+
+Deno.test("discovery language handling never rewrites stored source or manual category text", () => {
+  for (
+    const text of [
+      "#제주여행 #맛집추천",
+      "요리법은 없고 여행 얘기만 있어요",
+      "Python regius is a nonvenomous snake",
+      "지난번 저장한 제주 숙소",
+      "C# python_regius 카톡프사",
+    ]
+  ) {
+    const source = { user_title: text, body: text, categories: text };
+    const index = buildIndex(source);
+    assertEquals(source, { user_title: text, body: text, categories: text });
+    assertEquals(index.fields.user_title, norm(text));
+    assertEquals(index.fields.body, norm(text));
+    assertEquals(index.fields.categories, norm(text));
+  }
+});

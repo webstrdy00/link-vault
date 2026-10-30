@@ -200,6 +200,31 @@ Deno.test("production pinned transport validates addresses and owns body lifetim
   assertEquals(failingOwner.destroyErrors, [null]);
 });
 
+Deno.test("a complete keep-alive response releases its owned client after parsing", async () => {
+  const owner = new FakeResponseOwner();
+  const body = Readable.from([
+    encoder.encode("<html><head><title>Complete article</title>"),
+    encoder.encode(
+      '<meta name="description" content="The entire response arrived"></head></html>',
+    ),
+  ]);
+  const transport = new FakeTransport([
+    ownUndiciMetadataResponse({
+      statusCode: 200,
+      headers: { "content-type": "text/html", connection: "keep-alive" },
+      body,
+    }, owner),
+  ]);
+  const result = await fetchMetadataWithAdapters(
+    "https://example.com/article",
+    fakeAdapters(transport),
+  );
+  assertEquals(result.metadata_state, "ready");
+  assertEquals(result.fetched_title, "Complete article");
+  assertEquals(result.description, "The entire response arrived");
+  assertEquals(owner.destroyErrors, [null]);
+});
+
 Deno.test("Naver parser decodes entities and prefers real OG metadata", async () => {
   const transport = new FakeTransport([htmlResponse(`<!doctype html>
     <html><head>
@@ -356,6 +381,229 @@ Deno.test("meaningful Twitter and HTML metadata replace generic higher-priority 
   }
 });
 
+for (
+  const testCase of [
+    {
+      name: "X account-only title",
+      url: "https://x.com/NASAWebb/status/123",
+      title: "NASAWebb",
+      description: "Webb detected a distant world. More observations follow.",
+      expected: "Webb detected a distant world.",
+    },
+    {
+      name: "Facebook account title",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA",
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected: "First stop, Mars.",
+    },
+    {
+      name: "Bluesky profile title",
+      url: "https://bsky.app/profile/stsci.edu/post/123",
+      title: "Space Telescope Science Institute (@stsci.edu)",
+      description: "A new telescope is ready!\n\nRead the launch notes.",
+      expected: "A new telescope is ready!",
+    },
+    {
+      name: "federated Mastodon profile title",
+      url: "https://science.example.com/@astronomer/123",
+      title: "Astronomer (@astronomer@science.example.com)",
+      description:
+        "Astronomers asked the public for help.\nThe results are here.",
+      expected: "Astronomers asked the public for help.",
+    },
+    {
+      name: "Instagram caption wrapper",
+      url: "https://www.instagram.com/p/123/",
+      title: "NASA on Instagram: &quot;Stopped by Mars, took some photos&quot;",
+      description:
+        "1,234 likes, 56 comments - nasa on May 15: &quot;Stopped by Mars, took some photos&quot;",
+      expected: "Stopped by Mars, took some photos",
+      expectedDescription: "Stopped by Mars, took some photos",
+    },
+    {
+      name: "Instagram author-only wrapper",
+      url: "https://www.instagram.com/p/123/",
+      title: "NASA on Instagram",
+      description: "Mars looks beautiful today. See the panorama.",
+      expected: "Mars looks beautiful today.",
+    },
+    {
+      name: "genuine article title",
+      url: "https://example.com/article",
+      title: "NASA",
+      description: "A history of the space agency. Read more here.",
+      expected: "NASA",
+    },
+    {
+      name: "useful short social title",
+      url: "https://x.com/NASA/status/123",
+      title: "Liftoff!",
+      description: "The rocket launched today. Follow the mission.",
+      expected: "Liftoff!",
+    },
+    {
+      name: "article discussing a social service is not a caption wrapper",
+      url: "https://example.com/article",
+      title: "Research on Instagram: New findings",
+      description: "An independent analysis of social networks.",
+      expected: "Research on Instagram: New findings",
+    },
+    {
+      name: "Unicode description fallback",
+      url: "https://bsky.app/profile/space.example/post/123",
+      title: "Bluesky",
+      description: "제주에서 본 별빛😀。 다음 관측은 내일입니다.",
+      expected: "제주에서 본 별빛😀。",
+    },
+    {
+      name: "missing description does not invent an account post title",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA",
+      description: null,
+      expected: null,
+    },
+    {
+      name: "Unicode title without description",
+      url: "https://example.com/article",
+      title: "별빛😀",
+      description: null,
+      expected: "별빛😀",
+    },
+    {
+      name: "live X quoted title with service suffix",
+      url: "https://x.com/NASAWebb/status/123",
+      title: "&quot;Webb detected the strongest evidence yet!&quot; / X",
+      description: "Webb detected the strongest evidence yet!",
+      expected: "Webb detected the strongest evidence yet!",
+    },
+    {
+      name: "live Facebook expanded account corroborated by post metadata",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - National Aeronautics and Space Administration",
+      extraMeta:
+        `<meta property="og:image:alt" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:url" content="https://www.facebook.com/NASA/posts/123/">`,
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected: "First stop, Mars.",
+    },
+    {
+      name: "Facebook article without account corroboration stays intact",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - A new mission launches",
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected: "NASA - A new mission launches",
+    },
+    {
+      name:
+        "Facebook clipped HTML fallback after OG and Twitter account labels",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - National Aeronautics and Space Administration",
+      documentTitle:
+        "Firs... - NASA - National Aeronautics and Space Administration",
+      extraMeta:
+        `<meta name="twitter:title" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:image:alt" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:url" content="https://www.facebook.com/NASA/posts/123/">`,
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected: "First stop, Mars.",
+    },
+    {
+      name: "Facebook Korean account post wrapper uses description",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - National Aeronautics and Space Administration",
+      documentTitle:
+        "NASA - National Aeronautics and Space Administration님의 게시물",
+      extraMeta:
+        `<meta property="og:image:alt" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:url" content="https://www.facebook.com/NASA/posts/123/">`,
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected: "First stop, Mars.",
+    },
+    {
+      name:
+        "Facebook Korean headline containing account post words is preserved",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - National Aeronautics and Space Administration",
+      documentTitle:
+        "NASA - National Aeronautics and Space Administration님의 게시물 분석",
+      extraMeta:
+        `<meta property="og:image:alt" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:url" content="https://www.facebook.com/NASA/posts/123/">`,
+      description: "우주 탐사 소식을 분석합니다.",
+      expected:
+        "NASA - National Aeronautics and Space Administration님의 게시물 분석",
+    },
+    {
+      name: "Facebook complete HTML headline with account suffix is preserved",
+      url: "https://www.facebook.com/NASA/posts/123",
+      title: "NASA - National Aeronautics and Space Administration",
+      documentTitle:
+        "First stop, Mars - NASA - National Aeronautics and Space Administration",
+      extraMeta:
+        `<meta property="og:image:alt" content="NASA - National Aeronautics and Space Administration">
+        <meta property="og:url" content="https://www.facebook.com/NASA/posts/123/">`,
+      description: "First stop, Mars. Next stop, Psyche.",
+      expected:
+        "First stop, Mars - NASA - National Aeronautics and Space Administration",
+    },
+    {
+      name: "live Mastodon clipped quoted title uses complete description",
+      url: "https://mastodon.social/@badastro/123",
+      title:
+        "Phil Plait: &quot;Astronomers turned to public crowdsourcing to hel…&quot; - Mastodon.social",
+      description:
+        "Astronomers turned to public crowdsourcing to help them find brown dwarfs in space. It, um, worked.",
+      expected:
+        "Astronomers turned to public crowdsourcing to help them find brown dwarfs in space.",
+    },
+    {
+      name: "explicit author metadata identifies a display name",
+      url: "https://x.com/NASAWebb/status/123",
+      title: "NASA Webb Telescope",
+      author: "NASA Webb Telescope",
+      description: "A new view of the stars.\nMore details.",
+      expected: "A new view of the stars.",
+    },
+  ]
+) {
+  Deno.test(`representative post titles: ${testCase.name}`, async () => {
+    const hostname = new URL(testCase.url).hostname;
+    const dns = new FakeDns({ [hostname]: [PUBLIC_V4] });
+    const result = await fetchMetadataWithAdapters(
+      testCase.url,
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <title>${testCase.documentTitle ?? testCase.title}</title>
+        <meta property="og:title" content="${testCase.title}">
+        ${testCase.extraMeta ?? ""}
+        ${
+          testCase.author
+            ? `<meta name="author" content="${testCase.author}">`
+            : ""
+        }
+        ${
+          testCase.description === null
+            ? ""
+            : `<meta property="og:description" content="${testCase.description}">`
+        }`)]),
+        dns,
+      ),
+    );
+    assertEquals(dns.calls, [hostname]);
+    assertEquals(result.fetched_title, testCase.expected);
+    assertEquals(
+      result.description,
+      testCase.expectedDescription ?? testCase.description,
+    );
+    assertEquals(result.body_text, null);
+    assertEquals(
+      result.metadata_state,
+      testCase.description === null ? "partial" : "ready",
+    );
+  });
+}
+
 Deno.test("Threads generic site and account titles use a bounded meaningful description first line", async () => {
   const firstLine = "여행😀".repeat(41);
   for (
@@ -378,7 +626,7 @@ Deno.test("Threads generic site and account titles use a bounded meaningful desc
     assertEquals([...result.fetched_title!].length, 120);
     assertEquals(
       result.description,
-      `${firstLine} Second line must not enter the display title.`,
+      `${firstLine}\nSecond line must not enter the display title.`,
     );
     assertEquals(result.metadata_state, "ready");
     assertEquals(result.extraction_meta.title_truncated, true);
@@ -417,7 +665,7 @@ Deno.test("Threads service descriptions and generic first lines do not manufactu
   assertEquals(result.fetched_title, null);
   assertEquals(
     result.description,
-    "Threads Actual public information follows.",
+    "Threads\nActual public information follows.",
   );
   assertEquals(result.metadata_state, "partial");
 });
@@ -460,7 +708,10 @@ Deno.test("description-only HTML metadata supplies an untruncated first-line dis
     ),
   );
   assertEquals(result.fetched_title, "Public & useful first line");
-  assertEquals(result.description, "Public & useful first line A second line.");
+  assertEquals(
+    result.description,
+    "Public & useful first line\nA second line.",
+  );
   assertEquals(result.extraction_meta.title_truncated, false);
   assertEquals(result.metadata_state, "ready");
 });
@@ -1322,18 +1573,28 @@ Deno.test("DNS and upstream failures use the typed retryable network code", asyn
 
 Deno.test("generic transport and interrupted-body failures do not return partial unverified metadata", async () => {
   let cancellations = 0;
-  async function* failingBody(): AsyncIterable<Uint8Array> {
+  async function* failingBody(failure: Error): AsyncIterable<Uint8Array> {
     yield encoder.encode(
       '<title>Incomplete article</title><meta name="description" content="Unverified description">',
     );
-    throw new Error("Interrupted response.");
+    throw failure;
   }
   const transports = [
     new FakeTransport([() => Promise.reject(new Error("Connection reset."))]),
     new FakeTransport([{
       status: 200,
       headers: { "content-type": "text/html" },
-      body: failingBody(),
+      body: failingBody(new Error("Interrupted response.")),
+      cancel: () => cancellations++,
+    }]),
+    new FakeTransport([{
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: failingBody(
+        new Deno.errors.UnexpectedEof(
+          "peer closed connection without sending TLS close_notify",
+        ),
+      ),
       cancel: () => cancellations++,
     }]),
   ];
@@ -1346,7 +1607,7 @@ Deno.test("generic transport and interrupted-body failures do not return partial
     assertEquals(error.retryable, true);
     assertEquals(transport.calls.length, 1);
   }
-  assertEquals(cancellations, 1);
+  assertEquals(cancellations, 2);
 });
 
 Deno.test("429 excessive Retry-After stops rather than retrying earlier than requested", async () => {

@@ -24,6 +24,7 @@
     "test:metadata-live": "deno run --allow-net --allow-env=NODE_V8_COVERAGE,UNDICI_NO_FG,JEST_WORKER_ID --config supabase/functions/library-api/deno.json scripts/metadata-live-check.ts",
     "test:integration": "node scripts/member-integration.mjs",
     "test:discovery-integration": "node scripts/discovery-integration.mjs",
+    "test:save-quality-integration": "node scripts/save-quality-integration.mjs",
     "test:discovery-emulator-integration": "node scripts/discovery-emulator-integration.mjs",
     "test:enrichment-integration": "node scripts/enrichment-integration.mjs",
     "test:enrichment-emulator-integration": "node scripts/enrichment-emulator-integration.mjs",

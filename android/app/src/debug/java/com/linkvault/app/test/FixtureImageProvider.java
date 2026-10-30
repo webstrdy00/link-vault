@@ -7,6 +7,7 @@ import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
+import com.linkvault.app.BuildConfig;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -20,7 +21,7 @@ import java.util.regex.Pattern;
  * classes and is never packaged in release builds.
  */
 public final class FixtureImageProvider extends ContentProvider {
-    private static final String AUTHORITY = "com.linkvault.app.test.fixture-images";
+    private static final String AUTHORITY = BuildConfig.APPLICATION_ID + ".test.fixture-images";
     private static final String FIXTURE_DIRECTORY = "fixture_images";
     private static final String PNG_MIME_TYPE = "image/png";
     private static final Pattern FIXTURE_FILE_NAME =

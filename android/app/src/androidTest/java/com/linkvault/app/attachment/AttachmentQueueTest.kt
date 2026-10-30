@@ -1,19 +1,29 @@
 package com.linkvault.app.attachment
 
 import android.content.Context
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import androidx.room.Room
 import androidx.room.testing.MigrationTestHelper
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.linkvault.app.CaptureCompletionFixture
 import com.linkvault.app.auth.AccountClient
+import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.storage.MIGRATION_2_3
+import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
+import com.linkvault.app.storage.OutboxState
 import com.linkvault.app.storage.VaultDatabase
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -519,6 +529,106 @@ class AttachmentQueueTest {
         assertTrue(userSource.readBytes().contentEquals(byteArrayOf(4, 5, 6)))
         assertTrue(userSource.delete())
     }
+
+    @Test
+    fun commandDiscardKeepsRunningAndSavedRowsAndTheirReviewTracked() = runBlocking {
+        for (state in listOf(OutboxState.RUNNING, OutboxState.SAVED)) {
+            withCommandRequest(state) { viewModel, entry, database ->
+                val review = viewModel.uiState.value.commandReview
+                withContext(Dispatchers.Main) {
+                    viewModel.discardCommand(entry.requestId)
+                }
+                val result = withTimeout(5_000L) {
+                    viewModel.uiState.first { !it.actionRunning && it.actionError != null }
+                }
+
+                assertEquals(entry, database.outboxDao().findByRequestId(entry.requestId))
+                assertEquals(review, result.commandReview)
+                assertEquals(listOf(entry.requestId), result.commandEntries.map { it.requestId })
+                assertNull(result.message)
+                assertTrue(result.actionError!!.contains("버리지 못했어요"))
+            }
+        }
+    }
+
+    @Test
+    fun commandDiscardClearsReviewOnlyAfterRemovingTerminalRequest() = runBlocking {
+        withCommandRequest(OutboxState.CONFLICT) { viewModel, entry, database ->
+            withContext(Dispatchers.Main) {
+                viewModel.discardCommand(entry.requestId)
+            }
+            val result = withTimeout(5_000L) {
+                viewModel.uiState.first { !it.actionRunning && it.message != null }
+            }
+
+            assertNull(database.outboxDao().findByRequestId(entry.requestId))
+            assertNull(result.commandReview)
+            assertNull(result.actionError)
+            assertTrue(result.message!!.contains("서버에 완료된 변경은 되돌리지 않았어요"))
+        }
+    }
+
+    private suspend fun withCommandRequest(
+        state: OutboxState,
+        block: suspend (AttachmentViewModel, OutboxEntry, VaultDatabase) -> Unit,
+    ) {
+        val fixture = CaptureCompletionFixture()
+        val store = ViewModelStore()
+        try {
+            val entry = command(state).copy(ownerId = fixture.ownerId)
+            fixture.database.outboxDao().insertImmutable(entry)
+            val viewModel = withContext(Dispatchers.Main) {
+                val model = ViewModelProvider(
+                    store,
+                    AttachmentViewModel.factory(
+                        fixture.client,
+                        fixture.outbox,
+                        fixture.attachments,
+                        fixture.ownerId,
+                        fixture.client.sessionState.value.generation,
+                        LibraryItemDetail(id = ITEM_A, url = "https://example.com", version = 3L),
+                    ),
+                )[AttachmentViewModel::class.java]
+                attachmentState(model).value = model.uiState.value.copy(
+                    commandEntries = listOf(entry.copy(state = OutboxState.CONFLICT)),
+                    commandReview = AttachmentCommandReview(
+                        entry.requestId,
+                        AttachmentCommandKind.METADATA,
+                        null,
+                        3L,
+                        true,
+                    ),
+                )
+                model
+            }
+            block(viewModel, entry, fixture.database)
+        } finally {
+            withContext(Dispatchers.Main) { store.clear() }
+            fixture.close()
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun attachmentState(viewModel: AttachmentViewModel): MutableStateFlow<AttachmentUiState> =
+        AttachmentViewModel::class.java.getDeclaredField("mutableUiState").let { field ->
+            field.isAccessible = true
+            field.get(viewModel) as MutableStateFlow<AttachmentUiState>
+        }
+
+    private fun command(state: OutboxState) = OutboxEntry(
+        requestId = UUID.randomUUID().toString(),
+        ownerId = OWNER_A,
+        method = "POST",
+        path = "/items/$ITEM_A/retry-metadata",
+        payloadJson = "{\"expected_version\":3}",
+        state = state,
+        attemptCount = 1,
+        createdAt = 1_000L,
+        expiresAt = 90_000L,
+        nextAttemptAt = 1_000L,
+        resultJson = if (state == OutboxState.SAVED) "{\"job_id\":\"$REQUEST_ID\"}" else null,
+        leaseUntil = if (state == OutboxState.RUNNING) 30_000L else null,
+    )
 
     private fun attachment(
         operationId: String = OPERATION_A,

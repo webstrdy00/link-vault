@@ -444,10 +444,9 @@ class DiscoveryViewModel internal constructor(
 
     fun discardCategoryRequest(requestId: String) {
         mutateCategoryEntry(requestId) { requestOwner, _, token ->
-            outbox.discard(requestOwner, requestId)
-            if (!responseBelongsTo(token)) return@mutateCategoryEntry
+            if (!discardCategoryEntry(requestOwner, requestId, token)) return@mutateCategoryEntry
             mutableUiState.value = mutableUiState.value.copy(
-                categoryMutationNotice = "대기 요청을 버렸어요.",
+                categoryMutationNotice = "대기 요청을 버렸어요. 서버에 완료된 변경은 되돌리지 않았어요.",
                 categoryMutationError = null,
             )
         }
@@ -456,8 +455,7 @@ class DiscoveryViewModel internal constructor(
     fun discardAndEditCategoryRequest(requestId: String) {
         mutateCategoryEntry(requestId) { requestOwner, entry, token ->
             val name = entry.categoryPayloadName()
-            outbox.discard(requestOwner, requestId)
-            if (!responseBelongsTo(token)) return@mutateCategoryEntry
+            if (!discardCategoryEntry(requestOwner, requestId, token)) return@mutateCategoryEntry
             showCategoryIntentForEditing(
                 entry = entry,
                 name = name,
@@ -500,7 +498,12 @@ class DiscoveryViewModel internal constructor(
                     current.errorCode == "CATEGORY_LIMIT_REACHED"
                 ) {
                     val name = current.categoryPayloadName()
-                    outbox.discard(requestOwner, requestId)
+                    if (!discardCategoryEntry(requestOwner, requestId, token)) {
+                        if (responseBelongsTo(token)) {
+                            mutableUiState.value = mutableUiState.value.copy(categoryReviewRequestId = null)
+                        }
+                        return@launch
+                    }
                     if (!responseBelongsTo(token)) return@launch
                     showCategoryIntentForEditing(
                         entry = current,
@@ -574,13 +577,23 @@ class DiscoveryViewModel internal constructor(
                     payloadJson = reconfirmation.payloadJson,
                 )
                 if (!responseBelongsTo(token)) return@launch
-                outbox.discard(requestOwner, reconfirmation.requestId)
+                val removed = outbox.discard(requestOwner, reconfirmation.requestId)
                 if (!responseBelongsTo(token)) return@launch
-                replacedRequestIds += reconfirmation.requestId
+                val previousRequestRetained = !removed && outbox.observeOutbox(requestOwner).first().any {
+                    it.requestId == reconfirmation.requestId
+                }
+                if (!responseBelongsTo(token)) return@launch
+                if (!previousRequestRetained) replacedRequestIds += reconfirmation.requestId
                 mutableUiState.value = mutableUiState.value.copy(
                     isCategoryMutationInProgress = false,
-                    categoryReconfirmation = null,
-                    categoryMutationNotice = "확인한 내용으로 새 요청 ID를 만들었어요. 서버 확인 전 상태입니다.",
+                    categoryReconfirmation = mutableUiState.value.categoryReconfirmation
+                        .takeIf { previousRequestRetained },
+                    categoryMutationNotice = "확인한 내용으로 새 요청 ID를 만들었어요. 서버 확인 전 상태입니다." +
+                        if (previousRequestRetained) {
+                            " 이전 요청은 버리지 못해 처리 상태를 계속 확인해요. 서버에 완료된 변경은 되돌리지 않아요."
+                        } else {
+                            ""
+                        },
                 )
             } catch (error: CancellationException) {
                 throw error
@@ -1086,6 +1099,22 @@ class DiscoveryViewModel internal constructor(
                 }
             }
         }
+    }
+
+    private suspend fun discardCategoryEntry(
+        requestOwner: String,
+        requestId: String,
+        token: DiscoveryRequestToken,
+    ): Boolean {
+        val removed = outbox.discard(requestOwner, requestId)
+        if (!responseBelongsTo(token)) return false
+        if (!removed) {
+            mutableUiState.value = mutableUiState.value.copy(
+                categoryMutationNotice = null,
+                categoryMutationError = "요청을 버리지 못했어요. 이미 처리 중이거나 완료됐을 수 있어요. 최신 상태를 확인해 주세요.",
+            )
+        }
+        return removed
     }
 
     private fun mutateCategoryEntry(

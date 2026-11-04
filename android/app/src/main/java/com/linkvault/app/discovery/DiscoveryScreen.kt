@@ -76,11 +76,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.linkvault.app.auth.AccountClient
+import com.linkvault.app.library.LibraryCollectionStateLabel
 import com.linkvault.app.library.LibraryItemSummary
+import com.linkvault.app.library.LibraryThumbnailContent
+import com.linkvault.app.library.LibraryThumbnailLoader
 import com.linkvault.app.library.cardPreview
 import com.linkvault.app.library.codePointLength
 import com.linkvault.app.library.compactLibraryTitle
 import com.linkvault.app.library.formatLibrarySavedDate
+import com.linkvault.app.library.rememberLibraryThumbnailLoader
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
@@ -140,6 +144,7 @@ fun DiscoveryScreen(
         factory = factory,
     )
     val state by discoveryViewModel.uiState.collectAsState()
+    val thumbnailLoader = rememberLibraryThumbnailLoader(client, state.items)
     LaunchedEffect(discoveryViewModel, sessionState) {
         discoveryViewModel.syncSessionState(sessionState)
     }
@@ -220,6 +225,7 @@ fun DiscoveryScreen(
                 HorizontalDivider()
                 SearchResults(
                     state = state,
+                    thumbnailLoader = thumbnailLoader,
                     onOpenItem = onOpenItem,
                     onOpenAliasDisclosure = discoveryViewModel::openAliasDisclosure,
                     onRetry = discoveryViewModel::retrySearch,
@@ -782,6 +788,7 @@ private fun ToggleRow(
 @Composable
 private fun SearchResults(
     state: DiscoveryUiState,
+    thumbnailLoader: LibraryThumbnailLoader,
     onOpenItem: (String) -> Unit,
     onOpenAliasDisclosure: (String) -> Unit,
     onRetry: () -> Unit,
@@ -827,6 +834,7 @@ private fun SearchResults(
                             item = item,
                             onOpen = { onOpenItem(item.id) },
                             onOpenAliasDisclosure = { onOpenAliasDisclosure(item.id) },
+                            thumbnailLoader = thumbnailLoader,
                         )
                         if (index < state.items.lastIndex) {
                             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -851,6 +859,7 @@ internal fun SearchResultCard(
     item: LibraryItemSummary,
     onOpen: () -> Unit,
     onOpenAliasDisclosure: () -> Unit,
+    thumbnailLoader: LibraryThumbnailLoader? = null,
 ) {
     Column(
         modifier = Modifier
@@ -861,53 +870,61 @@ internal fun SearchResultCard(
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
-            text = "출처 · ${sourceDisplayName(item.source)}",
+            text = "출처 · ${discoverySourceDisplayName(item.source) ?: "확인 중"}",
+            modifier = Modifier.fillMaxWidth(),
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         formatLibrarySavedDate(item.createdAt)?.let { date ->
             Text(
                 text = "저장 · $date",
+                modifier = Modifier.fillMaxWidth(),
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Text(
-            text = compactLibraryTitle(item.displayTitle, item.url),
-            modifier = Modifier.testTag("search-item-title-${item.id}"),
-            fontSize = 17.sp,
-            lineHeight = 24.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        item.cardPreview()?.let { excerpt ->
+        LibraryThumbnailContent(item, thumbnailLoader) {
             Text(
-                text = excerpt,
-                modifier = Modifier.testTag("search-item-preview-${item.id}"),
-                fontSize = 13.sp,
-                lineHeight = 20.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                text = compactLibraryTitle(item.displayTitle, item.url),
+                modifier = Modifier.testTag("search-item-title-${item.id}"),
+                fontSize = 17.sp,
+                lineHeight = 24.sp,
+                fontWeight = FontWeight.SemiBold,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
+            item.cardPreview()?.let { excerpt ->
+                Text(
+                    text = excerpt,
+                    modifier = Modifier.padding(top = 6.dp).testTag("search-item-preview-${item.id}"),
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         if (item.categoryRefs.isEmpty()) {
             Text(
                 text = "미분류",
+                modifier = Modifier.fillMaxWidth(),
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
             Text(
                 text = item.categoryRefs.mapNotNull { it.name }.joinToString(),
+                modifier = Modifier.fillMaxWidth(),
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        LibraryCollectionStateLabel(item)
         item.cueLabel()?.let { label ->
             Text(
                 text = label,
+                modifier = Modifier.fillMaxWidth(),
                 fontSize = 12.sp,
                 color = if (item.cueState == "limited" || item.cueState == "missing") {
                     MaterialTheme.colorScheme.error
@@ -919,6 +936,7 @@ internal fun SearchResultCard(
         if (item.matchType == "alias") {
             Text(
                 text = "별칭으로 찾음",
+                modifier = Modifier.fillMaxWidth(),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSurface,
@@ -1419,14 +1437,6 @@ private fun DiscoveryLoading(message: String) {
         CircularProgressIndicator(modifier = Modifier.size(22.dp))
         Text(message)
     }
-}
-
-private fun sourceDisplayName(source: String?): String = when (source) {
-    "instagram" -> "Instagram"
-    "threads" -> "Threads"
-    "naver_blog" -> "네이버 블로그"
-    "other" -> "기타"
-    else -> "확인 중"
 }
 
 private fun aliasFieldDisplayName(field: String): String = when (field) {

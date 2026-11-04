@@ -13,6 +13,37 @@ object OutboxPolicy {
 
     fun leaseUntil(now: Long): Long = saturatedAdd(now, CLAIM_LEASE_MILLIS)
 
+    fun saveRecoveryAction(entry: OutboxEntry, ownerId: String?): SaveRecoveryAction? {
+        if (ownerId.isNullOrBlank() || entry.ownerId != ownerId ||
+            entry.method != "POST" || entry.path != "/items"
+        ) return null
+        return when (entry.state) {
+            OutboxState.FAILED,
+            OutboxState.RETRY,
+            -> when {
+                // POST /items stores quota rejection under this ID; replay cannot succeed.
+                entry.state == OutboxState.FAILED && entry.errorCode == "ITEM_LIMIT_REACHED" ->
+                    SaveRecoveryAction.RECONFIRM
+
+                entry.errorCode in TERMINAL_ERROR_CODES || entry.errorCode == "VERSION_CONFLICT" ->
+                    SaveRecoveryAction.EDIT_OR_REMOVE
+
+                else -> SaveRecoveryAction.RETRY_SAME_REQUEST
+            }
+
+            OutboxState.CONFLICT -> SaveRecoveryAction.EDIT_OR_REMOVE
+            OutboxState.EXPIRED -> if (entry.errorCode == "URL_HASH_COLLISION" ||
+                entry.errorCode == "IDEMPOTENCY_MISMATCH"
+            ) {
+                SaveRecoveryAction.EDIT_OR_REMOVE
+            } else {
+                SaveRecoveryAction.RECONFIRM
+            }
+
+            else -> null
+        }
+    }
+
     fun classifyFailure(
         now: Long,
         expiresAt: Long,
@@ -77,12 +108,19 @@ object OutboxPolicy {
         "ITEM_LIMIT_REACHED",
         "ITEM_NOT_FOUND",
         "STORAGE_LIMIT_REACHED",
+        "URL_HASH_COLLISION",
     )
     private val TRANSIENT_ERROR_CODES = setOf(
         "DEPENDENCY_UNAVAILABLE",
         "RATE_LIMITED",
         "SESSION_REFRESH_UNAVAILABLE",
     )
+}
+
+enum class SaveRecoveryAction {
+    RETRY_SAME_REQUEST,
+    RECONFIRM,
+    EDIT_OR_REMOVE,
 }
 
 sealed interface FailureAction {

@@ -54,6 +54,73 @@ class DiscoveryModelsTest {
     }
 
     @Test
+    fun sources_useFixedWireValuesAndSharedDisplayNamesWithoutClassifyingHosts() {
+        val expected = listOf(
+            Triple(DiscoverySource.ALL, null, "전체"),
+            Triple(DiscoverySource.INSTAGRAM, "instagram", "Instagram"),
+            Triple(DiscoverySource.THREADS, "threads", "Threads"),
+            Triple(DiscoverySource.NAVER_BLOG, "naver_blog", "네이버 블로그"),
+            Triple(DiscoverySource.X, "x", "X"),
+            Triple(DiscoverySource.FACEBOOK, "facebook", "Facebook"),
+            Triple(DiscoverySource.BLUESKY, "bluesky", "Bluesky"),
+            Triple(DiscoverySource.MASTODON, "mastodon", "Mastodon"),
+            Triple(DiscoverySource.OTHER, "other", "기타"),
+        )
+        assertEquals(expected.map { it.first }, DiscoverySource.entries)
+        expected.forEach { (source, apiValue, label) ->
+            assertEquals(apiValue, source.apiValue)
+            assertEquals(label, source.displayName)
+            if (source != DiscoverySource.ALL) {
+                assertEquals(label, discoverySourceDisplayName(apiValue))
+            }
+        }
+        assertEquals(null, discoverySourceDisplayName(null))
+        assertEquals(null, discoverySourceDisplayName("  "))
+        assertEquals("example.com", discoverySourceDisplayName("example.com"))
+        assertEquals("mastodon.example", discoverySourceDisplayName("mastodon.example"))
+    }
+
+    @Test
+    fun sources_conjoinWithAllOtherFiltersAndAllSourceResetPreservesThoseConditions() {
+        val zone = ZoneId.of("UTC")
+        for (source in DiscoverySource.entries.filter { it != DiscoverySource.ALL }) {
+            val input = DiscoveryFilterInput(
+                query = "saved post",
+                categoryId = "travel",
+                source = source,
+                dateFrom = "2026-11-01",
+                dateTo = "2026-11-02",
+                aliases = false,
+                needsCues = true,
+            )
+            val remainingParameters =
+                "date_from=2026-11-01T00%3A00%3A00Z&date_to=2026-11-03T00%3A00%3A00Z&" +
+                    "aliases=false&needs_cues=true&limit=20&offset=0"
+            val snapshot = validSnapshot(input, zone)
+            assertEquals(
+                "/items?q=saved%20post&category_id=travel&source=${source.apiValue}&$remainingParameters",
+                snapshot.itemsPath(),
+            )
+            assertEquals(
+                "/items?q=saved%20post&unclassified=true&source=${source.apiValue}&$remainingParameters",
+                validSnapshot(input.copy(categoryId = null, unclassified = true), zone).itemsPath(),
+            )
+
+            val reset = validSnapshot(input.copy(source = DiscoverySource.ALL), zone)
+            assertEquals(
+                "/items?q=saved%20post&category_id=travel&$remainingParameters",
+                reset.itemsPath(),
+            )
+            assertFalse(reset.queryKey.contains("source="))
+            assertNotEquals(snapshot.queryKey, reset.queryKey)
+            assertEquals(
+                "/items?q=saved%20post&source=${source.apiValue}&$remainingParameters",
+                snapshot.withoutCategoryFilter().itemsPath(),
+            )
+        }
+    }
+
+    @Test
     fun sourceOnlyBrowse_preservesServerFilterAcrossPagesWithoutRequiringSearchText() {
         for (source in DiscoverySource.entries) {
             val snapshot = validSnapshot(

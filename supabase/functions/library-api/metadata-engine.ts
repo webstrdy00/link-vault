@@ -600,28 +600,34 @@ function extractPageMetadata(
   if (isErrorDocument(parsed)) {
     return emptyResult("failed", "INVALID_CONTENT", finalUrl, checkedAt);
   }
+  const isContentTitle = (value: string | null | undefined): boolean =>
+    value !== null && value !== undefined && isMeaningfulTitle(value) &&
+    norm(value) !== norm(parsed.meta.get("og:site_name")) &&
+    !isAccountTitle(value, parsed, finalUrl);
   const rawDescription = [
     parsed.meta.get("og:description"),
     parsed.meta.get("twitter:description"),
     parsed.meta.get("description"),
   ].map((value) => cleanSocialText(value, finalUrl))
-    .find(isMeaningfulDescription) ?? null;
+    .find((value) =>
+      value !== null && isMeaningfulDescription(value) &&
+      value.split("\n").some((line) =>
+        isMeaningfulDescription(line) && !isAccountTitle(line, parsed, finalUrl)
+      )
+    ) ?? null;
   const rawTitle = [
     parsed.meta.get("og:title"),
     parsed.meta.get("twitter:title"),
     parsed.title,
     ...parsed.headings,
-  ].map((value) => cleanSocialText(value, finalUrl)).find((value) =>
-    value !== null && isMeaningfulTitle(value) &&
-    norm(value) !== norm(parsed.meta.get("og:site_name")) &&
-    !isAccountTitle(value, parsed, finalUrl)
-  ) ?? null;
+  ].map((value) => cleanSocialText(value, finalUrl)).find(isContentTitle) ??
+    null;
   const descriptionTitle = rawDescription?.split("\n")[0]
     .match(/^.*?[.!?。！？](?=\s|$)|^.+/u)?.[0];
   const title = rawTitle !== null
     ? truncateMetadataField(cleanText(rawTitle), 300)
     : truncateMetadataField(
-      isMeaningfulTitle(descriptionTitle) ? cleanText(descriptionTitle) : null,
+      isContentTitle(descriptionTitle) ? cleanText(descriptionTitle) : null,
       120,
     );
   const description = truncateMetadataField(rawDescription, 4000);
@@ -688,7 +694,7 @@ function isAccountTitle(
 ): boolean {
   const url = new URL(finalUrl);
   if (!isSocialMetadataUrl(url)) return false;
-  const label = norm(title);
+  const label = norm(title).replace(/\s*\/\s*(?:x|twitter)$/u, "");
   if (
     /^(?:x|twitter|facebook|bluesky|mastodon|instagram|threads|profile|posts)$/u
       .test(label) ||

@@ -440,8 +440,9 @@ select is(
   'manual create indexes the owner-validated stored canonical category name'
 );
 
+-- Synthetic counter fixture: committed conflict/replay branches, not row capacity.
 update public.library_usage
-set active_item_count = 100
+set active_item_count = 1000
 where owner_id = '17000000-0000-0000-0000-000000000003';
 
 set local role service_role;
@@ -482,7 +483,7 @@ select is(
 );
 
 update public.library_usage
-set active_item_count = 99
+set active_item_count = 999
 where owner_id = '17000000-0000-0000-0000-000000000003';
 
 set local role service_role;

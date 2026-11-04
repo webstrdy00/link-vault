@@ -35,8 +35,17 @@ enum class DiscoverySource(
     INSTAGRAM("instagram", "Instagram"),
     THREADS("threads", "Threads"),
     NAVER_BLOG("naver_blog", "네이버 블로그"),
+    X("x", "X"),
+    FACEBOOK("facebook", "Facebook"),
+    BLUESKY("bluesky", "Bluesky"),
+    MASTODON("mastodon", "Mastodon"),
     OTHER("other", "기타"),
 }
+
+internal fun discoverySourceDisplayName(source: String?): String? =
+    source?.takeUnless(String::isBlank)?.let { value ->
+        DiscoverySource.entries.firstOrNull { it.apiValue == value }?.displayName ?: value
+    }
 
 data class DiscoveryFilterInput(
     val query: String = "",

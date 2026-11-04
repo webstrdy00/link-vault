@@ -604,6 +604,191 @@ for (
   });
 }
 
+Deno.test("social service and account placeholders never become fetched metadata", async () => {
+  for (
+    const testCase of [
+      { service: "X", title: "X on X / X", description: "X on X" },
+      { service: "X", title: "X / X", description: "X" },
+      {
+        service: "Twitter",
+        title: "Twitter on Twitter / Twitter",
+        description: "Twitter on Twitter",
+      },
+      {
+        service: "X",
+        title: "NASA Webb Telescope on X / X",
+        description: "NASA Webb Telescope on X",
+      },
+      { service: "X", title: "NASAWebb / X", description: "NASAWebb" },
+      {
+        service: "X",
+        title: "NASA Webb Telescope / X",
+        description: "NASA Webb Telescope",
+      },
+      {
+        service: "X",
+        title: "X on X / X",
+        description: "X on X&#10;X / X&#10;NASAWebb",
+      },
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://x.com/NASAWebb/status/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <title>${testCase.title}</title>
+        <meta property="og:site_name" content="${testCase.service}">
+        <meta property="og:title" content="${testCase.title}">
+        <meta property="og:description" content="${testCase.description}">
+        <meta name="author" content="NASA Webb Telescope">
+        <h1>${testCase.title}</h1>`)]),
+        new FakeDns({ "x.com": [PUBLIC_V4] }),
+      ),
+    );
+    assertEquals(result.fetched_title, null, testCase.title);
+    assertEquals(result.description, null, testCase.title);
+    assertEquals(result.body_text, null);
+    assertEquals(result.metadata_state, "partial");
+    assertEquals(result.extraction_meta.error_code, "INVALID_RESULT");
+  }
+});
+
+Deno.test("social placeholder titles and descriptions yield to meaningful metadata candidates", async () => {
+  const description = "Webb found a distant world. More observations follow.";
+  for (
+    const testCase of [
+      {
+        extraMeta: "",
+        description,
+        title: "Webb found a distant world.",
+      },
+      {
+        extraMeta: `<meta name="twitter:description" content="${description}">`,
+        description: "X on X",
+        title: "Webb found a distant world.",
+      },
+      {
+        extraMeta:
+          `<meta name="description" content="${description}"><meta name="twitter:title" content="A new Webb observation">`,
+        description: "NASAWebb on X / X",
+        title: "A new Webb observation",
+      },
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://x.com/NASAWebb/status/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <title>X on X / X</title>
+        <meta property="og:site_name" content="X">
+        <meta property="og:title" content="X on X / X">
+        <meta property="og:description" content="${testCase.description}">
+        ${testCase.extraMeta}`)]),
+        new FakeDns({ "x.com": [PUBLIC_V4] }),
+      ),
+    );
+    assertEquals(result.fetched_title, testCase.title);
+    assertEquals(result.description, description);
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.extraction_meta.error_code, null);
+  }
+});
+
+Deno.test("social placeholder descriptions cannot make a real caption title ready", async () => {
+  for (const description of ["X on X", "X on X / X", "X", "NASAWebb"]) {
+    const result = await fetchMetadataWithAdapters(
+      "https://x.com/NASAWebb/status/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <meta property="og:title" content="&quot;A new view of the stars!&quot; / X">
+        <meta property="og:description" content="${description}">`)]),
+        new FakeDns({ "x.com": [PUBLIC_V4] }),
+      ),
+    );
+    assertEquals(result.fetched_title, "A new view of the stars!");
+    assertEquals(result.description, null);
+    assertEquals(result.metadata_state, "partial");
+    assertEquals(result.extraction_meta.error_code, "INVALID_RESULT");
+  }
+});
+
+Deno.test("social description first lines cannot manufacture service or account titles", async () => {
+  for (
+    const firstLine of [
+      "X on X",
+      "X on X / X",
+      "X",
+      "NASAWebb",
+      "NASA Webb Telescope",
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      "https://x.com/NASAWebb/status/123",
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <meta property="og:title" content="X">
+        <meta property="og:description" content="${firstLine}&#10;A real caption follows.">
+        <meta name="author" content="NASA Webb Telescope">`)]),
+        new FakeDns({ "x.com": [PUBLIC_V4] }),
+      ),
+    );
+    assertEquals(result.fetched_title, null, firstLine);
+    assertEquals(result.description, `${firstLine}\nA real caption follows.`);
+    assertEquals(result.metadata_state, "partial");
+    assertEquals(result.extraction_meta.error_code, "INVALID_RESULT");
+  }
+});
+
+Deno.test("real articles and captions mentioning X retain their content", async () => {
+  for (
+    const testCase of [
+      {
+        url: "https://example.com/article",
+        title: "X on X / X",
+        description: "X on X",
+        expectedTitle: "X on X / X",
+        expectedDescription: "X on X",
+      },
+      {
+        url: "https://example.com/article",
+        title: "Research on X: New findings",
+        description: "How scientists share research on X.",
+        expectedTitle: "Research on X: New findings",
+        expectedDescription: "How scientists share research on X.",
+      },
+      {
+        url: "https://x.com/NASAWebb/status/123",
+        title: "New X-ray observations / X",
+        description: "X marks the observed source.",
+        expectedTitle: "New X-ray observations / X",
+        expectedDescription: "X marks the observed source.",
+      },
+      {
+        url: "https://x.com/NASAWebb/status/123",
+        title: "NASAWebb on X: &quot;Webb spotted X-rays!&quot; / X",
+        description: "NASAWebb on X: &quot;X marks a new discovery.&quot;",
+        expectedTitle: "Webb spotted X-rays!",
+        expectedDescription: "X marks a new discovery.",
+      },
+    ]
+  ) {
+    const result = await fetchMetadataWithAdapters(
+      testCase.url,
+      fakeAdapters(
+        new FakeTransport([htmlResponse(`
+        <meta property="og:site_name" content="X">
+        <meta property="og:title" content="${testCase.title}">
+        <meta property="og:description" content="${testCase.description}">`)]),
+        new FakeDns({ [new URL(testCase.url).hostname]: [PUBLIC_V4] }),
+      ),
+    );
+    assertEquals(result.fetched_title, testCase.expectedTitle);
+    assertEquals(result.description, testCase.expectedDescription);
+    assertEquals(result.metadata_state, "ready");
+    assertEquals(result.extraction_meta.error_code, null);
+  }
+});
+
 Deno.test("Threads generic site and account titles use a bounded meaningful description first line", async () => {
   const firstLine = "여행😀".repeat(41);
   for (

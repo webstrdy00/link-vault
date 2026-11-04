@@ -11,6 +11,7 @@ import {
   runClassificationBatch,
 } from "./classification-worker.ts";
 import { createHandler, type MemberGateway, type RpcCall } from "./handler.ts";
+import { fetchLibraryExport } from "./library-export.ts";
 import {
   createMetadataHandler,
   isInternalMetadataPath,
@@ -95,6 +96,10 @@ const gateway: MemberGateway = {
     const client = callerClientFor(call.authorization);
     const { data, error } = await client.rpc(call.functionName, call.args);
     return rpcResult(data, error);
+  },
+
+  async exportItems(call) {
+    return await fetchLibraryExport(supabaseUrl, supabaseAnonKey, call);
   },
 
   async createItem(call) {

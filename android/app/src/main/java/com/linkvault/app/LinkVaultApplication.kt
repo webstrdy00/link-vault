@@ -5,6 +5,7 @@ import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.attachment.IncomingImageStore
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.auth.AccountAccess
+import com.linkvault.app.auth.LibraryExportAction
 import com.linkvault.app.storage.OutboxRepository
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -78,6 +79,9 @@ class LinkVaultApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        if (!LibraryExportAction.cleanupOrphanedStagingFiles(this)) {
+            mutableDraftError.value = "이전 내보내기의 임시 자료를 정리하지 못했어요."
+        }
         applicationScope.launch {
             try {
                 outboxRepository.cleanupDrafts()

@@ -26,9 +26,11 @@ import io.github.jan.supabase.logging.LogLevel
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
+import io.ktor.client.request.prepareGet
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
@@ -40,7 +42,9 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.http.isSuccess
+import io.ktor.utils.io.InternalAPI
 import io.ktor.utils.io.readAvailable
+import java.io.OutputStream
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -48,6 +52,7 @@ import java.security.SecureRandom
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.StateFlow
@@ -542,6 +547,67 @@ class AccountClient(
                 )
             }
             if (!rawResponse.status.isSuccess()) throw apiException(rawResponse)
+        }
+    }
+
+    @OptIn(InternalAPI::class)
+    suspend fun exportLibrary(
+        expectedOwnerId: String,
+        expectedGeneration: Long,
+        destination: OutputStream,
+    ): Long = withContext(Dispatchers.IO) {
+        withTimeout(LIBRARY_EXPORT_TIMEOUT_MILLIS) {
+            var copied = 0L
+            val requestId = UUID.randomUUID().toString()
+            val response = authorizedRequest(expectedOwnerId, expectedGeneration) { accessToken ->
+                requireLibraryExportSession(sessionState.value, expectedOwnerId, expectedGeneration)
+                requireHttpClient().prepareGet(
+                    "${requireConfig().url}$FUNCTIONS_PATH/items/export",
+                ) {
+                    header(HttpHeaders.Authorization, "Bearer $accessToken")
+                    header(API_KEY_HEADER, requireConfig().key)
+                    header(REQUEST_ID_HEADER, requestId)
+                    timeout { requestTimeoutMillis = LIBRARY_EXPORT_TIMEOUT_MILLIS }
+                }.execute { httpResponse ->
+                    when {
+                        httpResponse.status == HttpStatusCode.Unauthorized -> {
+                            // The only retry is the existing pre-write credential refresh.
+                            httpResponse.rawContent.cancel(null)
+                            RawResponse(httpResponse.status)
+                        }
+                        httpResponse.status != HttpStatusCode.OK -> {
+                            httpResponse.toBoundedTextResponse(MAX_ERROR_BODY_BYTES)
+                        }
+                        !isLibraryExportJsonContentType(httpResponse.headers[HttpHeaders.ContentType]) -> {
+                            httpResponse.rawContent.cancel(null)
+                            throw invalidLibraryExportResponse()
+                        }
+                        else -> {
+                            // Consume the engine channel directly: Ktor's channel transformer
+                            // can lose a failed EOF in its intermediate copy.
+                            copied = copyLibraryExportChannel(
+                                httpResponse.rawContent,
+                                destination,
+                                httpResponse.headers[HttpHeaders.ContentLength]?.toLongOrNull(),
+                            ) {
+                                requireLibraryExportSession(
+                                    sessionState.value,
+                                    expectedOwnerId,
+                                    expectedGeneration,
+                                )
+                            }
+                            RawResponse(httpResponse.status)
+                        }
+                    }
+                }
+            }
+            acceptResponse(response) { raw ->
+                if (raw.status != HttpStatusCode.OK) {
+                    if (raw.status.isSuccess()) throw invalidLibraryExportResponse()
+                    throw apiException(raw)
+                }
+                copied
+            }
         }
     }
 
@@ -1147,6 +1213,7 @@ class AccountClient(
                 throw sessionChanged()
             }
         }
+        if (error is LibraryExportDestinationException || error is AccountClientException) throw error
         throw AccountClientException(
             message = "서버에 연결하지 못했어요. 네트워크 연결을 확인하고 다시 시도해 주세요.",
             retryable = true,

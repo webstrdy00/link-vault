@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertMatch } from "@std/assert";
+import { assert, assertEquals, assertMatch, assertRejects } from "@std/assert";
 import {
   type AuthVerification,
   type CategoryLookupCall,
@@ -37,6 +37,7 @@ import {
   type ReplayAssetRequestCall,
   type ReserveAssetCall,
 } from "./asset-service.ts";
+import { type ExportItemsCall } from "./library-export.ts";
 
 const VALID_REQUEST_ID = "5e51d680-b8d8-4f7a-a29f-d764f2965aa2";
 const VALID_ITEM_ID = "3d8752d2-47bb-4f4c-b2c7-7a3590eb02a9";
@@ -88,6 +89,9 @@ class FakeGateway implements MemberGateway {
     userId: VERIFIED_USER_ID,
   };
   rpcResult: RpcResult = { data: { state: "active" }, error: null };
+  exportResult = new Response('{"items":[]}', {
+    headers: { "content-type": "application/json" },
+  });
   createResult: RpcResult = {
     data: { http_status: 201, duplicate: false, item: { id: VALID_ITEM_ID } },
     error: null,
@@ -179,6 +183,7 @@ class FakeGateway implements MemberGateway {
   removeAssetError: { message?: string } | null = null;
   verifiedTokens: string[] = [];
   rpcCalls: RpcCall[] = [];
+  exportCalls: ExportItemsCall[] = [];
   createCalls: CreateItemCall[] = [];
   categoryCalls: CategoryLookupCall[] = [];
   updateCalls: UpdateItemCall[] = [];
@@ -204,6 +209,11 @@ class FakeGateway implements MemberGateway {
   rpc(call: RpcCall): Promise<RpcResult> {
     this.rpcCalls.push(call);
     return Promise.resolve(this.rpcResult);
+  }
+
+  exportItems(call: ExportItemsCall): Promise<Response> {
+    this.exportCalls.push(call);
+    return Promise.resolve(this.exportResult);
   }
 
   createItem(call: CreateItemCall): Promise<RpcResult> {
@@ -342,7 +352,7 @@ Deno.test("bootstrap verifies the token and forwards caller authorization and re
   gateway.rpcResult = {
     data: {
       profile: { id: "member-id", state: "active" },
-      limits: { items: 100, image_bytes: 20_000_000 },
+      limits: { items: 1000, image_bytes: 20_000_000 },
       usage: {
         active_item_count: 0,
         used_image_bytes: 0,
@@ -609,6 +619,243 @@ Deno.test("URL preparation preserves path, query, and fragment as duplicate-key 
     new Set(gateway.createCalls.map((call) => call.prepared.url_hash)).size,
     3,
   );
+});
+
+Deno.test("POST and PATCH preparation classify parsed service hosts without changing authored fields or URL identity", async () => {
+  const cases = [
+    {
+      source: "instagram",
+      hosts: ["instagram.com", "media.instagram.com", "WWW.InStAgRaM.CoM"],
+    },
+    {
+      source: "threads",
+      hosts: [
+        "threads.com",
+        "posts.threads.com",
+        "WWW.ThReAdS.CoM",
+        "threads.net",
+        "posts.threads.net",
+        "WWW.ThReAdS.NeT",
+      ],
+    },
+    {
+      source: "naver_blog",
+      hosts: ["blog.naver.com", "m.blog.naver.com", "M.BLOG.NaVeR.CoM"],
+    },
+    {
+      source: "x",
+      hosts: [
+        "x.com",
+        "posts.x.com",
+        "WWW.X.CoM",
+        "twitter.com",
+        "posts.twitter.com",
+        "WWW.TwItTeR.CoM",
+      ],
+    },
+    {
+      source: "facebook",
+      hosts: [
+        "facebook.com",
+        "posts.facebook.com",
+        "WWW.FaCeBoOk.CoM",
+        "fb.com",
+        "posts.fb.com",
+        "WWW.FB.CoM",
+        "fb.watch",
+        "posts.fb.watch",
+        "WWW.FB.WaTcH",
+      ],
+    },
+    {
+      source: "bluesky",
+      hosts: ["bsky.app", "posts.bsky.app", "WWW.BsKy.ApP"],
+    },
+    {
+      source: "mastodon",
+      hosts: [
+        "mastodon.social",
+        "posts.mastodon.social",
+        "WWW.MaStOdOn.SoCiAl",
+      ],
+    },
+    {
+      source: "other",
+      hosts: [
+        "notinstagram.com",
+        "instagram.com.evil.com",
+        "notthreads.com",
+        "threads.net.evil.com",
+        "blog.naver.com.evil.com",
+        "posts.blog.naver.com",
+        "naver.com",
+        "notx.com",
+        "x.com.evil.com",
+        "nottwitter.com",
+        "twitter.com.evil.com",
+        "notfacebook.com",
+        "facebook.com.evil.com",
+        "notfb.com",
+        "fb.com.evil.com",
+        "notfb.watch",
+        "fb.watch.evil.com",
+        "notbsky.app",
+        "bsky.app.evil.com",
+        "notmastodon.social",
+        "mastodon.social.evil.com",
+        "mastodon.online",
+        "social.example.com",
+        "example.com",
+      ],
+    },
+  ];
+  const path = "/@person/../status/%7E?Keep=A&utm_source=x#Part";
+
+  for (const { source, hosts } of cases) {
+    for (const host of hosts) {
+      const url = `HTTPS://${host}:443${path}`;
+      const normalizedUrl = `https://${host.toLowerCase()}${path}`;
+      const createGateway = new FakeGateway();
+      const createBody = {
+        url,
+        title: "직접 쓴 제목",
+        note: "직접 쓴 메모",
+        shared_text: "직접 공유한 글",
+      };
+      const createResponse = await createHandler(createGateway)(
+        itemRequest(createBody),
+      );
+      assertEquals(createResponse.status, 201, url);
+      assertEquals(createGateway.createCalls.length, 1, url);
+      const created = createGateway.createCalls[0];
+      assertEquals(created.body, createBody, url);
+      assertEquals(created.prepared.source, source, url);
+      assertEquals(created.prepared.normalized_url, normalizedUrl, url);
+      assertEquals(created.prepared.metadata_allowed, true, url);
+      assertEquals(
+        created.prepared.normalized_fields.user_title,
+        createBody.title,
+      );
+      assertEquals(created.prepared.normalized_fields.note, createBody.note);
+
+      const updateGateway = new FakeGateway();
+      updateGateway.rpcResult = {
+        data: { ...itemSnapshot(), url },
+        error: null,
+      };
+      const updateBody = {
+        expected_version: 4,
+        title: "직접 수정한 제목",
+        note: "직접 수정한 메모",
+      };
+      const updateResponse = await createHandler(updateGateway)(
+        updateRequest(updateBody),
+      );
+      assertEquals(updateResponse.status, 200, url);
+      assertEquals(updateGateway.updateCalls.length, 1, url);
+      const updated = updateGateway.updateCalls[0];
+      assertEquals(updated.body, updateBody, url);
+      assertEquals(updated.prepared?.source, source, url);
+      assertEquals(updated.prepared?.normalized_url, normalizedUrl, url);
+      assertEquals(updated.prepared?.url_hash, created.prepared.url_hash, url);
+      assertEquals(updated.prepared?.metadata_allowed, true, url);
+      assertEquals(
+        updated.prepared?.normalized_fields.user_title,
+        updateBody.title,
+      );
+      assertEquals(updated.prepared?.normalized_fields.note, updateBody.note);
+      assertEquals(
+        updated.prepared?.normalized_fields.fetched_title,
+        "확보한 여행 제목",
+      );
+    }
+  }
+});
+
+Deno.test("POST and PATCH preserve metadata restrictions independently of source labels", async () => {
+  const cases = [
+    { url: "http://127.0.0.1/@person", source: "other" },
+    { url: "http://localhost/@person", source: "other" },
+    { url: "https://x.com:8443/status/1", source: "x" },
+    { url: "https://facebook.com:8443/post/1", source: "facebook" },
+    { url: "https://bsky.app:8443/profile/person/post/1", source: "bluesky" },
+    { url: "https://mastodon.social:8443/@person/1", source: "mastodon" },
+  ];
+
+  for (const { url, source } of cases) {
+    const createGateway = new FakeGateway();
+    const createResponse = await createHandler(createGateway)(
+      itemRequest({ url }),
+    );
+    assertEquals(createResponse.status, 201, url);
+    assertEquals(createGateway.createCalls[0].prepared.source, source, url);
+    assertEquals(
+      createGateway.createCalls[0].prepared.metadata_allowed,
+      false,
+      url,
+    );
+
+    const updateGateway = new FakeGateway();
+    updateGateway.rpcResult = { data: { ...itemSnapshot(), url }, error: null };
+    const updateResponse = await createHandler(updateGateway)(updateRequest({
+      expected_version: 4,
+      note: "직접 쓴 메모",
+    }));
+    assertEquals(updateResponse.status, 200, url);
+    assertEquals(updateGateway.updateCalls[0].prepared?.source, source, url);
+    assertEquals(
+      updateGateway.updateCalls[0].prepared?.metadata_allowed,
+      false,
+      url,
+    );
+  }
+});
+
+Deno.test("POST rejects credential-bearing service URLs and PATCH rejects unsafe stored URLs before writes", async () => {
+  for (
+    const host of [
+      "x.com",
+      "twitter.com",
+      "facebook.com",
+      "fb.com",
+      "fb.watch",
+      "bsky.app",
+      "mastodon.social",
+    ]
+  ) {
+    for (
+      const url of [
+        `https://${host}@evil.com/post/1`,
+        `https://evil.com@${host}/post/1`,
+        `https://user:password@${host}/post/1`,
+      ]
+    ) {
+      const createGateway = new FakeGateway();
+      const createResponse = await createHandler(createGateway)(
+        itemRequest({ url }),
+      );
+      assertEquals(createResponse.status, 400, url);
+      assertEquals(await errorCode(createResponse), "INVALID_BODY", url);
+      assertEquals(createGateway.createCalls, [], url);
+
+      const updateGateway = new FakeGateway();
+      updateGateway.rpcResult = {
+        data: { ...itemSnapshot(), url },
+        error: null,
+      };
+      const updateResponse = await createHandler(updateGateway)(updateRequest({
+        expected_version: 4,
+        note: "직접 쓴 메모",
+      }));
+      assertEquals(updateResponse.status, 503, url);
+      assertEquals(
+        await errorCode(updateResponse),
+        "DEPENDENCY_UNAVAILABLE",
+        url,
+      );
+      assertEquals(updateGateway.updateCalls, [], url);
+    }
+  }
 });
 
 Deno.test("POST items validates raw field types, Unicode bounds, and categories", async () => {
@@ -909,6 +1156,623 @@ Deno.test("POST items accepts only path-appropriate exact committed conflicts", 
   }
 });
 
+Deno.test("GET export verifies the caller and lazily forwards unchanged snapshot chunks with only trusted headers", async () => {
+  for (
+    const path of [
+      "/library-api/v1/items/export",
+      "/functions/v1/library-api/v1/items/export",
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    const chunks = [
+      '{"items":[{"url":"https://example.test/한글","title":"제목 🙂",',
+      '"user_title":null,"note":"첫 줄\\n둘째 줄","source":"other",',
+      '"categories":["개인"],"saved_at":"2026-11-01T01:02:03Z"}]}',
+    ].map((text) => new TextEncoder().encode(text));
+    let pulls = 0;
+    gateway.exportResult = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const chunk = chunks[pulls++];
+          if (chunk === undefined) controller.close();
+          else controller.enqueue(chunk);
+        },
+      }, { highWaterMark: 0 }),
+      {
+        headers: {
+          "content-type": "application/json",
+          "content-length": "999999999",
+          "content-encoding": "gzip",
+          "content-disposition": 'inline; filename="untrusted.json"',
+          "cache-control": "public",
+          "x-request-id": "untrusted-id",
+          "set-cookie": "private=fixture",
+          "retry-after": "999",
+          location: "https://untrusted.test/",
+          "access-control-allow-origin": "*",
+          server: "private-upstream",
+        },
+      },
+    );
+    const incoming = request(path, { headers: authenticatedJsonHeaders() });
+    const response = await createHandler(gateway)(incoming);
+
+    assertEquals(response.status, 200);
+    assertEquals(gateway.verifiedTokens, ["caller-access-token"]);
+    assertEquals(gateway.exportCalls.length, 1);
+    assertEquals(
+      gateway.exportCalls[0].authorization,
+      "Bearer caller-access-token",
+    );
+    assert(gateway.exportCalls[0].signal === incoming.signal);
+    assertEquals(gateway.rpcCalls, []);
+    assertEquals(gateway.serviceCalls, []);
+    assertEquals(gateway.createCalls, []);
+    assertEquals(Object.fromEntries(response.headers), {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "content-disposition": 'attachment; filename="linkfilebox-export.json"',
+      "x-request-id": VALID_REQUEST_ID,
+    });
+    assert(response.body === gateway.exportResult.body);
+    assertEquals(response.bodyUsed, false);
+    assertEquals(pulls, 0);
+    const reader = response.body!.getReader();
+    for (let index = 0; index < chunks.length; index++) {
+      assertEquals(await reader.read(), { done: false, value: chunks[index] });
+      await Promise.resolve();
+      assertEquals(pulls, index + 1);
+    }
+    assertEquals(await reader.read(), { done: true, value: undefined });
+    reader.releaseLock();
+  }
+});
+
+Deno.test("GET export generates a request id without requiring a mutation identity", async () => {
+  for (const requestId of [null, "invalid-id"]) {
+    const gateway = new FakeGateway();
+    const headers = new Headers({
+      authorization: "Bearer caller-access-token",
+    });
+    if (requestId !== null) headers.set("x-request-id", requestId);
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers },
+    ));
+    assertEquals(response.status, 200);
+    assertMatch(response.headers.get("x-request-id")!, UUID_PATTERN);
+    assertEquals(await response.text(), '{"items":[]}');
+  }
+});
+
+Deno.test("GET export applies normal authentication before contacting its transport", async () => {
+  for (
+    const testCase of [
+      { authorization: null, verification: "verified", status: 401 },
+      { authorization: "Basic fixture", verification: "verified", status: 401 },
+      {
+        authorization: "Bearer caller-access-token",
+        verification: "invalid",
+        status: 401,
+      },
+      {
+        authorization: "Bearer caller-access-token",
+        verification: "unavailable",
+        status: 503,
+      },
+      {
+        authorization: "Bearer caller-access-token",
+        verification: "throws",
+        status: 503,
+      },
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    if (testCase.verification === "throws") {
+      gateway.verifyUser = () =>
+        Promise.reject(new Error("private auth fixture"));
+    } else if (testCase.verification === "invalid") {
+      gateway.verification = { status: "invalid" };
+    } else if (testCase.verification === "unavailable") {
+      gateway.verification = { status: "unavailable" };
+    }
+    const headers = new Headers();
+    if (testCase.authorization !== null) {
+      headers.set("authorization", testCase.authorization);
+    }
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers },
+    ));
+    assertEquals(response.status, testCase.status);
+    assertEquals(
+      await errorCode(response),
+      testCase.status === 401 ? "UNAUTHENTICATED" : "DEPENDENCY_UNAVAILABLE",
+    );
+    assertEquals(gateway.exportCalls, []);
+    assertEquals(gateway.rpcCalls, []);
+  }
+});
+
+Deno.test("export is an exact GET route before item-detail matching and rejects every query parameter", async () => {
+  const gateway = new FakeGateway();
+  const handler = createHandler(gateway);
+  for (const method of ["POST", "PATCH", "DELETE", "HEAD", "OPTIONS", "PUT"]) {
+    for (const prefix of ["", "/functions/v1"]) {
+      const response = await handler(request(
+        `${prefix}/library-api/v1/items/export`,
+        { method },
+      ));
+      assertEquals(response.status, 405, method);
+      assertEquals(response.headers.get("allow"), "GET");
+      assertEquals(await errorCode(response), "METHOD_NOT_ALLOWED");
+    }
+  }
+  assertEquals(gateway.verifiedTokens, []);
+  for (
+    const query of [
+      "?q=test",
+      "?limit=1000",
+      "?owner_id=other",
+      "?q=",
+      "?q=one&q=two",
+      "?=value",
+    ]
+  ) {
+    const response = await handler(request(
+      `/library-api/v1/items/export${query}`,
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 400, query);
+    assertEquals(await errorCode(response), "INVALID_QUERY");
+  }
+  for (
+    const path of [
+      "/library-api/v1/items/export/",
+      "/library-api/v1/items/export/extra",
+      `/library-api/v1/items/${VALID_ITEM_ID}/export`,
+      "/v1/items/export",
+    ]
+  ) {
+    const response = await handler(
+      request(path, { headers: authenticatedJsonHeaders() }),
+    );
+    assertEquals(response.status, 404, path);
+    assertEquals(await errorCode(response), "NOT_FOUND");
+  }
+  for (const itemId of ["EXPORT", "%65xport", "exported"]) {
+    const response = await handler(request(
+      `/library-api/v1/items/${itemId}`,
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 400, itemId);
+    assertEquals(await errorCode(response), "INVALID_BODY");
+  }
+  for (const suffix of ["retry-metadata", "assets/reserve"]) {
+    const response = await handler(request(
+      `/library-api/v1/items/export/${suffix}`,
+      { method: "POST", headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 400, suffix);
+    assertEquals(await errorCode(response), "INVALID_BODY");
+  }
+  assertEquals(gateway.exportCalls, []);
+  assertEquals(gateway.rpcCalls, []);
+  assertEquals(gateway.serviceCalls, []);
+});
+
+Deno.test("non-GET export rejection never reads the request body or invokes a gateway", async () => {
+  const gateway = new FakeGateway();
+  let bodyReads = 0;
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export?owner_id=untrusted",
+    {
+      method: "POST",
+      headers: authenticatedJsonHeaders(),
+      body: new ReadableStream<Uint8Array>({
+        pull() {
+          bodyReads++;
+          throw new Error("export must not read a mutation body");
+        },
+      }, { highWaterMark: 0 }),
+    },
+  ));
+  assertEquals(response.status, 405);
+  assertEquals(response.headers.get("allow"), "GET");
+  assertEquals(await errorCode(response), "METHOD_NOT_ALLOWED");
+  assertEquals(bodyReads, 0);
+  assertEquals(gateway.verifiedTokens, []);
+  assertEquals(gateway.exportCalls, []);
+  assertEquals(gateway.rpcCalls, []);
+  assertEquals(gateway.serviceCalls, []);
+});
+
+Deno.test("export accepts only exact 200 with an application/json body", async () => {
+  for (
+    const status of [
+      201,
+      202,
+      204,
+      206,
+      301,
+      302,
+      304,
+      400,
+      403,
+      404,
+      429,
+      500,
+      503,
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    gateway.exportResult = new Response(
+      status === 204 || status === 304 ? null : '{"items":[]}',
+      { status, headers: { "content-type": "application/json" } },
+    );
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 503, String(status));
+    assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+    assertEquals(response.headers.get("content-disposition"), null);
+  }
+  for (
+    const mime of [
+      null,
+      "text/json",
+      "text/plain",
+      "application/jsonp",
+      "application/problem+json",
+      "application/json, text/html",
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    let cancelled = false;
+    let pulls = 0;
+    const headers = new Headers();
+    if (mime !== null) headers.set("content-type", mime);
+    gateway.exportResult = new Response(
+      new ReadableStream<Uint8Array>({
+        pull() {
+          pulls++;
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }, { highWaterMark: 0 }),
+      { headers },
+    );
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 503, String(mime));
+    assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+    assertEquals(cancelled, true);
+    assertEquals(pulls, 0);
+  }
+  const gateway = new FakeGateway();
+  gateway.exportResult = new Response(null, {
+    headers: { "content-type": "application/json" },
+  });
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export",
+    { headers: authenticatedJsonHeaders() },
+  ));
+  assertEquals(response.status, 503);
+  assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+  for (
+    const mime of [
+      "application/json",
+      "application/json; charset=utf-8",
+      "Application/JSON; Charset=UTF-8",
+    ]
+  ) {
+    const accepted = new FakeGateway();
+    accepted.exportResult = new Response('{"items":[]}', {
+      headers: { "content-type": mime },
+    });
+    const response = await createHandler(accepted)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 200, mime);
+    assertEquals(await response.text(), '{"items":[]}');
+  }
+});
+
+Deno.test("export maps only exact normal member guards and cancels upstream 401 without reading it", async () => {
+  for (
+    const message of [
+      "UNAUTHENTICATED",
+      "BETA_ACCESS_REQUIRED",
+      "ACCOUNT_DELETING",
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    gateway.exportResult = new Response(
+      JSON.stringify({ code: "P0001", message, details: "private fixture" }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      },
+    );
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, message === "UNAUTHENTICATED" ? 401 : 403);
+    const payload = await errorPayload(response);
+    assertEquals(payload.error.code, message);
+    assertEquals(JSON.stringify(payload).includes("private fixture"), false);
+  }
+  const gateway = new FakeGateway();
+  let cancelled = false;
+  let pulls = 0;
+  gateway.exportResult = new Response(
+    new ReadableStream<Uint8Array>({
+      pull() {
+        pulls++;
+      },
+      cancel() {
+        cancelled = true;
+        throw new Error("private cleanup fixture");
+      },
+    }, { highWaterMark: 0 }),
+    {
+      status: 401,
+      headers: {
+        "content-type": "text/html",
+        "www-authenticate": "private fixture",
+      },
+    },
+  );
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export",
+    { headers: authenticatedJsonHeaders() },
+  ));
+  assertEquals(response.status, 401);
+  assertEquals(await errorCode(response), "UNAUTHENTICATED");
+  assertEquals(response.headers.get("www-authenticate"), null);
+  assertEquals(cancelled, true);
+  assertEquals(pulls, 0);
+});
+
+Deno.test("export rejects malformed, unrelated, non-JSON, and wrong-status guard failures without exposing details", async () => {
+  const failures = [
+    { code: "08006", message: "BETA_ACCESS_REQUIRED" },
+    { code: "P0001", message: "BETA_ACCESS_REQUIRED private fixture" },
+    { code: "P0001", message: " BETA_ACCESS_REQUIRED" },
+    { code: "P0001", message: "ITEM_NOT_FOUND" },
+    { code: "P0001", message: "RATE_LIMITED" },
+    { message: "BETA_ACCESS_REQUIRED" },
+    { code: "P0001", message: null },
+    null,
+    [{ code: "P0001", message: "BETA_ACCESS_REQUIRED" }],
+  ];
+  for (const failure of failures) {
+    const gateway = new FakeGateway();
+    gateway.exportResult = new Response(JSON.stringify(failure), {
+      status: 400,
+      headers: {
+        "content-type": "application/json",
+        "set-cookie": "private=fixture",
+      },
+    });
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 503);
+    assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+    assertEquals(response.headers.get("set-cookie"), null);
+  }
+  for (
+    const testCase of [
+      {
+        status: 500,
+        mime: "application/json",
+        text: '{"code":"P0001","message":"BETA_ACCESS_REQUIRED"}',
+      },
+      {
+        status: 201,
+        mime: "application/json",
+        text: '{"code":"P0001","message":"BETA_ACCESS_REQUIRED"}',
+      },
+      {
+        status: 400,
+        mime: "text/plain",
+        text: '{"code":"P0001","message":"BETA_ACCESS_REQUIRED"}',
+      },
+      { status: 400, mime: "application/json", text: '{"code":"P0001",' },
+    ]
+  ) {
+    const gateway = new FakeGateway();
+    gateway.exportResult = new Response(testCase.text, {
+      status: testCase.status,
+      headers: { "content-type": testCase.mime },
+    });
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 503);
+    assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+  }
+});
+
+Deno.test("export error parsing has a 64 KiB byte boundary independent of content-length", async () => {
+  const limit = 64 * 1024;
+  const guard = '{"code":"P0001","message":"BETA_ACCESS_REQUIRED"}';
+  for (const extra of [0, 1]) {
+    const bytes = new TextEncoder().encode(
+      guard + " ".repeat(limit - guard.length + extra),
+    );
+    const gateway = new FakeGateway();
+    let pulls = 0;
+    let cancelled = false;
+    gateway.exportResult = new Response(
+      new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulls++;
+          if (pulls === 1) controller.enqueue(bytes.subarray(0, limit));
+          else if (pulls === 2 && extra > 0) {
+            controller.enqueue(bytes.subarray(limit));
+          } else if (pulls === 2) controller.close();
+          else throw new Error("must not read beyond the error limit");
+        },
+        cancel() {
+          cancelled = true;
+          throw new Error("private cleanup fixture");
+        },
+      }, { highWaterMark: 0 }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json", "content-length": "0" },
+      },
+    );
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, extra === 0 ? 403 : 503);
+    assertEquals(
+      await errorCode(response),
+      extra === 0 ? "BETA_ACCESS_REQUIRED" : "DEPENDENCY_UNAVAILABLE",
+    );
+    assertEquals(pulls, 2);
+    assertEquals(cancelled, extra > 0);
+  }
+  const gateway = new FakeGateway();
+  gateway.exportResult = new Response(
+    JSON.stringify({
+      code: "P0001",
+      message: "BETA_ACCESS_REQUIRED",
+      details: "한".repeat(25_000),
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  );
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export",
+    { headers: authenticatedJsonHeaders() },
+  ));
+  assertEquals(response.status, 503);
+  assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+});
+
+Deno.test("export rejects already consumed or locked upstream bodies as dependency failures", async () => {
+  for (const status of [200, 400]) {
+    for (const state of ["consumed", "locked"]) {
+      const gateway = new FakeGateway();
+      gateway.exportResult = new Response('{"items":[]}', {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+      const reader = state === "locked"
+        ? gateway.exportResult.body!.getReader()
+        : null;
+      if (state === "consumed") await gateway.exportResult.text();
+      try {
+        const response = await createHandler(gateway)(request(
+          "/library-api/v1/items/export",
+          { headers: authenticatedJsonHeaders() },
+        ));
+        assertEquals(response.status, 503);
+        assertEquals(await errorCode(response), "DEPENDENCY_UNAVAILABLE");
+      } finally {
+        if (reader !== null) {
+          await reader.cancel();
+          reader.releaseLock();
+        }
+      }
+    }
+  }
+});
+
+Deno.test("export transport rejection, malformed UTF-8, and unreadable error streams become bounded unavailable errors", async () => {
+  for (const failure of ["fetch", "stream", "utf8"]) {
+    const gateway = new FakeGateway();
+    if (failure === "fetch") {
+      gateway.exportItems = () =>
+        Promise.reject(new Error("private transport fixture"));
+    } else {
+      const body = failure === "utf8"
+        ? new Uint8Array([0xff])
+        : new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(new Error("private body fixture"));
+          },
+        });
+      gateway.exportResult = new Response(body, {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const response = await createHandler(gateway)(request(
+      "/library-api/v1/items/export",
+      { headers: authenticatedJsonHeaders() },
+    ));
+    assertEquals(response.status, 503, failure);
+    const payload = await errorPayload(response);
+    assertEquals(payload.error.code, "DEPENDENCY_UNAVAILABLE");
+    assertEquals(JSON.stringify(payload).includes("private"), false);
+  }
+});
+
+Deno.test("export preserves stream errors after headers without appending JSON or retrying", async () => {
+  const gateway = new FakeGateway();
+  const prefix = new TextEncoder().encode('{"items":[');
+  const failure = new Error("upstream interrupted fixture");
+  let pulls = 0;
+  gateway.exportResult = new Response(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulls++ === 0) controller.enqueue(prefix);
+        else controller.error(failure);
+      },
+    }, { highWaterMark: 0 }),
+    { headers: { "content-type": "application/json" } },
+  );
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export",
+    { headers: authenticatedJsonHeaders() },
+  ));
+  assertEquals(response.status, 200);
+  const reader = response.body!.getReader();
+  assertEquals(await reader.read(), { done: false, value: prefix });
+  assert(
+    await assertRejects(() => reader.read(), Error, failure.message) ===
+      failure,
+  );
+  reader.releaseLock();
+  assertEquals(response.status, 200);
+  assertEquals(gateway.exportCalls.length, 1);
+  assertEquals(gateway.rpcCalls, []);
+});
+
+Deno.test("cancelling an export consumer cancels the original upstream body", async () => {
+  const gateway = new FakeGateway();
+  let reason: unknown;
+  gateway.exportResult = new Response(
+    new ReadableStream<Uint8Array>({
+      cancel(value) {
+        reason = value;
+      },
+    }, { highWaterMark: 0 }),
+    { headers: { "content-type": "application/json" } },
+  );
+  const response = await createHandler(gateway)(request(
+    "/library-api/v1/items/export",
+    { headers: authenticatedJsonHeaders() },
+  ));
+  await response.body!.cancel("downstream cancelled fixture");
+  assertEquals(reason, "downstream cancelled fixture");
+  assertEquals(gateway.exportCalls.length, 1);
+});
+
 Deno.test("GET items forwards a prepared plan and default filters through the caller JWT", async () => {
   for (
     const testCase of [
@@ -1019,11 +1883,81 @@ Deno.test("GET items expands sealed aliases and maps query limits", async () => 
   assertEquals(limitGateway.rpcCalls, []);
 });
 
+Deno.test("GET list and search forward all eight sources with the remaining filters unchanged", async () => {
+  for (
+    const source of [
+      "instagram",
+      "threads",
+      "naver_blog",
+      "x",
+      "facebook",
+      "bluesky",
+      "mastodon",
+      "other",
+    ]
+  ) {
+    for (const q of ["", "find"]) {
+      const gateway = new FakeGateway();
+      gateway.rpcResult = { data: { items: [], has_more: false }, error: null };
+      const query = new URLSearchParams({
+        q,
+        source,
+        category_id: VALID_CATEGORY_ID,
+        unclassified: "false",
+        date_from: "2026-09-12T09:00:00+09:00",
+        date_to: "2026-09-13T00:00:00Z",
+        aliases: "false",
+        needs_cues: "true",
+        limit: "7",
+        offset: "3",
+      });
+      const response = await createHandler(gateway)(request(
+        `/library-api/v1/items?${query}`,
+        { headers: { authorization: "Bearer caller-access-token" } },
+      ));
+
+      assertEquals(response.status, 200, query.toString());
+      assertEquals(gateway.rpcCalls, [{
+        authorization: "Bearer caller-access-token",
+        functionName: "library_search_items",
+        args: {
+          p_plan: {
+            query: q,
+            terms: q === "" ? [] : [q],
+            groups: q === "" ? [] : [{ kind: "literal", value: q }],
+          },
+          p_filters: {
+            category_id: VALID_CATEGORY_ID,
+            unclassified: false,
+            source,
+            date_from: "2026-09-12T00:00:00.000Z",
+            date_to: "2026-09-13T00:00:00.000Z",
+            aliases: false,
+            needs_cues: true,
+          },
+          p_limit: 7,
+          p_offset: 3,
+        },
+      }], query.toString());
+      assertEquals(gateway.createCalls, []);
+      assertEquals(gateway.updateCalls, []);
+    }
+  }
+});
+
 Deno.test("GET items rejects unknown, contradictory, and malformed filters", async () => {
   const queries = [
     "?category_id=abc",
     `?category_id=${VALID_CATEGORY_ID}&unclassified=true`,
     "?source=tiktok",
+    "?source=twitter",
+    "?source=bsky",
+    "?source=mastodon.social",
+    "?source=X",
+    "?source=Facebook",
+    "?source=facebook%20",
+    "?source=",
+    "?source=x&source=facebook",
     "?unclassified=1",
     "?aliases=True",
     "?needs_cues=yes",

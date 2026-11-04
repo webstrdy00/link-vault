@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.linkvault.app.storage.OutboxRepository
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +32,22 @@ class AccountViewModel internal constructor(
                 client.configurationMessage ?: "로그인 설정이 필요해요.",
             )
         }
+    }
+
+    internal fun prepareLibraryExport(): LibraryExportRequest? {
+        if (operationJob?.isActive == true || mutableUiState.value !is AccountUiState.Active) {
+            return null
+        }
+        val displayed = displayedAccessSession ?: return null
+        val session = client.sessionState.value
+        val ownerId = session.ownerId ?: return null
+        if (displayed.ownerId != ownerId || displayed.generation != session.generation) return null
+        return LibraryExportRequest(
+            requestId = UUID.randomUUID().toString(),
+            ownerId = ownerId,
+            generation = session.generation,
+            fileName = "linkfilebox-library.json",
+        )
     }
 
     fun login(activity: Activity) {

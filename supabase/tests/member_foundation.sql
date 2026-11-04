@@ -175,7 +175,7 @@ select is(
 
 select is(
   public.member_bootstrap('20000000-0000-0000-0000-000000000003') -> 'limits',
-  '{"items":100,"image_bytes":20000000}'::jsonb,
+  '{"items":1000,"image_bytes":20000000}'::jsonb,
   'bootstrap returns the fixed beta limits'
 );
 

@@ -5,6 +5,7 @@ import com.linkvault.app.storage.OutboxState
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.encodeToJsonElement
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -19,6 +20,75 @@ class LibraryModelsTest {
     private val requestId = "11111111-2222-4333-8444-555555555555"
     private val deleteItemId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     private val otherItemId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+
+    @Test
+    fun thumbnailDescriptorParsesInEveryProjectionWithoutLosingExistingFields() {
+        val fields = Json.parseToJsonElement(
+            """
+            {
+              "id":"$deleteItemId", "version":7, "url":"https://example.com/image",
+              "display_title":"첨부한 링크", "source":"other", "note_excerpt":"메모",
+              "content_excerpt":"수집한 내용", "category_refs":[], "has_attachment":true,
+              "metadata_state":"ready", "ocr_state":"failed", "classification_state":"manual",
+              "cue_state":"ready", "cue_flags":["review"], "match_type":"note",
+              "created_at":"2026-10-31T10:00:00Z", "updated_at":"2026-11-01T10:00:00Z"
+            }
+            """.trimIndent(),
+        ).jsonObject
+        val descriptor = buildJsonObject {
+            put("id", otherItemId)
+            put("mime_type", "image/png")
+            put("byte_size", 12345)
+            put("width", 1024)
+            put("height", 768)
+        }
+        val response = buildJsonObject {
+            fields.forEach { (key, value) -> put(key, value) }
+            put("thumbnail_asset", descriptor)
+        }
+        val expected = LibraryThumbnailAsset(otherItemId, "image/png", 12345, 1024, 768)
+        val summary = parseLibrarySummaryResponse(response)
+        val detail = parseLibraryDetailResponse(response)
+
+        assertEquals(expected, summary.thumbnailAsset)
+        assertEquals(expected, detail.thumbnailAsset)
+        assertEquals(parseLibrarySummaryResponse(fields), summary.copy(thumbnailAsset = null))
+        assertEquals(parseLibraryDetailResponse(fields), detail.copy(thumbnailAsset = null))
+        assertEquals(
+            setOf("id", "mime_type", "byte_size", "width", "height"),
+            Json.encodeToJsonElement(expected).jsonObject.keys,
+        )
+        assertEquals(
+            summary,
+            parseLibraryListResponse(
+                buildJsonObject {
+                    put("items", kotlinx.serialization.json.JsonArray(listOf(response)))
+                    put("has_more", false)
+                },
+            ).items.single(),
+        )
+        assertEquals(
+            summary,
+            parseLibrarySaveResponse(buildJsonObject { put("duplicate", true); put("item", response) }).item,
+        )
+    }
+
+    @Test
+    fun absentAndNullThumbnailDescriptorsStayAbsentEvenWhenHasAttachmentIsTrue() {
+        val fields = buildJsonObject {
+            put("id", deleteItemId)
+            put("url", "https://example.com/image")
+            put("has_attachment", true)
+        }
+        listOf(fields, buildJsonObject {
+            fields.forEach { (key, value) -> put(key, value) }
+            put("thumbnail_asset", JsonNull)
+        }).forEach { response ->
+            assertNull(parseLibrarySummaryResponse(response).thumbnailAsset)
+            assertNull(parseLibraryDetailResponse(response).thumbnailAsset)
+            assertEquals(true, parseLibrarySummaryResponse(response).hasAttachment)
+        }
+    }
 
     @Test
     fun cardPreviewChoosesMemoThenCollectedExcerptWithoutChangingEither() {

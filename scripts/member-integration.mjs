@@ -2,8 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { localBackendFixture } from "./local-backend-fixture.mjs";
 
-const { request, user, approve, bootstrap, cleanup, settleClassification, serviceKey } =
-  localBackendFixture();
+const {
+  request,
+  user,
+  approve,
+  bootstrap,
+  cleanup,
+  settleClassification,
+  serviceKey,
+} = localBackendFixture();
 let checks = 0;
 
 function check(condition, label) {
@@ -53,6 +60,10 @@ try {
   check(
     first.body.categories.length === 8 && repeated.body.categories.length === 8,
     "exactly eight system categories",
+  );
+  check(
+    first.body.limits.items === 1000 && repeated.body.limits.items === 1000,
+    "bootstrap reports the one-thousand-link member limit",
   );
   check(first.body.usage.active_item_count === 0, "new member usage is empty");
   await bootstrap(b);
@@ -255,7 +266,8 @@ try {
   check(invalidPage.status === 400, "list page limit enforced");
   const resetFixtureRateWindow = async () => {
     // Advance only this fixture's rate window administratively so the test need
-    // not wait ten real minutes to reach 99 actual rows. Clients cannot do this.
+    // not wait through public rate windows to reach 999 actual rows. Clients
+    // cannot do this; the eleventh-save assertion below keeps the public limit.
     const reset = await request(
       `/rest/v1/api_rate_buckets?owner_id=eq.${a.id}`,
       {
@@ -265,51 +277,178 @@ try {
     );
     assert.equal(reset.status, 204);
   };
-  for (let index = 0; index < 98; index++) {
+  const ownedItemIds = new Set([saved.body.item.id]);
+  for (let index = 0; index < 998; index++) {
     if (index % 10 === 0) await resetFixtureRateWindow();
     const seeded = await createItem(a, {
-      url: `https://example.com/quota-${index}`,
+      url: `https://example.test/quota-${index}`,
     });
-    assert.equal(seeded.status, 201, "create actual quota fixture row");
+    const failureCode = seeded.body?.error?.code;
+    const safeCode =
+      typeof failureCode === "string" && /^[A-Z_]{1,64}$/.test(failureCode)
+        ? failureCode
+        : "UNKNOWN";
+    assert.equal(
+      seeded.status,
+      201,
+      `create actual quota fixture row ${index + 2} (${safeCode})`,
+    );
+    ownedItemIds.add(seeded.body.item.id);
     if (index === 9) {
       const rateLimited = await createItem(a, {
-        url: "https://example.com/rate-rejected",
+        url: "https://example.test/rate-rejected",
       });
       check(
-        rateLimited.status === 429,
+        rateLimited.status === 429 &&
+          rateLimited.body.error.code === "RATE_LIMITED",
         "eleventh new save in one minute is rate limited",
       );
     }
   }
+  const seededUsage = await request("/functions/v1/library-api/v1/me", {
+    token: a.token,
+  });
+  check(
+    ownedItemIds.size === 999 && seededUsage.status === 200 &&
+      seededUsage.body.usage.active_item_count === 999 &&
+      seededUsage.body.limits.items === 1000,
+    "quota race starts with 999 distinct actual owned rows",
+  );
   await resetFixtureRateWindow();
-  const quotaRace = await Promise.all([
-    createItem(a, { url: "https://example.com/quota-race-one" }),
-    createItem(a, { url: "https://example.com/quota-race-two" }),
-  ]);
+  const quotaBodies = [
+    { url: "https://example.test/quota-race-one" },
+    { url: "https://example.test/quota-race-two" },
+  ];
+  const quotaRequestIds = [randomUUID(), randomUUID()];
+  const quotaRace = await Promise.all(
+    quotaBodies.map((body, index) =>
+      createItem(a, body, quotaRequestIds[index])
+    ),
+  );
   check(
     quotaRace.filter((result) => result.status === 201).length === 1 &&
       quotaRace.filter((result) =>
           result.status === 409 &&
           result.body.error.code === "ITEM_LIMIT_REACHED"
         ).length === 1,
-    "two concurrent saves at 99 items admit only one",
+    "two concurrent saves at 999 items admit only one at 1000",
+  );
+  const quotaWinner = quotaRace.find((result) => result.status === 201);
+  const quotaLoser = quotaRace.findIndex((result) => result.status === 409);
+  ownedItemIds.add(quotaWinner.body.item.id);
+  const quotaReplay = await createItem(
+    a,
+    quotaBodies[quotaLoser],
+    quotaRequestIds[quotaLoser],
+  );
+  check(
+    quotaReplay.status === 409 &&
+      quotaReplay.body.error.code === "ITEM_LIMIT_REACHED",
+    "capacity-conflicted save replays its original failure at capacity",
   );
   const quotaUsage = await request("/functions/v1/library-api/v1/me", {
     token: a.token,
   });
   check(
     quotaUsage.status === 200 &&
-      quotaUsage.body.usage.active_item_count === 100,
-    "usage stays at one hundred after the quota race",
+      quotaUsage.body.usage.active_item_count === 1000 &&
+      quotaUsage.body.limits.items === 1000,
+    "me reports the one-thousand-link limit and usage after the quota race",
   );
-  const quotaPage = await request(
-    "/functions/v1/library-api/v1/items?limit=50&offset=50",
+  const quotaBootstrap = await bootstrap(a);
+  check(
+    quotaBootstrap.status === 200 &&
+      quotaBootstrap.body.limits.items === 1000 &&
+      quotaBootstrap.body.usage.active_item_count === 1000,
+    "bootstrap reports the one-thousand-link limit and full usage",
+  );
+  const paginatedIds = new Set();
+  for (let offset = 0; offset < 1000; offset += 50) {
+    const quotaPage = await request(
+      `/functions/v1/library-api/v1/items?limit=50&offset=${offset}`,
+      { token: a.token },
+    );
+    assert.equal(quotaPage.status, 200, "paginate actual quota fixture rows");
+    assert.equal(
+      quotaPage.body.items.length,
+      50,
+      "every quota page contains fifty rows",
+    );
+    assert.equal(
+      quotaPage.body.has_more,
+      offset + 50 < 1000,
+      "quota pagination has an exact end boundary",
+    );
+    for (const item of quotaPage.body.items) {
+      assert.ok(
+        ownedItemIds.has(item.id),
+        "quota pages contain only this member's saved rows",
+      );
+      assert.ok(!paginatedIds.has(item.id), "quota pages do not repeat a row");
+      assert.notEqual(
+        item.id,
+        savedB.body.item.id,
+        "quota pages exclude the other member's row",
+      );
+      paginatedIds.add(item.id);
+    }
+  }
+  const quotaEnd = await request(
+    "/functions/v1/library-api/v1/items?limit=50&offset=1000",
     { token: a.token },
   );
   check(
-    quotaPage.status === 200 && quotaPage.body.items.length === 50 &&
-      !quotaPage.body.has_more,
-    "one hundred actual rows paginate without overflow",
+    ownedItemIds.size === 1000 && paginatedIds.size === 1000 &&
+      quotaEnd.status === 200 && quotaEnd.body.items.length === 0 &&
+      quotaEnd.body.has_more === false,
+    "one thousand actual owned rows paginate uniquely across twenty pages and an empty end boundary",
+  );
+  const currentForDelete = await settleClassification(a, saved.body.item.id);
+  const quotaDelete = await request(
+    `/functions/v1/library-api/v1/items/${saved.body.item.id}`,
+    {
+      token: a.token,
+      method: "DELETE",
+      body: { expected_version: currentForDelete.body.version },
+      headers: { "X-Request-Id": randomUUID() },
+    },
+  );
+  check(
+    quotaDelete.status === 202,
+    "deleting an owned item releases full member capacity",
+  );
+  const releasedUsage = await request("/functions/v1/library-api/v1/me", {
+    token: a.token,
+  });
+  check(
+    releasedUsage.status === 200 &&
+      releasedUsage.body.usage.active_item_count === 999,
+    "deletion releases exactly one active-link slot",
+  );
+  const stickyQuota = await createItem(
+    a,
+    quotaBodies[quotaLoser],
+    quotaRequestIds[quotaLoser],
+  );
+  check(
+    stickyQuota.status === 409 &&
+      stickyQuota.body.error.code === "ITEM_LIMIT_REACHED",
+    "capacity-conflicted request stays failed after deletion releases capacity",
+  );
+  const quotaRecovery = await createItem(a, quotaBodies[quotaLoser]);
+  check(
+    quotaRecovery.status === 201 &&
+      !ownedItemIds.has(quotaRecovery.body.item.id),
+    "a new request ID can save the rejected URL into the released slot",
+  );
+  const recoveredUsage = await request("/functions/v1/library-api/v1/me", {
+    token: a.token,
+  });
+  check(
+    recoveredUsage.status === 200 &&
+      recoveredUsage.body.usage.active_item_count === 1000 &&
+      recoveredUsage.body.limits.items === 1000,
+    "new-ID recovery restores exactly one thousand active links",
   );
   const cross = await request(
     `/rest/v1/categories?owner_id=eq.${b.id}&select=id`,

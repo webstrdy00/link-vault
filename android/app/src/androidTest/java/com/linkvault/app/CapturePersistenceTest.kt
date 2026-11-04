@@ -15,14 +15,19 @@ import android.os.Build
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.ComposeTestRule
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextReplacement
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import androidx.room.Room
 import androidx.test.filters.SdkSuppress
 import androidx.test.core.app.ActivityScenario
@@ -44,6 +49,8 @@ import com.linkvault.app.attachment.IncomingImageCaptureFailure
 import com.linkvault.app.attachment.IncomingImageStore
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.auth.SessionBoundary
+import com.linkvault.app.library.LibrarySaveStatus
+import com.linkvault.app.library.LibraryViewModel
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
@@ -127,6 +134,81 @@ class CapturePersistenceTest {
     }
 
     @Test
+    fun unconfirmedSingleShareDraftResumesFromLauncherWithoutShareReturn(): Unit = runBlocking {
+        CaptureCompletionFixture().use { fixture ->
+            val url = "https://example.com/unconfirmed-draft"
+            val text = "공유한 초안\n$url"
+            val shareIntent = Intent(fixture.app, MainActivity::class.java).apply {
+                action = Intent.ACTION_SEND
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, url)
+                putExtra(Intent.EXTRA_SUBJECT, "공유한 초안")
+            }
+            ActivityScenario.launch<MainActivity>(shareIntent).use {
+                compose.onNodeWithText("선택한 링크 보관").assertDoesNotExist()
+                compose.onNodeWithText("저장").performScrollTo().assertIsEnabled()
+                fixture.awaitDraftWrites()
+                assertEquals(text, fixture.outbox.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID)?.text)
+                assertTrue(fixture.outbox.observeOutbox(fixture.ownerId).first().isEmpty())
+            }
+            val launchIntent = Intent(fixture.app, MainActivity::class.java).apply {
+                action = Intent.ACTION_MAIN
+                addCategory(Intent.CATEGORY_LAUNCHER)
+            }
+            ActivityScenario.launch<MainActivity>(launchIntent).use {
+                compose.waitUntil(10_000) {
+                    compose.onAllNodesWithText("이어쓰기").fetchSemanticsNodes().isNotEmpty()
+                }
+                compose.onNodeWithText("공유한 앱으로 돌아가기").assertDoesNotExist()
+                compose.onNodeWithText("저장").assertDoesNotExist()
+                compose.onNodeWithText("이어쓰기").performClick()
+                compose.onNodeWithText("공유 텍스트 또는 원문 URL").assertTextContains(text)
+                compose.onNodeWithText("선택한 링크 보관").performScrollTo().assertIsEnabled()
+                assertTrue(fixture.outbox.observeOutbox(fixture.ownerId).first().isEmpty())
+            }
+        }
+    }
+
+    @Test
+    fun directTextShareDoesNotAttachOrConsumeAnEarlierIncomingImage(): Unit = runBlocking {
+        CaptureCompletionFixture().use { fixture ->
+            val sourceDirectory = File(fixture.app.cacheDir, "fixture_images").apply {
+                check(exists() || mkdirs())
+            }
+            val source = File(sourceDirectory, "unattached-text-share.png").apply {
+                writeBytes(byteArrayOf(1, 2, 3, 4))
+            }
+            fixture.app.incomingImageStore.clear()
+            try {
+                val image = fixture.app.incomingImageStore.capture(
+                    FixtureImageProvider.uriForFile(source), fixture.app.incomingImageStore.generation(),
+                )
+                val intent = Intent(fixture.app, MainActivity::class.java).apply {
+                    action = Intent.ACTION_SEND
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, "https://example.com/no-implicit-image")
+                }
+                ActivityScenario.launch<MainActivity>(intent).use {
+                    compose.onNodeWithTag("capture-screen").assertDoesNotExist()
+                    compose.onNodeWithText("선택한 링크 보관").assertDoesNotExist()
+                    assertTrue(fixture.outbox.observeOutbox(fixture.ownerId).first().isEmpty())
+                    compose.onNodeWithText("저장").performScrollTo().performClick()
+                    val request = fixture.awaitRequest()
+                    assertEquals(listOf(request.requestId), fixture.outbox
+                        .observeOutbox(fixture.ownerId).first().map { it.requestId })
+                    assertEquals(setOf("url", "shared_text"), Json
+                        .parseToJsonElement(request.payloadJson).jsonObject.keys)
+                    assertEquals(image.id, fixture.app.incomingImageStore.draft.value?.id)
+                    assertTrue(source.isFile)
+                }
+            } finally {
+                fixture.app.incomingImageStore.clear()
+                source.delete()
+            }
+        }
+    }
+
+    @Test
     fun pendingCaptureCompletionSurvivesRecreationAndDoesNotRestoreOnFreshLaunch(): Unit = runBlocking {
         CaptureCompletionFixture().use { fixture ->
             val shareIntent = Intent(fixture.app, MainActivity::class.java).apply {
@@ -136,15 +218,24 @@ class CapturePersistenceTest {
             }
             ActivityScenario.launch<MainActivity>(shareIntent).use { scenario ->
                 try {
-                    compose.onNodeWithText("선택한 링크 보관").performScrollTo().performClick()
+                    compose.onNodeWithText("선택한 링크 보관").assertDoesNotExist()
                     compose.waitUntil(10_000) {
                         compose.onAllNodesWithText("저장").fetchSemanticsNodes().isNotEmpty()
                     }
+                    assertTrue(fixture.outbox.observeOutbox(fixture.ownerId).first().isEmpty())
+                    compose.onNodeWithText("공유한 앱으로 돌아가기").assertDoesNotExist()
                     compose.onNodeWithText("저장").performScrollTo().performClick()
                     val request = fixture.awaitRequest()
                     scenario.recreate()
+                    compose.waitUntil(10_000) {
+                        compose.onAllNodesWithText("공유한 앱으로 돌아가기").fetchSemanticsNodes().isNotEmpty()
+                    }
+                    assertEquals(listOf(request.requestId), fixture.outbox
+                        .observeOutbox(fixture.ownerId).first().map { it.requestId })
                     fixture.complete(request)
                     fixture.awaitAcknowledged(request.requestId, compose)
+                    compose.onNodeWithText("공유한 앱으로 돌아가기").performScrollTo().assertIsEnabled()
+                    scenario.onActivity { assertFalse(it.isFinishing) }
                     compose.onNodeWithTag("root-library").performClick()
                     compose.onNodeWithText("이어쓰기").assertDoesNotExist()
                     fixture.awaitDraftWrites()
@@ -158,10 +249,86 @@ class CapturePersistenceTest {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
             ActivityScenario.launch<MainActivity>(launchIntent).use {
+                compose.onNodeWithText("공유한 앱으로 돌아가기").assertDoesNotExist()
                 compose.onNodeWithText("이어쓰기").assertDoesNotExist()
                 compose.onNodeWithTag("root-capture").performClick()
                 compose.onNodeWithText("선택한 링크 보관").performScrollTo().assertIsNotEnabled()
             }
+        }
+    }
+
+    @Test
+    fun quotaRejectedCaptureReconfirmationAfterRecreationPreservesOwnerAndPayload(): Unit = runBlocking {
+        assertQuotaReconfirmation(fromQueue = false)
+    }
+
+    @Test
+    fun quotaRejectedQueueReconfirmationPreservesOwnerAndPayload(): Unit = runBlocking {
+        assertQuotaReconfirmation(fromQueue = true)
+    }
+
+    @Test
+    fun confirmedSaveFailuresRejectStaleSameIdRetries(): Unit = runBlocking {
+        for (code in listOf("ITEM_LIMIT_REACHED", "URL_HASH_COLLISION", "IDEMPOTENCY_MISMATCH")) {
+            withSaveViewModel { fixture, model ->
+                compose.runOnUiThread { model.save() }
+                val request = fixture.awaitRequest()
+                fixture.fail(request, errorCode = "NETWORK_ERROR")
+                withTimeout(10_000) {
+                    model.uiState.first { (it.saveStatus as? LibrarySaveStatus.Failed)?.canRetrySameRequest == true }
+                }
+                awaitRetryMutations(model) {
+                    // Commit the rejection while the UI still displays the earlier network failure.
+                    runBlocking {
+                        fixture.database.outboxDao().retry(
+                            fixture.ownerId, request.requestId, System.currentTimeMillis(),
+                        )
+                        fixture.fail(request, errorCode = code)
+                    }
+                    assertTrue((model.uiState.value.saveStatus as LibrarySaveStatus.Failed).canRetrySameRequest)
+                    model.retrySave()
+                    model.retryOperation(request.requestId)
+                }
+                val retained = checkNotNull(fixture.database.outboxDao().findByRequestId(request.requestId))
+                assertEquals(OutboxState.FAILED, retained.state)
+                assertEquals(code, retained.errorCode)
+                assertEquals(2, retained.attemptCount)
+                assertEquals(request.payloadJson, retained.payloadJson)
+                assertEquals(1, fixture.outbox.observeOutbox(fixture.ownerId).first().size)
+                withTimeout(10_000) {
+                    model.uiState.first {
+                        val failure = it.saveStatus as? LibrarySaveStatus.Failed
+                        failure != null && !failure.canRetrySameRequest &&
+                            failure.needsReconfirmation == (code == "ITEM_LIMIT_REACHED")
+                    }
+                }
+                awaitRetryMutations(model) {
+                    model.retrySave()
+                    model.retryOperation(request.requestId)
+                }
+                assertEquals(retained, fixture.database.outboxDao().findByRequestId(request.requestId))
+            }
+        }
+    }
+
+    @Test
+    fun ambiguousSaveFailureRetriesSameRequestAndPayload(): Unit = runBlocking {
+        withSaveViewModel { fixture, model ->
+            compose.runOnUiThread { model.save() }
+            val request = fixture.awaitRequest()
+            fixture.fail(request, errorCode = "NETWORK_ERROR")
+            withTimeout(10_000) {
+                model.uiState.first { (it.saveStatus as? LibrarySaveStatus.Failed)?.canRetrySameRequest == true }
+            }
+            awaitRetryMutations(model) { model.retrySave() }
+            val retained = fixture.outbox.observeOutbox(fixture.ownerId).first().single()
+            assertEquals(request.requestId, retained.requestId)
+            assertEquals(request.ownerId, retained.ownerId)
+            assertEquals(request.payloadJson, retained.payloadJson)
+            assertEquals(request.expiresAt, retained.expiresAt)
+            assertEquals(OutboxState.PENDING, retained.state)
+            assertEquals(1, retained.attemptCount)
+            assertNull(retained.errorCode)
         }
     }
 
@@ -391,6 +558,119 @@ class CapturePersistenceTest {
         }
     }
 
+    private suspend fun assertQuotaReconfirmation(fromQueue: Boolean) {
+        CaptureCompletionFixture().use { fixture ->
+            val text = "https://example.com/quota-reconfirmation reviewed shared text"
+            val shareIntent = Intent(fixture.app, MainActivity::class.java).apply {
+                action = Intent.ACTION_SEND
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+            }
+            ActivityScenario.launch<MainActivity>(shareIntent).use { scenario ->
+                try {
+                    compose.onNodeWithText("선택한 링크 보관").assertDoesNotExist()
+                    compose.waitUntil(10_000) {
+                        compose.onAllNodesWithText("저장").fetchSemanticsNodes().isNotEmpty()
+                    }
+                    compose.onNodeWithTag("capture-optional-details").performScrollTo().performClick()
+                    compose.onNodeWithText("제목 (선택 사항)").performScrollTo()
+                        .performTextReplacement("확인한 제목")
+                    compose.onNodeWithText("메모 (선택 사항)").performScrollTo()
+                        .performTextReplacement("확인한 메모")
+                    compose.onNodeWithText("저장").performScrollTo().performClick()
+                    val request = fixture.awaitRequest()
+                    val reviewed = Json.parseToJsonElement(request.payloadJson).jsonObject
+                    assertEquals("확인한 제목", reviewed.getValue("title").jsonPrimitive.content)
+                    assertEquals("확인한 메모", reviewed.getValue("note").jsonPrimitive.content)
+                    assertEquals(text, reviewed.getValue("shared_text").jsonPrimitive.content)
+                    fixture.fail(
+                        request,
+                        errorCode = "ITEM_LIMIT_REACHED",
+                        errorMessage = "보관 가능한 링크 수를 모두 사용했어요.",
+                    )
+                    val actionTag = if (fromQueue) {
+                        compose.onNodeWithTag("root-library").performClick()
+                        "outbox-save-reconfirm-${request.requestId}"
+                    } else {
+                        "capture-save-reconfirm"
+                    }
+                    scenario.recreate()
+                    compose.waitUntil(10_000) {
+                        compose.onAllNodesWithTag(actionTag).fetchSemanticsNodes().isNotEmpty()
+                    }
+                    assertEquals(
+                        OutboxState.FAILED,
+                        fixture.database.outboxDao().findByRequestId(request.requestId)?.state,
+                    )
+                    compose.onNodeWithText("다시 시도").assertDoesNotExist()
+                    compose.onNodeWithTag(actionTag).performScrollTo().performClick()
+                    val entries = withTimeout(10_000) {
+                        fixture.outbox.observeOutbox(fixture.ownerId).first { entries ->
+                            entries.none { it.requestId == request.requestId } &&
+                                entries.any { it.method == "POST" && it.path == "/items" }
+                        }
+                    }
+                    val replacement = entries.single()
+                    assertFalse(request.requestId == replacement.requestId)
+                    assertEquals(request.ownerId, replacement.ownerId)
+                    assertEquals(request.method, replacement.method)
+                    assertEquals(request.path, replacement.path)
+                    assertEquals(request.payloadJson, replacement.payloadJson)
+                    assertEquals(OutboxState.PENDING, replacement.state)
+                    assertEquals(0, replacement.attemptCount)
+                    assertNull(fixture.database.outboxDao().findByRequestId(request.requestId))
+                    fixture.complete(replacement)
+                    fixture.awaitAcknowledged(replacement.requestId, compose)
+                    compose.onNodeWithTag("root-library").performClick()
+                    compose.onNodeWithText("이어쓰기").assertDoesNotExist()
+                    fixture.awaitDraftWrites()
+                    assertNull(fixture.outbox.readDraft(LinkVaultApplication.CAPTURE_DRAFT_ID))
+                } finally {
+                    scenario.onActivity { it.intent = Intent(shareIntent) }
+                }
+            }
+        }
+    }
+
+    private suspend fun withSaveViewModel(
+        block: suspend (CaptureCompletionFixture, LibraryViewModel) -> Unit,
+    ) {
+        CaptureCompletionFixture().use { fixture ->
+            val store = ViewModelStore()
+            try {
+                lateinit var model: LibraryViewModel
+                compose.runOnUiThread {
+                    model = ViewModelProvider(
+                        store,
+                        LibraryViewModel.factory(
+                            client = fixture.client,
+                            outbox = fixture.outbox,
+                            attachments = fixture.attachments,
+                            ownerId = fixture.ownerId,
+                            sessionGeneration = fixture.client.sessionState.value.generation,
+                            initialUrl = "https://example.com/retry-contract",
+                            sharedText = "https://example.com/retry-contract",
+                        ),
+                    )[LibraryViewModel::class.java]
+                }
+                block(fixture, model)
+            } finally {
+                compose.runOnUiThread { store.clear() }
+            }
+        }
+    }
+
+    private suspend fun awaitRetryMutations(model: LibraryViewModel, action: () -> Unit) {
+        var jobs = emptyList<Job>()
+        compose.runOnUiThread {
+            val scopeJob = checkNotNull(model.viewModelScope.coroutineContext[Job])
+            val previous = scopeJob.children.toSet()
+            action()
+            jobs = scopeJob.children.filterNot { it in previous }.toList()
+        }
+        withTimeout(10_000) { jobs.forEach { it.join() } }
+    }
+
     private class ResolverContext(
         base: Context,
         private val resolver: ContentResolver,
@@ -515,13 +795,18 @@ internal class CaptureCompletionFixture : AutoCloseable {
         ) == 1)
     }
 
-    suspend fun fail(entry: OutboxEntry, state: OutboxState = OutboxState.FAILED) {
+    suspend fun fail(
+        entry: OutboxEntry,
+        state: OutboxState = OutboxState.FAILED,
+        errorCode: String = if (state == OutboxState.RETRY) "DEPENDENCY_UNAVAILABLE" else "INVALID_BODY",
+        errorMessage: String = "입력 내용을 확인해 주세요.",
+    ) {
         val claimed = claim(entry)
         check(database.outboxDao().completeFailure(
             ownerId, entry.requestId, checkNotNull(claimed.leaseUntil), state,
             System.currentTimeMillis() + 60_000L,
-            if (state == OutboxState.RETRY) "DEPENDENCY_UNAVAILABLE" else "INVALID_BODY",
-            "입력 내용을 확인해 주세요.",
+            errorCode,
+            errorMessage,
         ) == 1)
     }
 

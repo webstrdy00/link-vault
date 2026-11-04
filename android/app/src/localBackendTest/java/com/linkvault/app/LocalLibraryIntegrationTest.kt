@@ -142,8 +142,12 @@ class LocalLibraryIntegrationTest {
     }
 
     private fun verifySourceBrowsing(ids: Map<String, String>) {
+        val resultTag = Regex(
+            "^search-item-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            RegexOption.IGNORE_CASE,
+        )
         val resultCard = androidx.compose.ui.test.SemanticsMatcher("source search result") { node ->
-            node.config.getOrNull(SemanticsProperties.TestTag)?.startsWith("search-item-") == true
+            node.config.getOrNull(SemanticsProperties.TestTag)?.matches(resultTag) == true
         }
         fun awaitResults(expected: Set<String>) {
             compose.waitUntil(timeoutMillis = 30_000) {
@@ -273,7 +277,10 @@ class LocalLibraryIntegrationTest {
                 compose.onNodeWithText("제목 (선택 사항)").assertDoesNotExist()
                 compose.onNodeWithText("메모 (선택 사항)").assertDoesNotExist()
                 compose.onNodeWithText("저장").performScrollTo().assertIsEnabled().performClick()
-                awaitText("저장했어요.")
+                awaitText("서버에 저장했어요.")
+                // Completion clears capture Intent data. Keep ActivityScenario's
+                // original launch filter for its later recreation/close events.
+                scenario.onActivity { it.intent = Intent(intent) }
                 compose.onNodeWithText("새로고침").performScrollTo().performClick()
                 val itemId = openSingleSavedItem()
                 compose.onNodeWithTag("detail-back").assertExists()

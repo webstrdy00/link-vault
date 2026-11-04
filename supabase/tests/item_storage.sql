@@ -1234,8 +1234,9 @@ select throws_ok(
 
 reset role;
 
+-- Synthetic counter fixture: this branch check does not seed 1000 actual items.
 update public.library_usage
-set active_item_count = 100
+set active_item_count = 1000
 where owner_id = '11000000-0000-0000-0000-000000000001';
 
 set local role service_role;
@@ -1248,7 +1249,7 @@ select is(
     (select prepared from item_test_inputs where input_name = 'item_limit')
   ),
   '{"http_status":409,"error_code":"ITEM_LIMIT_REACHED"}'::jsonb,
-  'the locked owner counter commits the 100 active-item limit conflict'
+  'the synthetic locked owner counter commits the 1000 active-item limit conflict'
 );
 
 reset role;

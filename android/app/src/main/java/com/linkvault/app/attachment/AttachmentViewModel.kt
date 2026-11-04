@@ -1017,7 +1017,13 @@ internal class AttachmentViewModel(
             try {
                 val downloaded = client.downloadActiveAsset(boundOwner, itemId, asset.id)
                 bytes = downloaded
-                val bitmap = decodePreview(downloaded, asset)
+                val bitmap = decodePreview(
+                    bytes = downloaded,
+                    expectedMimeType = asset.mimeType,
+                    expectedByteSize = asset.byteSize,
+                    expectedWidth = asset.width,
+                    expectedHeight = asset.height,
+                )
                     ?: throw IOException("The downloaded image cannot be decoded safely.")
                 if (!visible || !identityMatches() || mutableUiState.value.item.previewKey() != key) {
                     bitmap.recycle()
@@ -1254,11 +1260,20 @@ private suspend fun writePrivateOcrFile(file: File, bytes: ByteArray): Unit =
         }
     }
 
-private suspend fun decodePreview(bytes: ByteArray, asset: LibraryActiveAsset): Bitmap? =
+internal suspend fun decodePreview(
+    bytes: ByteArray,
+    expectedMimeType: String,
+    expectedByteSize: Long,
+    expectedWidth: Int,
+    expectedHeight: Int,
+    maxPixels: Long = MAX_PREVIEW_PIXELS,
+    maxDimension: Int = Int.MAX_VALUE,
+): Bitmap? =
     withContext(Dispatchers.Default) {
         if (bytes.isEmpty() || bytes.size.toLong() > ImagePreparation.MAX_OUTPUT_BYTES ||
-            bytes.size.toLong() != asset.byteSize ||
-            asset.mimeType !in SUPPORTED_PREVIEW_MIME_TYPES
+            bytes.size.toLong() != expectedByteSize ||
+            expectedMimeType !in SUPPORTED_PREVIEW_MIME_TYPES ||
+            maxPixels !in 1..MAX_PREVIEW_PIXELS || maxDimension <= 0
         ) {
             return@withContext null
         }
@@ -1266,14 +1281,18 @@ private suspend fun decodePreview(bytes: ByteArray, asset: LibraryActiveAsset): 
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
         val width = bounds.outWidth
         val height = bounds.outHeight
-        if (width <= 0 || height <= 0 || width != asset.width || height != asset.height ||
+        if (width <= 0 || height <= 0 || width != expectedWidth || height != expectedHeight ||
             width.toLong() * height.toLong() > ImagePreparation.MAX_PIXELS ||
-            bounds.outMimeType !in SUPPORTED_PREVIEW_MIME_TYPES
+            bounds.outMimeType != expectedMimeType
         ) {
             return@withContext null
         }
         var sample = 1
-        while ((width / sample).toLong() * (height / sample).toLong() > MAX_PREVIEW_PIXELS) {
+        while (((width.toLong() + sample - 1) / sample) *
+            ((height.toLong() + sample - 1) / sample) > maxPixels ||
+            (width.toLong() + sample - 1) / sample > maxDimension ||
+            (height.toLong() + sample - 1) / sample > maxDimension
+        ) {
             sample *= 2
         }
         val options = BitmapFactory.Options().apply {
@@ -1284,7 +1303,8 @@ private suspend fun decodePreview(bytes: ByteArray, asset: LibraryActiveAsset): 
             val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
                 ?: return@withContext null
             if (decoded.isRecycled || decoded.width <= 0 || decoded.height <= 0 ||
-                decoded.width.toLong() * decoded.height.toLong() > MAX_PREVIEW_PIXELS
+                decoded.width.toLong() * decoded.height.toLong() > maxPixels ||
+                decoded.width > maxDimension || decoded.height > maxDimension
             ) {
                 if (!decoded.isRecycled) decoded.recycle()
                 null

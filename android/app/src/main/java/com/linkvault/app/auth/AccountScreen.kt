@@ -48,15 +48,18 @@ import com.linkvault.app.R
 import com.linkvault.app.storage.OutboxRepository
 
 @Composable
-fun AccountScreen(
+internal fun AccountScreen(
     client: AccountClient,
     outbox: OutboxRepository,
+    exportCoordinator: LibraryExportCoordinator,
+    onExport: (LibraryExportRequest) -> Unit,
     onBack: () -> Unit,
     onOpenPrivacy: () -> Unit,
 ) {
     val factory = remember(client, outbox) { AccountViewModel.factory(client, outbox) }
     val accountViewModel: AccountViewModel = viewModel(factory = factory)
     val state by accountViewModel.uiState.collectAsState()
+    val exportState by exportCoordinator.uiState.collectAsState()
     val context = LocalContext.current
     val activity = context.findActivity()
     var fontLicenseText by remember { mutableStateOf<String?>(null) }
@@ -168,8 +171,22 @@ fun AccountScreen(
 
             is AccountUiState.Active -> ActiveContent(
                 summary = currentState.summary,
-                onLogout = accountViewModel::requestLogout,
-                onDeleteAccount = accountViewModel::requestAccountDeletion,
+                exportState = exportState,
+                onExport = {
+                    val request = accountViewModel.prepareLibraryExport()
+                    if (request == null) {
+                        exportCoordinator.reportUnavailable()
+                    } else {
+                        onExport(request)
+                    }
+                },
+                onCancelExport = exportCoordinator::cancel,
+                onLogout = {
+                    if (!exportCoordinator.uiState.value.isBusy) accountViewModel.requestLogout()
+                },
+                onDeleteAccount = {
+                    if (!exportCoordinator.uiState.value.isBusy) accountViewModel.requestAccountDeletion()
+                },
             )
 
             is AccountUiState.Error -> ErrorContent(
@@ -215,6 +232,9 @@ fun AccountScreen(
                 state = currentState,
                 onRetryLocalCleanup = accountViewModel::retryAcceptedDeletionLocalCleanup,
             )
+        }
+        if (state !is AccountUiState.Active && exportState.cleanupFailed) {
+            ExportCleanupWarning()
         }
     }
 
@@ -382,8 +402,11 @@ private fun PendingApprovalContent(
 }
 
 @Composable
-private fun ActiveContent(
+internal fun ActiveContent(
     summary: AccountSummary,
+    exportState: LibraryExportUiState,
+    onExport: () -> Unit,
+    onCancelExport: () -> Unit,
     onLogout: () -> Unit,
     onDeleteAccount: () -> Unit,
 ) {
@@ -407,6 +430,7 @@ private fun ActiveContent(
             )
         }
     }
+    LibraryExportContent(exportState, onExport, onCancelExport)
     SettingsGroup(title = "이 기기의 자료") {
         Text(
             "로그아웃하면 서버 계정과 서버 자료는 유지되고, 이 기기의 계정 자료만 정리해요.",
@@ -415,15 +439,114 @@ private fun ActiveContent(
         )
         OutlinedButton(
             onClick = onLogout,
+            enabled = !exportState.isBusy,
             shape = EditorialShape,
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 48.dp),
+                .heightIn(min = 48.dp)
+                .testTag("account-logout"),
         ) {
             Text("로그아웃")
         }
     }
-    AccountDeletionGroup(onDeleteAccount)
+    AccountDeletionGroup(onDeleteAccount, enabled = !exportState.isBusy)
+}
+
+@Composable
+internal fun LibraryExportContent(
+    state: LibraryExportUiState,
+    onExport: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    SettingsGroup(title = "내 보관함 내보내기") {
+        Text("서버에 저장된 모든 링크를 JSON 파일로 저장해요.")
+        Text("URL, 전체 제목, 직접 입력한 제목·메모, 출처, 분류 이름, 저장 시각을 포함해요.")
+        Text(
+            "이 기기의 저장 대기열과 이미지·OCR·본문은 포함하지 않아요.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "개인 정보가 포함될 수 있으니 안전한 위치에 보관해 주세요. 화면을 떠나면 내보내기를 중단해요.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        when (state.status) {
+            LibraryExportStatus.SELECTING_DESTINATION -> Text("파일을 저장할 위치를 선택해 주세요.")
+            LibraryExportStatus.EXPORTING, LibraryExportStatus.CANCELLING -> {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Text(
+                        if (state.status == LibraryExportStatus.CANCELLING) {
+                            "내보내기를 중단하고 파일을 정리하고 있어요."
+                        } else {
+                            "서버 자료를 확인하고 JSON 파일로 저장하고 있어요."
+                        },
+                    )
+                }
+            }
+            else -> Unit
+        }
+        state.message?.let { message ->
+            Text(
+                text = message,
+                color = if (state.status == LibraryExportStatus.ERROR) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurface
+                },
+                modifier = when (state.status) {
+                    LibraryExportStatus.SUCCESS -> Modifier.testTag("library-export-success")
+                    LibraryExportStatus.ERROR -> Modifier.testTag("library-export-error")
+                    else -> Modifier
+                },
+            )
+        }
+        if (state.pickerPending && state.status == LibraryExportStatus.CANCELLED) {
+            Text("열려 있는 파일 선택기를 닫아 주세요. 이전 선택 결과가 돌아오기 전에는 다시 시작할 수 없어요.")
+        }
+        if (state.cleaningUp) {
+            Text("선택한 미완성 파일을 정리하고 있어요. 정리가 끝나면 다시 시작할 수 있어요.")
+        }
+        if (state.cleanupFailed) ExportCleanupWarning()
+        Button(
+            onClick = onExport,
+            enabled = !state.isBusy,
+            shape = EditorialShape,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .testTag("library-export-start"),
+        ) {
+            Text("JSON 파일로 내보내기")
+        }
+        if (state.isBusy) {
+            OutlinedButton(
+                onClick = onCancel,
+                enabled = state.status == LibraryExportStatus.SELECTING_DESTINATION ||
+                    state.status == LibraryExportStatus.EXPORTING,
+                shape = EditorialShape,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("library-export-cancel"),
+            ) {
+                Text("내보내기 취소")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExportCleanupWarning() {
+    Text(
+        "미완성 파일을 지우지 못했어요. 선택한 저장 위치에서 직접 확인하고 삭제해 주세요. " +
+            "앱 종료나 파일 제공자 제한으로 자동 정리가 보장되지는 않아요.",
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.testTag("library-export-cleanup-warning"),
+    )
 }
 
 @Composable
@@ -693,7 +816,7 @@ private fun DeletionAcceptedContent(
 }
 
 @Composable
-private fun AccountDeletionGroup(onDeleteAccount: () -> Unit) {
+private fun AccountDeletionGroup(onDeleteAccount: () -> Unit, enabled: Boolean = true) {
     DangerSettingsGroup(title = "계정 삭제") {
         Text(
             "계정과 서버 보관 자료의 삭제를 요청해요. 접수 후에는 되돌릴 수 없어요.",
@@ -701,13 +824,15 @@ private fun AccountDeletionGroup(onDeleteAccount: () -> Unit) {
         )
         TextButton(
             onClick = onDeleteAccount,
+            enabled = enabled,
             shape = EditorialShape,
             colors = ButtonDefaults.textButtonColors(
                 contentColor = MaterialTheme.colorScheme.error,
             ),
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 48.dp),
+                .heightIn(min = 48.dp)
+                .testTag("account-delete"),
         ) {
             Text("계정과 서버 자료 삭제")
         }

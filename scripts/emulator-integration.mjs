@@ -17,10 +17,12 @@ const fixtureKind = process.env.LINK_VAULT_TEST_FIXTURE ?? "generic";
 const verifyListDeletion = process.env.LINK_VAULT_TEST_DELETE === "1";
 const verifyDetailEditing = process.env.LINK_VAULT_TEST_DETAIL_EDIT === "1";
 const verifySourceBrowsing = process.env.LINK_VAULT_TEST_SOURCE_BROWSE === "1";
+const verifyExport = process.env.LINK_VAULT_TEST_EXPORT === "1";
 assert.ok(
-  [verifyDetailEditing, verifyListDeletion, verifySourceBrowsing].filter(
-    Boolean,
-  ).length <= 1,
+  [verifyDetailEditing, verifyListDeletion, verifySourceBrowsing, verifyExport]
+    .filter(
+      Boolean,
+    ).length <= 1,
   "Choose one device scenario",
 );
 const verifyUncachedDeletion =
@@ -51,7 +53,9 @@ const fixtures = {
 };
 assert.ok(Object.hasOwn(fixtures, fixtureKind), "Unknown device test fixture");
 const fixture = fixtures[fixtureKind];
-const fixtureUrl = fixture.url;
+const fixtureUrl = verifyExport
+  ? `https://example.test/export-device-${randomUUID()}`
+  : fixture.url;
 let userId;
 let accessToken;
 const devices = execFileSync("adb", ["devices"], { encoding: "utf8" });
@@ -192,6 +196,12 @@ try {
       threads: `https://www.threads.com/@source_fixture/post/${randomUUID()}`,
       naver_blog:
         `https://blog.naver.com/source_fixture/223000000000?case=${randomUUID()}`,
+      x: `https://x.com/source_fixture/status/1800000000000000000?case=${randomUUID()}`,
+      facebook: `https://www.facebook.com/source_fixture/posts/${randomUUID()}`,
+      bluesky:
+        `https://bsky.app/profile/source-fixture.invalid/post/${randomUUID()}`,
+      mastodon:
+        `https://mastodon.social/@source_fixture/111000000000000000?case=${randomUUID()}`,
       other: `https://source-fixture.invalid/${randomUUID()}`,
     };
     for (const [source, url] of Object.entries(sourceUrls)) {
@@ -217,7 +227,9 @@ try {
     "--console=plain",
     "-PlocalBackendTests=true",
     "-PisolatedDeviceTests=true",
-    "-Pandroid.testInstrumentationRunnerArguments.class=com.linkvault.app.LocalLibraryIntegrationTest",
+    `-Pandroid.testInstrumentationRunnerArguments.class=com.linkvault.app.${
+      verifyExport ? "ExportIntegrationTest" : "LocalLibraryIntegrationTest"
+    }`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureEmail=${fixtureEmail}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixturePassword=${fixturePassword}`,
     `-Pandroid.testInstrumentationRunnerArguments.fixtureUrl=${fixtureUrl}`,
@@ -364,8 +376,22 @@ try {
     token: accessToken,
   });
   assert.equal(items.status, 200);
-  if (verifySourceBrowsing) {
-    assert.equal(items.data.items.length, 4);
+  if (verifyExport) {
+    assert.equal(
+      items.data.items.length,
+      2,
+      "device export preserves its two server-saved fixtures",
+    );
+    const exported = await api("/functions/v1/library-api/v1/items/export", {
+      token: accessToken,
+    });
+    assert.equal(exported.status, 200);
+    assert.equal(exported.data.items.length, 2);
+    console.log(
+      "PASS account export -> real authenticated snapshot -> validated JSON -> private document-contract fixture file",
+    );
+  } else if (verifySourceBrowsing) {
+    assert.equal(items.data.items.length, 8);
     for (const [source, id] of Object.entries(sourceFixtureIds)) {
       const filtered = await api(
         `/functions/v1/library-api/v1/items?source=${source}`,
@@ -440,7 +466,9 @@ try {
     }
   }
   console.log(
-    "PASS device UI -> real Auth session -> Edge API -> PostgreSQL -> reload",
+    verifyExport
+      ? "System picker response is stubbed; authenticated transport and document I/O are real."
+      : "PASS device UI -> real Auth session -> Edge API -> PostgreSQL -> reload",
   );
   console.log(
     "Google Credential Manager/provider exchange remains a separate verification.",

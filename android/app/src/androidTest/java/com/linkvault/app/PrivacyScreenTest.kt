@@ -84,7 +84,12 @@ class PrivacyScreenTest {
         compose.onNodeWithText("30일 경과와 삭제 기록 내보내기 확인", substring = true).assertExists()
         compose.onNodeWithText("모든 사본의 삭제나 완료 시각을 보장하지 않습니다.", substring = true)
             .assertExists()
-        compose.onNodeWithText("순환 목표를 넘겨 보존됩니다.", substring = true).assertExists()
+        compose.onNodeWithText("복원 검증 증거가 있을 때 30일 이내·최근 7개로 순환", substring = true)
+            .assertExists()
+        compose.onNodeWithText("마지막 검증 복구본과 필요한 삭제 원장은 예외 보존", substring = true)
+            .assertExists()
+        compose.onNodeWithText("검증 증거가 없어 기존 서버 스냅샷을 자동 정리하지 않습니다.", substring = true)
+            .assertExists()
         compose.onNodeWithText("법적 적합성을 보증하지 않습니다.", substring = true).assertExists()
     }
 

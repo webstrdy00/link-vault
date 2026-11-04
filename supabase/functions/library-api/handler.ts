@@ -9,6 +9,7 @@ import {
   type PreparedItemUpdate,
   prepareItem,
   prepareItemUpdate,
+  SOURCE_VALUES,
 } from "./item-preparation.ts";
 import {
   type ClassificationCategory,
@@ -34,9 +35,11 @@ import {
   parseDeleteChallengeBody,
   type VerifiedAccountDeletionUser,
 } from "./account-deletion.ts";
+import { type ExportItemsCall } from "./library-export.ts";
 
 const MAX_BOOTSTRAP_BODY_BYTES = 8 * 1024;
 const MAX_ITEM_BODY_BYTES = 64 * 1024;
+const MAX_EXPORT_ERROR_BODY_BYTES = 64 * 1024;
 const MAX_DISCOVERY_BODY_BYTES = 8 * 1024;
 const MAX_ASSET_OCR_BODY_BYTES = 128 * 1024;
 const MAX_URL_CHARACTERS = 4096;
@@ -49,7 +52,7 @@ const MAX_CATEGORY_IDS = 5;
 const MAX_LIST_LIMIT = 50;
 const MAX_POSTGRES_INTEGER = 2_147_483_647;
 const RULES_VERSION = "rules-v2.0.0";
-const SOURCES = new Set(["instagram", "threads", "naver_blog", "other"]);
+const SOURCES = new Set<string>(SOURCE_VALUES);
 const CREATE_ITEM_COMMITTED_CONFLICTS = new Set([
   "ITEM_LIMIT_REACHED",
   "URL_HASH_COLLISION",
@@ -161,6 +164,7 @@ export interface MemberGateway extends AssetGateway {
   health?(): Promise<boolean>;
   verifyUser(accessToken: string): Promise<AuthVerification>;
   rpc(call: RpcCall): Promise<RpcResult>;
+  exportItems(call: ExportItemsCall): Promise<Response>;
   createItem(call: CreateItemCall): Promise<RpcResult>;
   lookupCategories(call: CategoryLookupCall): Promise<RpcResult>;
   updateItem(call: UpdateItemCall): Promise<RpcResult>;
@@ -177,6 +181,7 @@ type Route =
       | "accountDelete";
   }
   | { kind: "items" }
+  | { kind: "itemsExport" }
   | { kind: "itemDetail"; itemId: string }
   | { kind: "itemAssetReserve"; itemId: string }
   | { kind: "itemAsset"; itemId: string; assetId: string }
@@ -316,6 +321,14 @@ export function createHandler(
           authorization,
           functionName: "member_me",
           args: {},
+        }, requestId);
+      }
+
+      if (route.kind === "itemsExport") {
+        requireNoQuery(requestUrl);
+        return await exportItemsResponse(gateway, {
+          authorization,
+          signal: request.signal,
         }, requestId);
       }
 
@@ -935,6 +948,8 @@ function matchRoute(pathname: string): Route | null {
       return { kind: "accountDelete" };
     case `${API_PREFIX}/items`:
       return { kind: "items" };
+    case `${API_PREFIX}/items/export`:
+      return { kind: "itemsExport" };
     case `${API_PREFIX}/categories`:
       return { kind: "categories" };
   }
@@ -1028,6 +1043,7 @@ function methodsFor(route: Route): string[] {
   switch (route.kind) {
     case "health":
     case "me":
+    case "itemsExport":
     case "itemAssetContent":
       return ["GET"];
     case "itemDetail":
@@ -1781,6 +1797,113 @@ function requireValidRequestId(valid: boolean): void {
       "INVALID_REQUEST_ID",
       "X-Request-Id must be a UUID.",
     );
+  }
+}
+
+async function exportItemsResponse(
+  gateway: MemberGateway,
+  call: ExportItemsCall,
+  requestId: string,
+): Promise<Response> {
+  let upstream: Response;
+  try {
+    upstream = await gateway.exportItems(call);
+  } catch {
+    throw dependencyUnavailableError();
+  }
+  if (upstream.status === 401) {
+    await cancelExportBody(upstream);
+    throw unauthenticatedError();
+  }
+  if (upstream.status !== 200) {
+    const failure = await readExportFailure(upstream);
+    if (
+      upstream.status === 400 && failure?.code === "P0001" &&
+      (failure.message === "UNAUTHENTICATED" ||
+        failure.message === "BETA_ACCESS_REQUIRED" ||
+        failure.message === "ACCOUNT_DELETING")
+    ) {
+      throw mapRpcFailure(failure);
+    }
+    throw dependencyUnavailableError();
+  }
+  if (
+    upstream.body === null || upstream.bodyUsed || upstream.body.locked ||
+    !isExportJson(upstream)
+  ) {
+    await cancelExportBody(upstream);
+    throw dependencyUnavailableError();
+  }
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "content-disposition": 'attachment; filename="linkfilebox-export.json"',
+      "x-request-id": requestId,
+    },
+  });
+}
+
+function isExportJson(response: Response): boolean {
+  return response.headers.get("content-type")?.split(";", 1)[0].trim()
+    .toLowerCase() === "application/json";
+}
+
+async function cancelExportBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The stable API error takes precedence over upstream cleanup failures.
+  }
+}
+
+async function readExportFailure(
+  response: Response,
+): Promise<RpcFailure | null> {
+  if (
+    response.body === null || response.bodyUsed || response.body.locked ||
+    !isExportJson(response)
+  ) {
+    await cancelExportBody(response);
+    return null;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let text = "";
+  let complete = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        break;
+      }
+      bytes += value.byteLength;
+      if (bytes > MAX_EXPORT_ERROR_BODY_BYTES) {
+        return null;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    const failure: unknown = JSON.parse(text);
+    return isObject(failure) && typeof failure.code === "string" &&
+        typeof failure.message === "string"
+      ? { code: failure.code, message: failure.message }
+      : null;
+  } catch {
+    return null;
+  } finally {
+    if (!complete) {
+      try {
+        await reader.cancel();
+      } catch {
+        // An unreadable or oversized error is always dependency unavailable.
+      }
+    }
+    reader.releaseLock();
   }
 }
 

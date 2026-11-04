@@ -533,6 +533,15 @@ data class LibraryActiveAsset(
 )
 
 @Serializable
+data class LibraryThumbnailAsset(
+    val id: String,
+    @SerialName("mime_type") val mimeType: String,
+    @SerialName("byte_size") val byteSize: Long,
+    val width: Int,
+    val height: Int,
+)
+
+@Serializable
 data class LibraryItemSummary(
     val id: String,
     val version: Long? = null,
@@ -551,6 +560,7 @@ data class LibraryItemSummary(
     @SerialName("match_type") val matchType: String? = null,
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
+    @SerialName("thumbnail_asset") val thumbnailAsset: LibraryThumbnailAsset? = null,
 )
 
 @Serializable
@@ -590,6 +600,7 @@ data class LibraryItemDetail(
     @SerialName("extraction_meta")
     val extractionMeta: LibraryExtractionMeta = LibraryExtractionMeta(),
     @SerialName("active_asset") val activeAsset: LibraryActiveAsset? = null,
+    @SerialName("thumbnail_asset") val thumbnailAsset: LibraryThumbnailAsset? = null,
 )
 
 fun LibraryItemDetail.editableTitle(): String =

@@ -13,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -73,6 +74,7 @@ import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -89,9 +91,12 @@ import com.linkvault.app.attachment.AttachmentControls
 import com.linkvault.app.attachment.AttachmentRepository
 import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.discovery.DiscoverySource
+import com.linkvault.app.discovery.discoverySourceDisplayName
 import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxPolicy
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
+import com.linkvault.app.storage.SaveRecoveryAction
 import java.text.DateFormat
 import java.util.Date
 
@@ -114,6 +119,7 @@ fun LibraryScreen(
     incomingImageUri: Uri? = null,
     onIncomingImageConsumed: () -> Unit = {},
     onAdd: (() -> Unit)? = null,
+    onReturnToSharingApp: (() -> Unit)? = null,
 ) {
     val sessionState by client.sessionState.collectAsState()
     val ownerId = sessionState.ownerId
@@ -141,6 +147,17 @@ fun LibraryScreen(
         factory = factory,
     )
     val state by libraryViewModel.uiState.collectAsState()
+    val thumbnailLoader = rememberLibraryThumbnailLoader(client, state.items)
+    var shareSaveRequestIds by rememberSaveable(viewModelKey) { mutableStateOf(emptyList<String>()) }
+    var shareSaveAccepted by rememberSaveable(viewModelKey) { mutableStateOf(false) }
+    fun captureSaveStarted(requestId: String, previousRequestId: String?) {
+        if (onReturnToSharingApp != null &&
+            (previousRequestId == null || previousRequestId in shareSaveRequestIds)
+        ) {
+            shareSaveRequestIds = shareSaveRequestIds + requestId
+        }
+        onCaptureSaveStarted(requestId, previousRequestId)
+    }
     LibraryRecoveryEffect(
         libraryViewModel = libraryViewModel,
         authenticated = state.availability is LibraryAvailability.Ready,
@@ -166,7 +183,14 @@ fun LibraryScreen(
     LaunchedEffect(libraryViewModel, initialUrl, sharedText) {
         libraryViewModel.updateSharedInput(initialUrl, sharedText)
     }
-    LaunchedEffect(libraryViewModel, state.receiptsAwaitingAcknowledgement) {
+    LaunchedEffect(
+        libraryViewModel, state.saveStatus, state.receiptsAwaitingAcknowledgement, shareSaveRequestIds,
+    ) {
+        if ((state.saveStatus as? LibrarySaveStatus.Queued)?.requestId in shareSaveRequestIds ||
+            state.completedCaptureRequestIds.any { it in shareSaveRequestIds }
+        ) {
+            shareSaveAccepted = true
+        }
         state.completedCaptureRequestIds
             .intersect(state.receiptsAwaitingAcknowledgement)
             .forEach(onCaptureSaved)
@@ -246,13 +270,14 @@ fun LibraryScreen(
                 if (state.outboxEntries.isNotEmpty()) {
                     OutboxContent(
                         entries = state.outboxEntries,
+                        ownerId = ownerId,
                         edit = state.edit,
                         delete = state.delete,
                         onRetry = libraryViewModel::retryOperation,
                         onDiscard = libraryViewModel::discardOperation,
                         onReconfirmSave = { requestId ->
-                            libraryViewModel.reconfirmExpiredSave(requestId)
-                                ?.let { onCaptureSaveStarted(it, requestId) }
+                            libraryViewModel.reconfirmSave(requestId)
+                                ?.let { captureSaveStarted(it, requestId) }
                         },
                         onLoadLatest = libraryViewModel::loadLatestForEdit,
                         onLoadLatestDelete = libraryViewModel::loadLatestForDelete,
@@ -271,13 +296,18 @@ fun LibraryScreen(
                                     onTitleChange = libraryViewModel::updateTitle,
                                     onNoteChange = libraryViewModel::updateNote,
                                     onSave = {
-                                        libraryViewModel.save()?.let { onCaptureSaveStarted(it, null) }
+                                        libraryViewModel.save()?.let { captureSaveStarted(it, null) }
                                     },
                                     onRetrySave = libraryViewModel::retrySave,
                                     onEditAfterFailure = libraryViewModel::editAfterSaveFailure,
                                     onReconfirmSave = { requestId ->
-                                        libraryViewModel.reconfirmExpiredSave(requestId)
-                                            ?.let { onCaptureSaveStarted(it, requestId) }
+                                        libraryViewModel.reconfirmSave(requestId)
+                                            ?.let { captureSaveStarted(it, requestId) }
+                                    },
+                                    onReturnToSharingApp = onReturnToSharingApp?.takeIf {
+                                        shareSaveAccepted &&
+                                            (state.saveStatus is LibrarySaveStatus.Queued ||
+                                                state.saveStatus is LibrarySaveStatus.Saved)
                                     },
                                 )
                                 HorizontalDivider()
@@ -287,6 +317,7 @@ fun LibraryScreen(
                         }
                         LibraryListContent(
                             state = state,
+                            thumbnailLoader = thumbnailLoader,
                             onOpenDetail = libraryViewModel::openDetail,
                             onDelete = libraryViewModel::beginDeleteFromList,
                             onRetry = libraryViewModel::retryList,
@@ -630,6 +661,7 @@ internal fun SaveFormContent(
     onRetrySave: () -> Unit,
     onEditAfterFailure: () -> Unit,
     onReconfirmSave: (String) -> Unit,
+    onReturnToSharingApp: (() -> Unit)? = null,
 ) {
     val form = state.form
     val validationIssues = remember(form) { validateLibrarySaveForm(form) }
@@ -734,7 +766,7 @@ internal fun SaveFormContent(
             LibrarySaveStatus.Idle -> Unit
             LibrarySaveStatus.Saving -> LoadingMessage("저장하고 있어요.")
             is LibrarySaveStatus.Queued -> Text(
-                text = "오프라인에서도 안전하게 저장했어요. 연결되면 동기화합니다.",
+                text = "기기에 보관했어요. 서버 전송을 기다리고 있어요.",
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
             )
@@ -746,7 +778,7 @@ internal fun SaveFormContent(
                     saveStatus.needsReconfirmation && saveStatus.requestId != null -> {
                         Button(
                             onClick = { onReconfirmSave(saveStatus.requestId) },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().testTag("capture-save-reconfirm"),
                             shape = MaterialTheme.shapes.small,
                         ) {
                             Text("다시 확인하고 저장")
@@ -773,15 +805,30 @@ internal fun SaveFormContent(
 
             is LibrarySaveStatus.Saved -> {
                 val resultMessage = if (saveStatus.result.duplicate) {
-                    "이미 저장된 링크예요."
+                    "이미 서버에 저장된 링크예요."
                 } else {
-                    "저장했어요."
+                    "서버에 저장했어요."
                 }
                 Text(
                     text = resultMessage,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold,
                 )
+                val item = state.items.firstOrNull { it.id == saveStatus.result.item.id }
+                    ?: saveStatus.result.item
+                val metadataMessage = when (item.metadataState) {
+                    "queued", "running" -> "게시물 정보를 확인하고 있어요."
+                    "partial" -> "미리보기 정보를 일부만 가져왔어요."
+                    "failed", "unsupported" -> "미리보기 정보를 가져오지 못했지만 링크는 보관돼요."
+                    else -> null
+                }
+                metadataMessage?.let { message ->
+                    Text(
+                        text = message,
+                        modifier = Modifier.testTag("capture-metadata-status"),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
 
@@ -798,12 +845,21 @@ internal fun SaveFormContent(
                 Text("저장")
             }
         }
+        if (onReturnToSharingApp != null) {
+            TextButton(
+                onClick = onReturnToSharingApp,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("공유한 앱으로 돌아가기")
+            }
+        }
     }
 }
 
 @Composable
 private fun OutboxContent(
     entries: List<OutboxEntry>,
+    ownerId: String?,
     edit: LibraryEditUiState?,
     delete: LibraryDeleteUiState?,
     onRetry: (String) -> Unit,
@@ -819,6 +875,7 @@ private fun OutboxContent(
             fontWeight = FontWeight.Bold,
         )
         entries.forEach { entry ->
+            val saveRecovery = OutboxPolicy.saveRecoveryAction(entry, ownerId)
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
@@ -855,14 +912,32 @@ private fun OutboxContent(
                             Text(message, color = MaterialTheme.colorScheme.error)
                         }
                     }
+                    if (saveRecovery == SaveRecoveryAction.EDIT_OR_REMOVE) {
+                        Text(
+                            text = "대기 요청을 제거한 뒤 입력 내용을 확인하고 수정해 주세요.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     when (entry.state) {
                         OutboxState.FAILED -> {
-                            Button(
-                                onClick = { onRetry(entry.requestId) },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = MaterialTheme.shapes.small,
-                            ) {
-                                Text("다시 시도")
+                            when {
+                                saveRecovery == SaveRecoveryAction.RECONFIRM -> Button(
+                                    onClick = { onReconfirmSave(entry.requestId) },
+                                    modifier = Modifier.fillMaxWidth()
+                                        .testTag("outbox-save-reconfirm-${entry.requestId}"),
+                                    shape = MaterialTheme.shapes.small,
+                                ) {
+                                    Text("다시 확인하고 저장")
+                                }
+
+                                saveRecovery == SaveRecoveryAction.RETRY_SAME_REQUEST ||
+                                    entry.method != "POST" || entry.path != "/items" -> Button(
+                                    onClick = { onRetry(entry.requestId) },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = MaterialTheme.shapes.small,
+                                ) {
+                                    Text("다시 시도")
+                                }
                             }
                             OutlinedButton(
                                 onClick = { onDiscard(entry.requestId) },
@@ -907,10 +982,11 @@ private fun OutboxContent(
                         }
 
                         OutboxState.EXPIRED -> {
-                            if (entry.method == "POST") {
+                            if (saveRecovery == SaveRecoveryAction.RECONFIRM) {
                                 Button(
                                     onClick = { onReconfirmSave(entry.requestId) },
-                                    modifier = Modifier.fillMaxWidth(),
+                                    modifier = Modifier.fillMaxWidth()
+                                        .testTag("outbox-save-reconfirm-${entry.requestId}"),
                                     shape = MaterialTheme.shapes.small,
                                 ) {
                                     Text("다시 확인하고 저장")
@@ -974,6 +1050,7 @@ internal fun LibraryListContent(
     onRetry: () -> Unit,
     onLoadMore: () -> Unit,
     onAdd: (() -> Unit)?,
+    thumbnailLoader: LibraryThumbnailLoader? = null,
 ) {
     Column {
         if (state.isShowingCache) {
@@ -1014,6 +1091,7 @@ internal fun LibraryListContent(
                         onOpenDetail = onOpenDetail,
                         onDelete = onDelete,
                         deleteEnabled = state.delete == null && (item.version ?: 0L) > 0L,
+                        thumbnailLoader = thumbnailLoader,
                     )
                 }
             }
@@ -1059,10 +1137,9 @@ internal fun LibraryItemCard(
     onOpenDetail: (String) -> Unit,
     onDelete: ((String) -> Unit)? = null,
     deleteEnabled: Boolean = true,
+    thumbnailLoader: LibraryThumbnailLoader? = null,
 ) {
-    val source = item.source?.takeUnless(String::isBlank)?.let { value ->
-        DiscoverySource.entries.firstOrNull { it.apiValue == value }?.displayName ?: value
-    }
+    val source = discoverySourceDisplayName(item.source)
     val date = formatLibrarySavedDate(item.createdAt)?.let { "저장 · $it" }
     val categoryNames = item.categoryRefs.mapNotNull { it.name?.takeUnless(String::isBlank) }
     Column {
@@ -1075,32 +1152,30 @@ internal fun LibraryItemCard(
                 .padding(vertical = 18.dp),
         ) {
             if (source != null || date != null) {
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Row(
-                        modifier = Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.spacedBy(7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        source?.let { value ->
+                    source?.let { value ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
                             LibrarySourceBadge(source = value, itemId = item.id)
                             Text(
                                 text = value,
-                                modifier = Modifier.testTag("library-source-label-${item.id}"),
+                                modifier = Modifier.weight(1f).testTag("library-source-label-${item.id}"),
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp,
                                 lineHeight = 16.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
                             )
                         }
                     }
                     date?.let { value ->
                         Text(
                             text = value,
+                            modifier = Modifier.fillMaxWidth(),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 11.sp,
                             lineHeight = 16.sp,
@@ -1108,46 +1183,51 @@ internal fun LibraryItemCard(
                     }
                 }
             }
-            Text(
-                text = compactLibraryTitle(item.displayTitle, item.url),
+            LibraryThumbnailContent(
+                item = item,
+                loader = thumbnailLoader,
                 modifier = Modifier.padding(top = if (source != null || date != null) 8.dp else 0.dp),
-                fontSize = 17.sp,
-                lineHeight = 24.sp,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            item.cardPreview()?.let { note ->
+            ) {
                 Text(
-                    text = note,
-                    modifier = Modifier.padding(top = 4.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 13.sp,
-                    lineHeight = 20.sp,
+                    text = compactLibraryTitle(item.displayTitle, item.url),
+                    fontSize = 17.sp,
+                    lineHeight = 24.sp,
+                    fontWeight = FontWeight.SemiBold,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+                item.cardPreview()?.let { note ->
+                    Text(
+                        text = note,
+                        modifier = Modifier.padding(top = 4.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 13.sp,
+                        lineHeight = 20.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
             if (categoryNames.isNotEmpty() || item.hasAttachment == true) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Text(
-                        text = categoryNames.joinToString(" · "),
-                        modifier = Modifier.weight(1f),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 11.sp,
-                        lineHeight = 15.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    if (categoryNames.isNotEmpty()) {
+                        Text(
+                            text = categoryNames.joinToString(" · "),
+                            modifier = Modifier.fillMaxWidth(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                        )
+                    }
                     if (item.hasAttachment == true) {
                         Text(
                             text = "첨부 있음",
+                            modifier = Modifier.fillMaxWidth(),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 11.sp,
                             lineHeight = 15.sp,
@@ -1155,6 +1235,7 @@ internal fun LibraryItemCard(
                     }
                 }
             }
+            LibraryCollectionStateLabel(item)
         }
             if (onDelete != null) {
                 IconButton(
@@ -1175,22 +1256,77 @@ internal fun LibraryItemCard(
 }
 
 @Composable
+internal fun LibraryThumbnailContent(
+    item: LibraryItemSummary,
+    loader: LibraryThumbnailLoader?,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    if (loader == null || item.thumbnailAsset == null) {
+        Column(modifier = modifier) { content() }
+        return
+    }
+    val fontScale = LocalDensity.current.fontScale
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+        // Keep a useful text width instead of squeezing large type beside the image.
+        if (maxWidth >= 72.dp + 12.dp + 144.dp * fontScale) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                LibraryThumbnail(item, loader)
+                Column(modifier = Modifier.weight(1f)) { content() }
+            }
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                LibraryThumbnail(item, loader)
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+internal fun LibraryCollectionStateLabel(item: LibraryItemSummary) {
+    val label = when (item.metadataState) {
+        "queued", "running" -> "게시물 정보 확인 중"
+        "partial" -> "게시물 정보 일부"
+        "failed", "unsupported" -> "게시물 정보 없음"
+        else -> return
+    }
+    Text(
+        text = label,
+        modifier = Modifier.fillMaxWidth().testTag("library-collection-state-${item.id}"),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontSize = 11.sp,
+        lineHeight = 16.sp,
+    )
+}
+
+@Composable
 private fun LibrarySourceBadge(source: String, itemId: String) {
     val colors = MaterialTheme.colorScheme
     val background = when (source) {
         DiscoverySource.INSTAGRAM.displayName -> Color.Transparent
-        DiscoverySource.THREADS.displayName -> Color.Black
+        DiscoverySource.THREADS.displayName,
+        DiscoverySource.X.displayName -> Color.Black
         DiscoverySource.NAVER_BLOG.displayName -> Color(0xFF03C75A)
+        DiscoverySource.FACEBOOK.displayName -> Color(0xFF0866FF)
+        DiscoverySource.BLUESKY.displayName -> Color(0xFF0085FF)
+        DiscoverySource.MASTODON.displayName -> Color(0xFF6364FF)
         else -> colors.surfaceContainerLow
     }
     val foreground = when (source) {
         DiscoverySource.INSTAGRAM.displayName,
-        DiscoverySource.THREADS.displayName -> Color.White
-        DiscoverySource.NAVER_BLOG.displayName -> Color.Black
+        DiscoverySource.THREADS.displayName,
+        DiscoverySource.X.displayName,
+        DiscoverySource.FACEBOOK.displayName,
+        DiscoverySource.MASTODON.displayName -> Color.White
+        DiscoverySource.NAVER_BLOG.displayName,
+        DiscoverySource.BLUESKY.displayName -> Color.Black
         else -> colors.onSurfaceVariant
     }
     Surface(
-        modifier = Modifier.size(22.dp).testTag("library-source-badge-$itemId"),
+        modifier = Modifier
+            .size(22.dp * LocalDensity.current.fontScale.coerceAtLeast(1f))
+            .testTag("library-source-badge-$itemId"),
         shape = MaterialTheme.shapes.small,
         color = background,
         contentColor = foreground,
@@ -1200,6 +1336,10 @@ private fun LibrarySourceBadge(source: String, itemId: String) {
                 DiscoverySource.INSTAGRAM.displayName,
                 DiscoverySource.THREADS.displayName,
                 DiscoverySource.NAVER_BLOG.displayName,
+                DiscoverySource.X.displayName,
+                DiscoverySource.FACEBOOK.displayName,
+                DiscoverySource.BLUESKY.displayName,
+                DiscoverySource.MASTODON.displayName,
                 -> foreground.copy(alpha = 0.35f)
                 else -> colors.outlineVariant
             },
@@ -1286,9 +1426,13 @@ private fun EmptyLibraryContent(
 
 private fun sourceMonogram(source: String): String {
     when (source) {
-        "네이버 블로그" -> return "N"
-        "Threads" -> return "Th"
-        "Instagram" -> return "Ig"
+        DiscoverySource.NAVER_BLOG.displayName -> return "N"
+        DiscoverySource.THREADS.displayName -> return "Th"
+        DiscoverySource.INSTAGRAM.displayName -> return "Ig"
+        DiscoverySource.X.displayName -> return "X"
+        DiscoverySource.FACEBOOK.displayName -> return "f"
+        DiscoverySource.BLUESKY.displayName -> return "B"
+        DiscoverySource.MASTODON.displayName -> return "M"
     }
     val trimmed = source.trim()
     if (trimmed.isEmpty()) return ""
@@ -1528,7 +1672,7 @@ internal fun DetailContent(
             DetailBackButton(onBackToList)
         }
         val sourceAndDate = listOfNotNull(
-            item.source?.takeUnless(String::isBlank),
+            discoverySourceDisplayName(item.source),
             formatLibrarySavedDate(item.createdAt)?.let { "저장 · $it" },
         )
         if (sourceAndDate.isNotEmpty()) {
@@ -1731,7 +1875,7 @@ private fun EditContent(
                 }
 
                 is LibraryEditStatus.Queued -> Text(
-                    text = "변경 사항을 저장했어요. 연결되면 동기화합니다.",
+                    text = "변경 사항을 기기에 보관했어요. 서버 반영을 기다리고 있어요.",
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold,
                 )

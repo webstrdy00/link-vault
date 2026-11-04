@@ -141,4 +141,146 @@ class EnrichmentOutboxTest {
             }.isFailure,
         )
     }
+
+    @Test
+    fun quotaRejectedSaveRequiresReconfirmationInsteadOfSameRequestRetry() {
+        val rejected = entry("POST", "/items").copy(
+            state = OutboxState.FAILED,
+            errorCode = "ITEM_LIMIT_REACHED",
+        )
+        assertEquals(SaveRecoveryAction.RECONFIRM, OutboxPolicy.saveRecoveryAction(rejected, owner))
+        assertEquals(
+            SaveRecoveryAction.EDIT_OR_REMOVE,
+            OutboxPolicy.saveRecoveryAction(rejected.copy(state = OutboxState.RETRY), owner),
+        )
+    }
+
+    @Test
+    fun ambiguousSaveFailuresKeepSameRequestRecovery() {
+        for (state in listOf(OutboxState.FAILED, OutboxState.RETRY)) {
+            for (code in listOf(null, "NETWORK_ERROR", "DEPENDENCY_UNAVAILABLE", "RATE_LIMITED")) {
+                val ambiguous = entry("POST", "/items").copy(state = state, errorCode = code)
+                assertEquals(
+                    SaveRecoveryAction.RETRY_SAME_REQUEST,
+                    OutboxPolicy.saveRecoveryAction(ambiguous, owner),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun committedSaveFailuresRequireEditingOrRemoval() {
+        for (code in listOf(
+            "URL_HASH_COLLISION", "IDEMPOTENCY_MISMATCH", "VERSION_CONFLICT",
+            "INVALID_BODY", "INVALID_REQUEST_BODY", "ITEM_DELETED", "ITEM_NOT_FOUND",
+            "ACCOUNT_DELETING", "BETA_ACCESS_REQUIRED", "STORAGE_LIMIT_REACHED",
+        )) {
+            for (state in listOf(OutboxState.FAILED, OutboxState.RETRY, OutboxState.CONFLICT)) {
+                assertEquals(
+                    SaveRecoveryAction.EDIT_OR_REMOVE,
+                    OutboxPolicy.saveRecoveryAction(
+                        entry("POST", "/items").copy(state = state, errorCode = code),
+                        owner,
+                    ),
+                )
+            }
+        }
+        for (code in listOf(null, "NETWORK_ERROR", "ITEM_LIMIT_REACHED")) {
+            assertEquals(
+                SaveRecoveryAction.EDIT_OR_REMOVE,
+                OutboxPolicy.saveRecoveryAction(
+                    entry("POST", "/items").copy(state = OutboxState.CONFLICT, errorCode = code),
+                    owner,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun saveRecoveryRequiresExactPostItemsRoute() {
+        for ((method, path) in listOf(
+            "GET" to "/items", "PATCH" to "/items", "post" to "/items",
+            "POST" to "/items/", "POST" to "/items?retry=1", "POST" to "/items#save",
+            "POST" to "/items/$item/retry-metadata", "POST" to "/categories",
+        )) {
+            for (state in listOf(OutboxState.FAILED, OutboxState.RETRY, OutboxState.EXPIRED)) {
+                assertEquals(
+                    null,
+                    OutboxPolicy.saveRecoveryAction(
+                        entry(method, path).copy(state = state, errorCode = "ITEM_LIMIT_REACHED"),
+                        owner,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun saveRecoveryRequiresSameNonblankOwner() {
+        for (otherOwner in listOf(null, "", " ", item)) {
+            for (state in listOf(OutboxState.FAILED, OutboxState.RETRY, OutboxState.EXPIRED)) {
+                assertEquals(
+                    null,
+                    OutboxPolicy.saveRecoveryAction(
+                        entry("POST", "/items").copy(state = state, errorCode = "ITEM_LIMIT_REACHED"),
+                        otherOwner,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun expiredSaveRequiresReconfirmationUnlessItsIdentityConflicted() {
+        for (code in listOf(null, "REQUEST_EXPIRED", "NETWORK_ERROR", "ITEM_LIMIT_REACHED")) {
+            assertEquals(
+                SaveRecoveryAction.RECONFIRM,
+                OutboxPolicy.saveRecoveryAction(
+                    entry("POST", "/items").copy(state = OutboxState.EXPIRED, errorCode = code),
+                    owner,
+                ),
+            )
+        }
+        for (code in listOf("URL_HASH_COLLISION", "IDEMPOTENCY_MISMATCH")) {
+            assertEquals(
+                SaveRecoveryAction.EDIT_OR_REMOVE,
+                OutboxPolicy.saveRecoveryAction(
+                    entry("POST", "/items").copy(state = OutboxState.EXPIRED, errorCode = code),
+                    owner,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun activeAndSavedRequestsDoNotOfferTerminalSaveRecovery() {
+        for (state in listOf(
+            OutboxState.PENDING, OutboxState.RUNNING, OutboxState.WAITING_LOGIN, OutboxState.SAVED,
+        )) {
+            for (code in listOf(null, "ITEM_LIMIT_REACHED", "URL_HASH_COLLISION")) {
+                assertEquals(
+                    null,
+                    OutboxPolicy.saveRecoveryAction(
+                        entry("POST", "/items").copy(state = state, errorCode = code),
+                        owner,
+                    ),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun urlHashCollisionRemainsTerminalEvenWhenMarkedRetryable() {
+        assertEquals(
+            FailureAction.Fail,
+            OutboxPolicy.classifyFailure(
+                now = 1,
+                expiresAt = 100_000,
+                attemptCount = 1,
+                retryable = true,
+                errorCode = "URL_HASH_COLLISION",
+                retryAfterSeconds = 1,
+            ),
+        )
+    }
 }

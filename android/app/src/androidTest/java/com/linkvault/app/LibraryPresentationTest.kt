@@ -17,12 +17,15 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -34,12 +37,19 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsNotDisplayed
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.captureToImage
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -47,6 +57,9 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.printToString
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.test.platform.app.InstrumentationRegistry
@@ -55,7 +68,13 @@ import com.linkvault.app.attachment.AttachmentCommandKind
 import com.linkvault.app.attachment.AttachmentCommandReview
 import com.linkvault.app.attachment.AttachmentLocalStage
 import com.linkvault.app.attachment.AttachmentUiState
+import com.linkvault.app.auth.AccountSessionState
+import com.linkvault.app.discovery.DiscoveryAvailability
+import com.linkvault.app.discovery.DiscoveryFilterInput
 import com.linkvault.app.discovery.DiscoverySource
+import com.linkvault.app.discovery.DiscoveryUiState
+import com.linkvault.app.discovery.SearchFilterSheet
+import com.linkvault.app.discovery.SearchResultCard
 import com.linkvault.app.library.DetailContent
 import com.linkvault.app.library.LibraryActiveAsset
 import com.linkvault.app.library.LibraryCategoryRef
@@ -67,12 +86,19 @@ import com.linkvault.app.library.LibraryItemCard
 import com.linkvault.app.library.LibraryItemDetail
 import com.linkvault.app.library.LibraryItemSummary
 import com.linkvault.app.library.LibraryRootHeader
+import com.linkvault.app.library.LibraryThumbnailAsset
+import com.linkvault.app.library.LibraryThumbnailLoader
+import com.linkvault.app.library.SourceFilterShortcuts
 import com.linkvault.app.library.formatLibrarySavedDate
 import com.linkvault.app.storage.OutboxEntry
 import com.linkvault.app.storage.OutboxState
 import com.linkvault.app.ui.VaultTheme
+import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.math.abs
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.job
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -82,6 +108,244 @@ import org.junit.Test
 class LibraryPresentationTest {
     @get:Rule
     val compose = createComposeRule()
+
+    @Test
+    fun libraryThumbnailAndTextOpenDetailWithoutTriggeringSeparateDelete() {
+        val bytes = thumbnailBytes()
+        val item = thumbnailItem("library-image", bytes).copy(metadataState = "failed")
+        val opened = mutableListOf<String>()
+        val deleted = mutableListOf<String>()
+        val loader = thumbnailLoader(listOf(item)) { _, _, _ -> bytes.copyOf() }
+        try {
+            compose.setContent {
+                VaultTheme {
+                    Surface(Modifier.width(320.dp).verticalScroll(rememberScrollState())) {
+                        LibraryItemCard(
+                            item,
+                            onOpenDetail = { opened += it },
+                            onDelete = { deleted += it },
+                            thumbnailLoader = loader,
+                        )
+                    }
+                }
+            }
+            awaitThumbnail(item.id)
+            assertCardTextFits(item, search = false)
+            compose.onNodeWithTag("library-collection-state-${item.id}", useUnmergedTree = true)
+                .assertTextEquals("게시물 정보 없음")
+            compose.onNodeWithText(item.contentExcerpt!!).assertDoesNotExist()
+            val image = compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+            val imageBounds = image.getUnclippedBoundsInRoot()
+            val titleBounds = cardText(item, search = false, item.displayTitle!!).getUnclippedBoundsInRoot()
+            assertEquals(72f, (imageBounds.right - imageBounds.left).value, 0.001f)
+            assertEquals(72f, (imageBounds.bottom - imageBounds.top).value, 0.001f)
+            assertTrue(titleBounds.left >= imageBounds.right)
+            image.performTouchInput { click(center) }
+            compose.runOnIdle {
+                assertEquals(listOf(item.id), opened)
+                assertTrue(deleted.isEmpty())
+            }
+            compose.onNodeWithTag("detail-${item.id}").performClick()
+            compose.onNodeWithTag("list-delete-${item.id}").performClick()
+            compose.runOnIdle {
+                assertEquals(listOf(item.id, item.id), opened)
+                assertEquals(listOf(item.id), deleted)
+            }
+            captureDetail("thumbnail-card.png")
+        } finally {
+            loader.close()
+        }
+    }
+
+    @Test
+    fun searchThumbnailAndTextOpenDetailAndPreserveMemoPreviewPriority() {
+        val bytes = thumbnailBytes()
+        var item by mutableStateOf(thumbnailItem("search-image", bytes))
+        var opened = 0
+        var aliasOpened = 0
+        val loader = thumbnailLoader(listOf(item)) { _, _, _ -> bytes.copyOf() }
+        try {
+            compose.setContent {
+                val currentItems = listOf(item)
+                SideEffect { loader.updateItems(currentItems) }
+                VaultTheme {
+                    Surface(Modifier.width(320.dp).verticalScroll(rememberScrollState())) {
+                        SearchResultCard(
+                            currentItems.single(),
+                            onOpen = { opened++ },
+                            onOpenAliasDisclosure = { aliasOpened++ },
+                            thumbnailLoader = loader,
+                        )
+                    }
+                }
+            }
+            awaitThumbnail(item.id)
+            assertCardTextFits(item, search = true)
+            compose.onNodeWithText(item.contentExcerpt!!).assertDoesNotExist()
+            compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+                .performTouchInput { click(center) }
+            compose.onNodeWithTag("search-item-${item.id}").performClick()
+            compose.runOnIdle {
+                assertEquals(2, opened)
+                assertEquals(0, aliasOpened)
+            }
+            captureDetail("thumbnail-search-card.png")
+            compose.runOnIdle { item = item.copy(noteExcerpt = " \n") }
+            compose.onNodeWithTag("search-item-preview-${item.id}", useUnmergedTree = true)
+                .assertTextEquals(item.contentExcerpt!!)
+        } finally {
+            loader.close()
+        }
+    }
+
+    @Test
+    fun libraryThumbnailAtNarrowWidthAndLargeFontKeepsMetadataReadable() {
+        assertNarrowThumbnailCard(search = false)
+    }
+
+    @Test
+    fun searchThumbnailAtNarrowWidthAndLargeFontKeepsMetadataReadable() {
+        assertNarrowThumbnailCard(search = true)
+    }
+
+    @Test
+    fun missingAndFailedThumbnailsKeepBothCardsTextAndDetailTargetsUsable() {
+        val bytes = thumbnailBytes()
+        var libraryItem by mutableStateOf(thumbnailItem("library-failure", bytes))
+        var searchItem by mutableStateOf(thumbnailItem("search-failure", bytes))
+        var opened = 0
+        var deleted = 0
+        val trace = ThumbnailRequestTrace()
+        val loader = thumbnailLoader(listOf(libraryItem, searchItem)) { _, itemId, assetId ->
+            trace.record("request item=$itemId asset=$assetId")
+            currentCoroutineContext().job.invokeOnCompletion { error ->
+                trace.record("completion item=$itemId asset=$assetId error=${error?.javaClass?.simpleName}:${error?.message}")
+            }
+            val downloaded = if (assetId == "broken") ByteArray(bytes.size) { 42 } else bytes.copyOf()
+            trace.record("return item=$itemId asset=$assetId bytes=${downloaded.size}")
+            downloaded
+        }
+        try {
+            compose.setContent {
+                // Observe the complete snapshot beside its SideEffect, just as the screen loader helper does.
+                val currentItems = listOf(libraryItem, searchItem)
+                SideEffect {
+                    loader.updateItems(currentItems)
+                    trace.record(
+                        "snapshot revision=${loader.revision.value} " +
+                            currentItems.joinToString { "${it.id}:${it.thumbnailAsset?.id}:current=${loader.isCurrent(it)}" },
+                    )
+                }
+                VaultTheme {
+                    Surface {
+                        Column(Modifier.width(260.dp).verticalScroll(rememberScrollState())) {
+                            LibraryItemCard(
+                                currentItems[0],
+                                onOpenDetail = { opened++ },
+                                onDelete = { deleted++ },
+                                thumbnailLoader = loader,
+                            )
+                            SearchResultCard(
+                                currentItems[1],
+                                onOpen = { opened++ },
+                                onOpenAliasDisclosure = {},
+                                thumbnailLoader = loader,
+                            )
+                        }
+                    }
+                }
+            }
+            awaitThumbnail(libraryItem.id)
+            awaitThumbnail(searchItem.id)
+            compose.runOnIdle {
+                libraryItem = libraryItem.copy(thumbnailAsset = libraryItem.thumbnailAsset!!.copy(id = "broken"))
+                searchItem = searchItem.copy(thumbnailAsset = searchItem.thumbnailAsset!!.copy(id = "broken"))
+            }
+            compose.runOnIdle {
+                assertTrue("the screen snapshot tracks the replacement library descriptor", loader.isCurrent(libraryItem))
+                assertTrue("the screen snapshot tracks the replacement search descriptor", loader.isCurrent(searchItem))
+            }
+            listOf(libraryItem, searchItem).forEach { item ->
+                awaitFailedThumbnail(item, loader, trace) { listOf(libraryItem, searchItem) }
+                compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+                    .assertDoesNotExist()
+                compose.onNodeWithTag("library-thumbnail-error-${item.id}", useUnmergedTree = true)
+                    .performScrollTo().assertTextEquals("이미지 미리보기 실패")
+            }
+            assertCardTextFits(libraryItem, search = false)
+            assertCardTextFits(searchItem, search = true)
+            compose.onNodeWithTag("detail-${libraryItem.id}").performScrollTo().performClick()
+            compose.onNodeWithTag("search-item-${searchItem.id}").performScrollTo().performClick()
+            compose.runOnIdle {
+                assertEquals(2, opened)
+                assertEquals(0, deleted)
+                libraryItem = libraryItem.copy(thumbnailAsset = null)
+                searchItem = searchItem.copy(thumbnailAsset = null)
+            }
+            listOf(libraryItem to false, searchItem to true).forEach { (item, search) ->
+                compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+                    .assertDoesNotExist()
+                compose.onNodeWithTag("library-thumbnail-error-${item.id}", useUnmergedTree = true)
+                    .assertDoesNotExist()
+                assertCardTextFits(item, search)
+                val card = compose.onNodeWithTag(cardTag(item, search)).getUnclippedBoundsInRoot()
+                val title = cardText(item, search, item.displayTitle!!).getUnclippedBoundsInRoot()
+                assertEquals(card.left, title.left)
+                compose.onNodeWithTag(cardTag(item, search)).performScrollTo().performClick()
+            }
+            compose.runOnIdle {
+                assertEquals(4, opened)
+                assertEquals(0, deleted)
+            }
+        } finally {
+            loader.close()
+        }
+    }
+
+    @Test
+    fun collectionLabelsFollowExtractionStateRatherThanAttachmentOrOcrSuccess() {
+        var state by mutableStateOf<String?>("queued")
+        var attached by mutableStateOf(false)
+        compose.setContent {
+            VaultTheme {
+                Column(Modifier.width(260.dp).verticalScroll(rememberScrollState())) {
+                    val item = LibraryItemSummary(
+                        id = "collection-library",
+                        url = "https://example.com/collection",
+                        displayTitle = "수집 상태",
+                        metadataState = state,
+                        hasAttachment = attached,
+                        ocrState = if (attached) "ready" else "failed",
+                    )
+                    LibraryItemCard(item, onOpenDetail = {})
+                    SearchResultCard(item.copy(id = "collection-search"), onOpen = {}, onOpenAliasDisclosure = {})
+                }
+            }
+        }
+        listOf(
+            "queued" to "게시물 정보 확인 중",
+            "running" to "게시물 정보 확인 중",
+            "partial" to "게시물 정보 일부",
+            "failed" to "게시물 정보 없음",
+            "unsupported" to "게시물 정보 없음",
+            "ready" to null,
+            null to null,
+        ).forEach { (metadataState, label) ->
+            listOf(false, true).forEach { hasAttachment ->
+                compose.runOnIdle { state = metadataState; attached = hasAttachment }
+                listOf("collection-library", "collection-search").forEach { id ->
+                    val node = compose.onNodeWithTag("library-collection-state-$id", useUnmergedTree = true)
+                    if (label == null) node.assertDoesNotExist() else node.performScrollTo().assertTextEquals(label)
+                    compose.onNodeWithTag("library-thumbnail-$id", useUnmergedTree = true).assertDoesNotExist()
+                }
+                if (hasAttachment) {
+                    compose.onNodeWithText("첨부 있음", useUnmergedTree = true).performScrollTo().assertIsDisplayed()
+                } else {
+                    compose.onNodeWithText("첨부 있음").assertDoesNotExist()
+                }
+            }
+        }
+    }
 
     @Test
     fun listPreviewUpdatesFromCollectedContentToMemoAndUsesSavedDate() {
@@ -221,6 +485,110 @@ class LibraryPresentationTest {
     }
 
     @Test
+    fun everySourceShortcutAndAllSourceResetRemainReachableAtNarrowWidthAndLargeFont() {
+        val browsedSources = mutableListOf<DiscoverySource>()
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 1.8f)) {
+                VaultTheme {
+                    Surface(Modifier.width(220.dp)) {
+                        SourceFilterShortcuts(onBrowseSource = { browsedSources += it })
+                    }
+                }
+            }
+        }
+
+        val visited = DiscoverySource.entries + DiscoverySource.ALL
+        visited.forEachIndexed { index, source ->
+            val chip = compose.onNodeWithTag("library-source-${source.apiValue ?: "all"}")
+                .performScrollTo().assertIsDisplayed().assertHasClickAction()
+                .assertTextEquals(source.displayName)
+            val viewport = compose.onNodeWithTag("library-source-shortcuts").getUnclippedBoundsInRoot()
+            val bounds = chip.getUnclippedBoundsInRoot()
+            assertTrue(bounds.left >= viewport.left - 1.dp && bounds.right <= viewport.right + 1.dp)
+            assertTrue(bounds.bottom - bounds.top >= 48.dp)
+            compose.onNodeWithText(source.displayName, useUnmergedTree = true)
+                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                    val layouts = mutableListOf<TextLayoutResult>()
+                    assertTrue(action(layouts))
+                    assertNoTextOverflow("library-source-${source.apiValue ?: "all"}/label", layouts.single())
+                }
+            chip.performClick()
+            compose.runOnIdle { assertEquals(visited.take(index + 1), browsedSources) }
+        }
+    }
+
+    @Test
+    fun searchFilterSourceChoicesPreserveConjunctionAndAllowAllSourceAndFullFilterReset() {
+        val original = DiscoveryFilterInput(
+            query = "saved post",
+            unclassified = true,
+            source = DiscoverySource.X,
+            dateFrom = "2026-11-01",
+            dateTo = "2026-11-02",
+            aliases = false,
+            needsCues = true,
+        )
+        var filters by mutableStateOf(original)
+        val selectedSources = mutableListOf<DiscoverySource>()
+        var resetCalls = 0
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 1.8f)) {
+                VaultTheme {
+                    SearchFilterSheet(
+                        state = DiscoveryUiState(
+                            availability = DiscoveryAvailability.Ready,
+                            displayZoneId = "UTC",
+                            filters = filters,
+                        ),
+                        onDismiss = {},
+                        onSubmit = {},
+                        onCategorySelected = {},
+                        onUnclassifiedChange = {},
+                        onSourceSelected = { source ->
+                            selectedSources += source
+                            filters = filters.copy(source = source)
+                        },
+                        onDateFromChange = {},
+                        onDateToChange = {},
+                        onAliasesChange = {},
+                        onNeedsCuesChange = {},
+                        onClearFilters = {
+                            resetCalls++
+                            filters = DiscoveryFilterInput(query = filters.query)
+                        },
+                    )
+                }
+            }
+        }
+
+        val visited = DiscoverySource.entries + DiscoverySource.ALL
+        visited.forEachIndexed { index, source ->
+            compose.onNodeWithText(source.displayName)
+                .performScrollTo().assertIsDisplayed().assertHasClickAction().performClick()
+                .assertIsSelected()
+            compose.onNodeWithText(source.displayName, useUnmergedTree = true)
+                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                    val layouts = mutableListOf<TextLayoutResult>()
+                    assertTrue(action(layouts))
+                    assertNoTextOverflow("search-source-${source.apiValue ?: "all"}/label", layouts.single())
+                }
+            compose.runOnIdle {
+                assertEquals(visited.take(index + 1), selectedSources)
+                assertEquals(original.copy(source = source), filters)
+            }
+            compose.onNodeWithTag("search-filter-apply").assertIsDisplayed()
+        }
+        compose.onNodeWithText("필터 지우기").assertIsDisplayed().performClick()
+        compose.runOnIdle {
+            assertEquals(1, resetCalls)
+            assertEquals(DiscoveryFilterInput(query = original.query), filters)
+        }
+        compose.onNodeWithText("전체").performScrollTo().assertIsSelected()
+    }
+
+    @Test
     fun sourceBadgesKeepNamesMonogramsAndTravelCategorySeparateInLightTheme() {
         assertSourceBadgePresentation(darkTheme = false)
     }
@@ -228,6 +596,34 @@ class LibraryPresentationTest {
     @Test
     fun sourceBadgesKeepNamesMonogramsAndTravelCategorySeparateInDarkTheme() {
         assertSourceBadgePresentation(darkTheme = true)
+    }
+
+    @Test
+    fun sourceBadgesAndNamesRemainReadableAtNarrowWidthAndLargeFontInLightTheme() {
+        assertSourceBadgePresentation(darkTheme = false, fontScale = 1.8f)
+    }
+
+    @Test
+    fun sourceBadgesAndNamesRemainReadableAtNarrowWidthAndLargeFontInDarkTheme() {
+        assertSourceBadgePresentation(darkTheme = true, fontScale = 1.8f)
+    }
+
+    @Test
+    fun detailMetadataShowsMastodonDisplayNameInsteadOfItsWireValue() {
+        val createdAt = "2026-11-01T03:00:00Z"
+        showDetail(
+            LibraryItemDetail(
+                id = "mastodon-detail",
+                version = 1,
+                url = "https://mastodon.social/@example/123",
+                displayTitle = "다시 읽을 글",
+                source = "mastodon",
+                createdAt = createdAt,
+            ),
+        )
+        val savedDate = formatLibrarySavedDate(createdAt)
+        compose.onNodeWithText("Mastodon · 저장 · $savedDate").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("mastodon · 저장 · $savedDate").assertDoesNotExist()
     }
 
     @Test
@@ -846,11 +1242,237 @@ class LibraryPresentationTest {
         assertNoDetailClutter()
     }
 
-    private fun assertSourceBadgePresentation(darkTheme: Boolean) {
+    private fun thumbnailBytes(): ByteArray {
+        val bitmap = Bitmap.createBitmap(64, 48, Bitmap.Config.ARGB_8888)
+        return try {
+            bitmap.eraseColor(android.graphics.Color.rgb(30, 110, 190))
+            ByteArrayOutputStream().use { output ->
+                assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                output.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun thumbnailItem(id: String, bytes: ByteArray) = LibraryItemSummary(
+        id = id,
+        version = 1,
+        url = "https://example.com/$id",
+        displayTitle = "사진과 메모로 다시 찾는 여행",
+        source = "instagram",
+        noteExcerpt = "직접 쓴 메모",
+        contentExcerpt = "수집한 내용보다 내 메모를 먼저 보여줍니다.",
+        categoryRefs = listOf(LibraryCategoryRef(name = "여행"), LibraryCategoryRef(name = "업무·학습")),
+        hasAttachment = true,
+        metadataState = "partial",
+        ocrState = "failed",
+        createdAt = "2026-10-24T12:00:00+09:00",
+        thumbnailAsset = LibraryThumbnailAsset("image-$id", "image/png", bytes.size.toLong(), 64, 48),
+    )
+
+    private fun thumbnailLoader(
+        items: List<LibraryItemSummary>,
+        download: suspend (String, String, String) -> ByteArray,
+    ) = LibraryThumbnailLoader(
+        ownerId = "thumbnail-owner",
+        sessionGeneration = 1L,
+        sessions = MutableStateFlow(AccountSessionState(ownerId = "thumbnail-owner", generation = 1L, initialized = true)),
+        download = download,
+    ).apply { updateItems(items) }
+
+    private fun awaitThumbnail(itemId: String) {
+        compose.waitUntil(5_000) {
+            compose.onAllNodesWithTag("library-thumbnail-$itemId", useUnmergedTree = true)
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+
+    private class ThumbnailRequestTrace {
+        private val events = ArrayDeque<String>()
+        private var sequence = 0
+
+        @Synchronized
+        fun record(event: String) {
+            if (events.size == 48) events.removeFirst()
+            events.addLast("${++sequence} [${Thread.currentThread().name}] $event")
+        }
+
+        @Synchronized
+        fun snapshot(): String = events.joinToString("\n")
+    }
+
+    private fun awaitFailedThumbnail(
+        item: LibraryItemSummary,
+        loader: LibraryThumbnailLoader,
+        trace: ThumbnailRequestTrace,
+        currentItems: () -> List<LibraryItemSummary>,
+    ) {
+        try {
+            compose.waitUntil(5_000) {
+                compose.onAllNodesWithTag("library-thumbnail-error-${item.id}", useUnmergedTree = true)
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+        } catch (timeout: ComposeTimeoutException) {
+            val snapshot = currentItems()
+            val state = "revision=${loader.revision.value} awaited=${item.id}:${item.thumbnailAsset} " +
+                "awaitedCurrent=${loader.isCurrent(item)} snapshot=" +
+                snapshot.joinToString { "${it.id}:${it.thumbnailAsset}:current=${loader.isCurrent(it)}" }
+            val evidence = File(
+                InstrumentationRegistry.getInstrumentation().targetContext.cacheDir,
+                "thumbnail-transition-timeout-${item.id}.png",
+            )
+            val screenshot = runCatching {
+                val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+                evidence.outputStream().use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                }
+                evidence.absolutePath
+            }.getOrElse { "capture failed: ${it.javaClass.simpleName}: ${it.message}" }
+            val semantics = runCatching {
+                compose.onRoot(useUnmergedTree = true).printToString(maxDepth = 12).take(12_000)
+            }.getOrElse { "semantics unavailable: ${it.javaClass.simpleName}: ${it.message}" }
+            throw AssertionError(
+                "Thumbnail failure transition timed out: $state\nScreenshot: $screenshot\n" +
+                    "Fake request trace (last 48):\n${trace.snapshot()}\nSemantics:\n$semantics",
+                timeout,
+            )
+        }
+    }
+
+    private fun assertNoTextOverflow(tag: String, layout: TextLayoutResult) {
+        // Intrinsically sized Text can retain a paragraph measured at its parent's
+        // max width (even Infinity). Check rendered lines, not that unused width.
+        assertTrue("$tag has visible text", layout.lineCount > 0)
+        assertFalse("$tag exceeds its line limit", layout.multiParagraph.didExceedMaxLines)
+        assertEquals("$tag retains all characters", layout.layoutInput.text.length, layout.getLineEnd(layout.lineCount - 1))
+        repeat(layout.lineCount) { line ->
+            assertFalse("$tag line $line is ellipsized", layout.isLineEllipsized(line))
+            assertTrue("$tag line $line starts inside", layout.getLineLeft(line) >= -1f)
+            assertTrue("$tag line $line ends inside", layout.getLineRight(line) <= layout.size.width + 1f)
+            assertTrue("$tag line $line top is visible", layout.getLineTop(line) >= -1f)
+            assertTrue("$tag line $line bottom is visible", layout.getLineBottom(line) <= layout.size.height + 1f)
+        }
+    }
+
+    private fun cardTag(item: LibraryItemSummary, search: Boolean) =
+        if (search) "search-item-${item.id}" else "detail-${item.id}"
+
+    private fun cardText(item: LibraryItemSummary, search: Boolean, text: String) = compose.onNode(
+        hasText(text) and hasAnyAncestor(hasTestTag(cardTag(item, search))),
+        useUnmergedTree = true,
+    )
+
+    private fun assertCardTextFits(item: LibraryItemSummary, search: Boolean) {
+        val source = DiscoverySource.entries.first { it.apiValue == item.source }.displayName
+        val metadata = listOf(
+            if (search) "출처 · $source" else source,
+            "저장 · ${formatLibrarySavedDate(item.createdAt)}",
+            if (search) "여행, 업무·학습" else "여행 · 업무·학습",
+        )
+        (listOf(item.displayTitle!!, item.noteExcerpt!!) + metadata).forEach { text ->
+            val textNode = if (!search && text == source) {
+                compose.onNodeWithTag("library-source-label-${item.id}", useUnmergedTree = true)
+            } else {
+                cardText(item, search, text)
+            }
+            val node = textNode.performScrollTo().assertIsDisplayed()
+            val card = compose.onNodeWithTag(cardTag(item, search)).getUnclippedBoundsInRoot()
+            val bounds = node.getUnclippedBoundsInRoot()
+            assertTrue("$text starts inside its card", bounds.left >= card.left)
+            assertTrue("$text ends inside its card", bounds.right <= card.right)
+            node.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                val layouts = mutableListOf<TextLayoutResult>()
+                assertTrue(action(layouts))
+                val layout = layouts.single()
+                if (text in metadata) {
+                    assertNoTextOverflow("${cardTag(item, search)}/$text", layout)
+                } else {
+                    assertTrue(layout.lineCount in 1..2)
+                }
+            }
+        }
+    }
+
+    private fun assertNarrowThumbnailCard(search: Boolean) {
+        val bytes = thumbnailBytes()
+        var item by mutableStateOf(thumbnailItem(if (search) "narrow-search" else "narrow-library", bytes))
+        var opened = 0
+        var deleted = 0
+        val loader = thumbnailLoader(listOf(item)) { _, _, assetId ->
+            if (assetId == "broken") ByteArray(bytes.size) { 42 } else bytes.copyOf()
+        }
+        try {
+            compose.setContent {
+                val currentItems = listOf(item)
+                SideEffect { loader.updateItems(currentItems) }
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = 1.8f)) {
+                    VaultTheme {
+                        Surface(Modifier.width(220.dp).verticalScroll(rememberScrollState())) {
+                            if (search) {
+                                SearchResultCard(currentItems.single(), onOpen = { opened++ }, onOpenAliasDisclosure = {}, thumbnailLoader = loader)
+                            } else {
+                                LibraryItemCard(currentItems.single(), onOpenDetail = { opened++ }, onDelete = { deleted++ }, thumbnailLoader = loader)
+                            }
+                        }
+                    }
+                }
+            }
+            awaitThumbnail(item.id)
+            assertCardTextFits(item, search)
+            DiscoverySource.entries.filter { it != DiscoverySource.ALL }.forEach { source ->
+                compose.runOnIdle { item = item.copy(source = source.apiValue) }
+                assertCardTextFits(item, search)
+                compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+                    .performScrollTo().assertIsDisplayed()
+            }
+            compose.runOnIdle { item = item.copy(source = DiscoverySource.INSTAGRAM.apiValue) }
+            assertCardTextFits(item, search)
+            val image = compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true)
+                .performScrollTo().assertIsDisplayed()
+            val imageBounds = image.getUnclippedBoundsInRoot()
+            val titleBounds = cardText(item, search, item.displayTitle!!).getUnclippedBoundsInRoot()
+            assertEquals(72f, (imageBounds.right - imageBounds.left).value, 0.001f)
+            assertTrue("large text is below, not squeezed beside, the image", titleBounds.top >= imageBounds.bottom)
+            image.performTouchInput { click(center) }
+            compose.runOnIdle { assertEquals(1, opened); assertEquals(0, deleted) }
+            compose.onNodeWithTag("library-collection-state-${item.id}", useUnmergedTree = true)
+                .performScrollTo().assertIsDisplayed()
+            captureDetail(if (search) "thumbnail-search-card-narrow-large-font.png" else "thumbnail-card-narrow-large-font.png")
+            compose.runOnIdle { item = item.copy(thumbnailAsset = item.thumbnailAsset!!.copy(id = "broken")) }
+            compose.runOnIdle {
+                assertTrue("the screen snapshot tracks the replacement descriptor", loader.isCurrent(item))
+            }
+            compose.waitUntil(5_000) {
+                compose.onAllNodesWithTag("library-thumbnail-error-${item.id}", useUnmergedTree = true)
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+            compose.onNodeWithTag("library-thumbnail-${item.id}", useUnmergedTree = true).assertDoesNotExist()
+            assertCardTextFits(item, search)
+            compose.onNodeWithTag(cardTag(item, search)).performScrollTo().performClick()
+            compose.runOnIdle { assertEquals(2, opened); assertEquals(0, deleted); item = item.copy(thumbnailAsset = null) }
+            compose.onNodeWithTag("library-thumbnail-error-${item.id}", useUnmergedTree = true).assertDoesNotExist()
+            assertCardTextFits(item, search)
+            val card = compose.onNodeWithTag(cardTag(item, search)).getUnclippedBoundsInRoot()
+            val title = cardText(item, search, item.displayTitle!!).getUnclippedBoundsInRoot()
+            assertEquals(card.left, title.left)
+            compose.onNodeWithTag(cardTag(item, search)).performScrollTo().performClick()
+            compose.runOnIdle { assertEquals(3, opened); assertEquals(0, deleted) }
+        } finally {
+            loader.close()
+        }
+    }
+
+    private fun assertSourceBadgePresentation(darkTheme: Boolean, fontScale: Float = 1f) {
         val sources = listOf(
             Triple("instagram", "Instagram", "Ig"),
             Triple("threads", "Threads", "Th"),
             Triple("naver_blog", "네이버 블로그", "N"),
+            Triple("x", "X", "X"),
+            Triple("facebook", "Facebook", "f"),
+            Triple("bluesky", "Bluesky", "B"),
+            Triple("mastodon", "Mastodon", "M"),
             Triple("other", "기타", "기"),
             Triple("example.com", "example.com", "E"),
         )
@@ -867,15 +1489,18 @@ class LibraryPresentationTest {
             LibraryItemSummary(id = "blank-source", url = "https://example.com/blank-source", source = "  "),
         )
         compose.setContent {
-            VaultTheme {
-                MaterialTheme(colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()) {
-                    Surface(modifier = Modifier.fillMaxSize()) {
-                        Column(
-                            modifier = Modifier
-                                .width(260.dp)
-                                .verticalScroll(rememberScrollState()),
-                        ) {
-                            summaries.forEach { LibraryItemCard(item = it, onOpenDetail = {}) }
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale = fontScale)) {
+                VaultTheme {
+                    MaterialTheme(colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()) {
+                        Surface(modifier = Modifier.fillMaxSize()) {
+                            Column(
+                                modifier = Modifier
+                                    .width(if (fontScale > 1f) 220.dp else 260.dp)
+                                    .verticalScroll(rememberScrollState()),
+                            ) {
+                                summaries.forEach { LibraryItemCard(item = it, onOpenDetail = {}) }
+                            }
                         }
                     }
                 }
@@ -891,6 +1516,32 @@ class LibraryPresentationTest {
                 .assertIsDisplayed().assertTextEquals(label)
             compose.onNodeWithTag("library-source-monogram-$source", useUnmergedTree = true)
                 .assertIsDisplayed().assertTextEquals(monogram)
+            val card = compose.onNodeWithTag("detail-$source").getUnclippedBoundsInRoot()
+            val badge = compose.onNodeWithTag("library-source-badge-$source", useUnmergedTree = true)
+                .getUnclippedBoundsInRoot()
+            assertEquals(22f * fontScale, (badge.right - badge.left).value, 1f)
+            val expectedBackground = when (source) {
+                "x" -> android.graphics.Color.BLACK
+                "facebook" -> android.graphics.Color.rgb(8, 102, 255)
+                "bluesky" -> android.graphics.Color.rgb(0, 133, 255)
+                "mastodon" -> android.graphics.Color.rgb(99, 100, 255)
+                else -> null
+            }
+            expectedBackground?.let { color ->
+                val image = compose.onNodeWithTag("library-source-badge-$source", useUnmergedTree = true)
+                    .captureToImage().asAndroidBitmap()
+                assertEquals("recognizable badge color for $source", color, image.getPixel(image.width / 2, image.height / 8))
+            }
+            listOf("library-source-label-$source", "library-source-monogram-$source").forEach { tag ->
+                val node = compose.onNodeWithTag(tag, useUnmergedTree = true)
+                val bounds = node.getUnclippedBoundsInRoot()
+                assertTrue(bounds.left >= card.left && bounds.right <= card.right)
+                node.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { action ->
+                    val layouts = mutableListOf<TextLayoutResult>()
+                    assertTrue(action(layouts))
+                    assertNoTextOverflow(tag, layouts.single())
+                }
+            }
         }
         listOf("null-source", "blank-source").forEach { id ->
             compose.onNodeWithTag("detail-$id").performScrollTo()

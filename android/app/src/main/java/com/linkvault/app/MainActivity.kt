@@ -1,6 +1,7 @@
 package com.linkvault.app
 
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -8,7 +9,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -68,11 +71,14 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
 import com.linkvault.app.attachment.IncomingImageCaptureException
 import com.linkvault.app.attachment.IncomingImageCaptureFailure
 import com.linkvault.app.auth.AccountScreen
+import com.linkvault.app.auth.LibraryExportCoordinator
 import com.linkvault.app.capture.CaptureInput
 import com.linkvault.app.capture.InvalidUrlReason
 import com.linkvault.app.discovery.DiscoveryScreen
 import com.linkvault.app.discovery.DiscoverySource
+import com.linkvault.app.library.LibrarySaveForm
 import com.linkvault.app.library.LibraryScreen
+import com.linkvault.app.library.validateLibrarySaveForm
 import com.linkvault.app.privacy.PrivacyScreen
 import com.linkvault.app.ui.VaultTheme
 import java.util.UUID
@@ -89,8 +95,12 @@ class MainActivity : ComponentActivity() {
     private var draftTouched = false
     private var recoveryError by mutableStateOf<String?>(null)
     private var handledLogoutGeneration = 0L
+    private var externalShareEntryActive by mutableStateOf(false)
     private val app get() = application as LinkVaultApplication
     private val privateSessionStoreViewModel: PrivateSessionStoreViewModel by viewModels()
+    private val libraryExportCoordinator: LibraryExportCoordinator by viewModels {
+        LibraryExportCoordinator.factory(applicationContext, app.accountClient)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val currentLogout = app.logoutGeneration.value
@@ -105,6 +115,8 @@ class MainActivity : ComponentActivity() {
         capture = readIncomingCapture(intent, sequence = nextSequence)
         val fromHistory = intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0
         if (fromHistory && savedInstanceState == null) capture = IncomingCapture()
+        externalShareEntryActive = !staleState &&
+            (savedInstanceState?.getBoolean("external_share_entry_active") ?: capture.isExternalShare)
         if (capture.isExternalShare && !staleState && savedInstanceState == null && !fromHistory) {
             draftTouched = true
             app.persistCapture(capture.text, null)
@@ -146,12 +158,16 @@ class MainActivity : ComponentActivity() {
         super.onSaveInstanceState(outState)
         outState.putLong("capture_logout_generation", handledLogoutGeneration)
         outState.putInt("capture_sequence", nextSequence)
+        outState.putBoolean("external_share_entry_active", externalShareEntryActive)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) return
+        externalShareEntryActive =
+            intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE
+        if (!externalShareEntryActive) return
+        libraryExportCoordinator.leaveAccount()
         draftTouched = true
         nextSequence += 1
         capture = readIncomingCapture(intent, sequence = nextSequence)
@@ -164,6 +180,19 @@ class MainActivity : ComponentActivity() {
         capture: IncomingCapture,
         onOpenOriginal: (String) -> String?,
     ) {
+        // Keep registration outside routed screens so invalidated and process-orphaned results
+        // are still delivered. The activity-scoped coordinator, not composition, owns the slot.
+        val exportContract = remember {
+            object : ActivityResultContracts.CreateDocument("application/json") {
+                override fun createIntent(context: Context, input: String): Intent =
+                    super.createIntent(context, input).addCategory(Intent.CATEGORY_OPENABLE)
+            }
+        }
+        val exportLauncher = rememberLauncherForActivityResult(
+            exportContract,
+        ) { destination ->
+            libraryExportCoordinator.onDestinationResult(destination)
+        }
         var selectedRootOrdinal by rememberSaveable {
             mutableIntStateOf(RootDestination.LIBRARY.ordinal)
         }
@@ -177,9 +206,11 @@ class MainActivity : ComponentActivity() {
         var discoveryEntryId by rememberSaveable { mutableStateOf(UUID.randomUUID().toString()) }
         var saveUrl by rememberSaveable { mutableStateOf<String?>(null) }
         var saveSharedText by rememberSaveable { mutableStateOf("") }
+        var saveStartedFromExternalShare by rememberSaveable { mutableStateOf(false) }
         // Match receipts to an input revision, not to text or URLs that a later share may repeat.
         var inputRevision by rememberSaveable { mutableIntStateOf(0) }
         var appliedCaptureSequence by rememberSaveable { mutableIntStateOf(capture.sequence) }
+        var routedShareSequence by rememberSaveable { mutableIntStateOf(-1) }
         var saveCaptureRevision by rememberSaveable { mutableIntStateOf(0) }
         var saveCaptureSequence by rememberSaveable { mutableIntStateOf(capture.sequence) }
         var captureSaveRequestIds by rememberSaveable { mutableStateOf(emptyList<String>()) }
@@ -212,6 +243,7 @@ class MainActivity : ComponentActivity() {
         }
 
         fun openRoot(destination: RootDestination) {
+            if (destination != RootDestination.ACCOUNT) libraryExportCoordinator.leaveAccount()
             showCapture = false
             saveFlowActive = false
             showPrivacy = false
@@ -227,6 +259,7 @@ class MainActivity : ComponentActivity() {
             pendingDiscoverySource = null
             saveUrl = null
             saveSharedText = ""
+            saveStartedFromExternalShare = false
             rootLibraryEntryId = UUID.randomUUID().toString()
             saveEntryId = UUID.randomUUID().toString()
             discoveryEntryId = UUID.randomUUID().toString()
@@ -270,28 +303,9 @@ class MainActivity : ComponentActivity() {
                 draftTouched = true
                 nextSequence += 1
                 this@MainActivity.capture = IncomingCapture(sequence = nextSequence)
+                externalShareEntryActive = false
                 setIntent(Intent(this@MainActivity, MainActivity::class.java))
                 handledLogoutGeneration = logoutGeneration
-            }
-        }
-
-        LaunchedEffect(capture.sequence) {
-            if (capture.sequence != appliedCaptureSequence) {
-                appliedCaptureSequence = capture.sequence
-                inputRevision += 1
-                captureSaveRequestIds = emptyList()
-                input = capture.text
-                selectedUrl = capture.selectedUrl
-                inputLimitExceeded = capture.text.length > CaptureInput.MAX_INPUT_LENGTH
-                openError = null
-                selectedSharedImageIndex = if (capture.imageUris.size == 1) 0 else null
-                if (capture.isExternalShare) {
-                    saveFlowActive = false
-                    showPrivacy = false
-                    discoveryItemId = null
-                    pendingDiscoverySource = null
-                    showCapture = true
-                }
             }
         }
 
@@ -301,6 +315,14 @@ class MainActivity : ComponentActivity() {
             !app.accountClient.isConfigured ||
                 accountSessionState.initialized || accountSessionState.ownerId != null
 
+        val accountVisible = selectedRoot == RootDestination.ACCOUNT && !showCapture &&
+            !saveFlowActive && !showPrivacy && discoveryItemId == null
+        LaunchedEffect(accountVisible) {
+            if (!accountVisible) libraryExportCoordinator.leaveAccount()
+        }
+        BackHandler(enabled = accountVisible) {
+            openRoot(RootDestination.LIBRARY)
+        }
         BackHandler(enabled = showCapture || saveFlowActive || discoveryItemId != null) {
             when {
                 saveFlowActive -> {
@@ -326,16 +348,66 @@ class MainActivity : ComponentActivity() {
             }
         }
         val openSaveFlow: (String?, String) -> Unit = { url, sharedText ->
+            libraryExportCoordinator.leaveAccount()
             saveEntryId = UUID.randomUUID().toString()
             saveUrl = url
             saveSharedText = sharedText
             saveCaptureRevision = inputRevision
             saveCaptureSequence = capture.sequence
+            saveStartedFromExternalShare = externalShareEntryActive
             showCapture = false
             showPrivacy = false
             discoveryItemId = null
             pendingDiscoverySource = null
             saveFlowActive = true
+        }
+        LaunchedEffect(capture.sequence, privateRoutesReady, externalShareEntryActive) {
+            if (capture.sequence != appliedCaptureSequence) {
+                appliedCaptureSequence = capture.sequence
+                inputRevision += 1
+                captureSaveRequestIds = emptyList()
+                input = capture.text
+                selectedUrl = capture.selectedUrl
+                inputLimitExceeded = capture.text.length > CaptureInput.MAX_INPUT_LENGTH
+                openError = null
+                selectedSharedImageIndex = if (capture.imageUris.size == 1) 0 else null
+                if (capture.isExternalShare) {
+                    libraryExportCoordinator.leaveAccount()
+                    saveFlowActive = false
+                    showPrivacy = false
+                    discoveryItemId = null
+                    pendingDiscoverySource = null
+                    showCapture = true
+                }
+            }
+            if (privateRoutesReady && externalShareEntryActive && capture.isExternalShare &&
+                routedShareSequence != capture.sequence
+            ) {
+                routedShareSequence = capture.sequence
+                val parsed = CaptureInput.parse(input)
+                val directUrl = parsed.urls.singleOrNull()?.takeIf { url ->
+                    input == capture.text && !capture.isImageShare && !parsed.inputTooLong &&
+                        parsed.rejected.isEmpty() &&
+                        validateLibrarySaveForm(LibrarySaveForm(url, input)).isEmpty()
+                }
+                if (directUrl != null) openSaveFlow(directUrl, input)
+            }
+        }
+        val returnCaptureSequence = saveCaptureSequence
+        val returnEntryId = saveEntryId
+        val returnToSharingApp: (() -> Unit)? = if (
+            saveFlowActive && saveStartedFromExternalShare && externalShareEntryActive &&
+            returnCaptureSequence == this@MainActivity.capture.sequence
+        ) {
+            {
+                if (saveFlowActive && returnEntryId == saveEntryId && externalShareEntryActive &&
+                    returnCaptureSequence == this@MainActivity.capture.sequence
+                ) {
+                    finish()
+                }
+            }
+        } else {
+            null
         }
         val captureSaved: (String) -> Unit = { requestId ->
             if (requestId in captureSaveRequestIds &&
@@ -363,6 +435,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val openCapture: () -> Unit = {
+            libraryExportCoordinator.leaveAccount()
             saveFlowActive = false
             showPrivacy = false
             discoveryItemId = null
@@ -390,7 +463,7 @@ class MainActivity : ComponentActivity() {
                     if (!showCapture && !saveFlowActive && !showPrivacy &&
                         discoveryItemId == null && hasCaptureDraft
                     ) {
-                        DraftResumeBar(onResume = { showCapture = true })
+                        DraftResumeBar(onResume = openCapture)
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                     NavigationBar(
@@ -512,6 +585,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 onCaptureSaved = captureSaved,
+                                onReturnToSharingApp = returnToSharingApp,
                                 incomingImageUri = incomingImageDraft?.uri,
                                 onIncomingImageConsumed = consumeIncomingImage,
                                 onBack = {
@@ -602,8 +676,17 @@ class MainActivity : ComponentActivity() {
                         AccountScreen(
                             client = app.accountClient,
                             outbox = app.outboxRepository,
+                            exportCoordinator = libraryExportCoordinator,
+                            onExport = { request ->
+                                libraryExportCoordinator.launchPicker(request) { fileName ->
+                                    exportLauncher.launch(fileName)
+                                }
+                            },
                             onBack = { openRoot(RootDestination.LIBRARY) },
-                            onOpenPrivacy = { showPrivacy = true },
+                            onOpenPrivacy = {
+                                libraryExportCoordinator.leaveAccount()
+                                showPrivacy = true
+                            },
                         )
                     }
                 }

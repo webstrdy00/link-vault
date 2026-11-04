@@ -11,7 +11,11 @@ import android.graphics.Typeface
 import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithContentDescription
@@ -46,6 +50,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -126,6 +131,76 @@ class EnrichmentIntegrationTest {
         compose.onNodeWithTag("attachment-image", useUnmergedTree = true).assertExists()
     }
 
+    private fun cardThumbnailPixels(evidenceName: String? = null): IntArray {
+        val tag = "library-thumbnail-${fixtureItemId()}"
+        awaitTag(tag, timeoutMillis = SERVER_TIMEOUT_MILLIS)
+        val bitmap = compose.onNodeWithTag(tag, useUnmergedTree = true)
+            .performScrollTo()
+            .assertIsDisplayed()
+            .captureToImage()
+            .asAndroidBitmap()
+        evidenceName?.let { name ->
+            File(app.cacheDir, name).outputStream().use { output ->
+                assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+            }
+        }
+        // Ignore the rounded edge so the comparison measures uploaded image pixels, not the card background.
+        val inset = 8
+        val width = bitmap.width - inset * 2
+        val height = bitmap.height - inset * 2
+        assertTrue(width > 0 && height > 0)
+        return IntArray(width * height).also { pixels ->
+            bitmap.getPixels(pixels, 0, width, inset, inset, width, height)
+        }
+    }
+
+    private fun sameRenderedThumbnail(expected: IntArray, actual: IntArray): Boolean {
+        if (expected.size != actual.size) return false
+        // Identical images at different layout positions differed by up to 5/255
+        // at filtered text edges on the QA emulator. Allow raster rounding, not
+        // different content; the replacement must also exceed this same bound.
+        return expected.indices.all { index ->
+            (0..24 step 8).all { shift ->
+                kotlin.math.abs(
+                    ((expected[index] ushr shift) and 0xff) -
+                        ((actual[index] ushr shift) and 0xff),
+                ) <= 8
+            }
+        }
+    }
+
+    private fun returnToLibraryListAndRefresh() {
+        clickTag("detail-back")
+        clickRoot("root-library")
+        awaitTag("detail-${fixtureItemId()}")
+        awaitLibraryRefreshEnabled()
+        compose.onNodeWithContentDescription("보관함 새로고침")
+            .performScrollTo()
+            .assertIsEnabled()
+            .performClick()
+        awaitLibraryRefreshEnabled()
+        compose.onNodeWithText("마지막 동기화 ·", substring = true).assertDoesNotExist()
+    }
+
+    private fun awaitLibraryRefreshEnabled() {
+        compose.waitUntil(SERVER_TIMEOUT_MILLIS) {
+            compose.onAllNodesWithContentDescription("보관함 새로고침")
+                .fetchSemanticsNodes().singleOrNull()?.config
+                ?.contains(SemanticsProperties.Disabled) == false
+        }
+    }
+
+    private fun awaitNoCardThumbnail() {
+        val tag = "library-thumbnail-${fixtureItemId()}"
+        compose.waitUntil(SERVER_TIMEOUT_MILLIS) {
+            compose.onAllNodes(hasTestTag(tag), useUnmergedTree = true)
+                .fetchSemanticsNodes().isEmpty()
+        }
+        compose.onNodeWithTag(tag, useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("library-thumbnail-error-${fixtureItemId()}", useUnmergedTree = true)
+            .assertDoesNotExist()
+    }
+
     private fun shell(command: String) {
         InstrumentationRegistry.getInstrumentation().uiAutomation
             .executeShellCommand(command)
@@ -172,7 +247,7 @@ class EnrichmentIntegrationTest {
         val bitmap = Bitmap.createBitmap(FIXTURE_WIDTH, FIXTURE_HEIGHT, Bitmap.Config.ARGB_8888)
         try {
             val canvas = Canvas(bitmap)
-            canvas.drawColor(Color.WHITE)
+            canvas.drawColor(if (name == "seoul") Color.rgb(240, 248, 255) else Color.rgb(255, 248, 240))
             val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.BLACK
                 textSize = FIXTURE_TEXT_SIZE
@@ -402,6 +477,7 @@ class EnrichmentIntegrationTest {
         assertTrue("force-stop retains the Room row", retained.stage != AttachmentStage.SAVED)
         assertTrue("force-stop retains the same-owner prepared file", queuedFile(retained).isFile)
         assertRecognizedFixture(retained, "서울")
+        lateinit var initialThumbnailPixels: IntArray
 
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
@@ -414,19 +490,26 @@ class EnrichmentIntegrationTest {
 
             val (firstItem, firstAsset) = awaitActiveAsset()
             val firstAssetId = firstAsset.getValue("id").jsonPrimitive.content
+            assertEquals(firstAssetId, (firstItem.getValue("thumbnail_asset") as JsonObject).getValue("id").jsonPrimitive.content)
             val firstTextRevision = firstItem.getValue("text_revision").jsonPrimitive.long
             assertEquals("ready", firstItem.getValue("ocr_state").jsonPrimitive.content)
             assertTrue(firstAsset.getValue("ocr_text").jsonPrimitive.content.contains("서울"))
             compose.waitUntil(UI_TIMEOUT_MILLIS) {
                 File(app.noBackupFilesDir, "attachment_queue").walkTopDown().none { file -> file.isFile }
             }
+            returnToLibraryListAndRefresh()
+            val libraryPixels = cardThumbnailPixels("uploaded-thumbnail-library.png")
+            initialThumbnailPixels = libraryPixels
             openSearch()
             submitSearch("LINK 서울")
             awaitTag("search-item-$itemId", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            assertTrue("search renders the same authenticated uploaded image as the library", sameRenderedThumbnail(libraryPixels, cardThumbnailPixels("uploaded-thumbnail-search.png")))
 
             writeReceipt {
                 put("initialAssetId", firstAssetId)
                 put("initialTextRevision", firstTextRevision)
+                put("initialLibraryThumbnailVisible", true)
+                put("initialSearchThumbnailVisible", true)
             }
         }
 
@@ -462,6 +545,7 @@ class EnrichmentIntegrationTest {
             setNetwork(enabled = true)
             val (replacementItem, replacementAsset) = awaitActiveAsset(differentFrom = firstAssetId)
             val replacementAssetId = replacementAsset.getValue("id").jsonPrimitive.content
+            assertEquals(replacementAssetId, (replacementItem.getValue("thumbnail_asset") as JsonObject).getValue("id").jsonPrimitive.content)
             val replacementTextRevision = replacementItem.getValue("text_revision").jsonPrimitive.long
             assertNotEquals(firstAssetId, replacementAssetId)
             assertTrue(replacementTextRevision > firstItemTextRevision())
@@ -469,12 +553,17 @@ class EnrichmentIntegrationTest {
             assertTrue(replacementAsset.getValue("ocr_text").jsonPrimitive.content.contains("제주"))
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
 
+            returnToLibraryListAndRefresh()
+            val replacementPixels = cardThumbnailPixels()
+            assertFalse("replacement updates actual card pixels, not just the attachment state", sameRenderedThumbnail(initialThumbnailPixels, replacementPixels))
             openSearch()
             submitSearch("LINK 제주")
             awaitTag("search-item-$itemId", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            assertTrue("search renders the replacement uploaded image", sameRenderedThumbnail(replacementPixels, cardThumbnailPixels()))
             submitSearch("서울")
             awaitText("조건에 맞는 항목이 없어요.", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             compose.onNodeWithTag("search-item-$itemId").assertDoesNotExist()
+            awaitNoCardThumbnail()
 
             writeReceipt {
                 put("replacementOperationId", replacementPending.operationId)
@@ -482,6 +571,8 @@ class EnrichmentIntegrationTest {
                 put("replacementOcrText", replacementPending.ocrText)
                 put("replacementAssetId", replacementAssetId)
                 put("replacementTextRevision", replacementTextRevision)
+                put("replacementLibraryThumbnailUpdated", true)
+                put("replacementSearchThumbnailUpdated", true)
             }
         }
     }
@@ -497,6 +588,7 @@ class EnrichmentIntegrationTest {
         assertEquals(argument("fixtureOwnerId"), app.accountClient.sessionUserId())
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             clickRoot("root-library")
+            cardThumbnailPixels()
             openFixtureDetail()
             assertInlineImageControls()
             awaitTag("attachment-preview", timeoutMillis = SERVER_TIMEOUT_MILLIS)
@@ -511,9 +603,21 @@ class EnrichmentIntegrationTest {
             awaitTag("attachment-pick", timeoutMillis = SERVER_TIMEOUT_MILLIS)
             val deleted = currentItem()
             assertTrue(deleted["active_asset"] !is JsonObject)
+            assertTrue(deleted["thumbnail_asset"] !is JsonObject)
             compose.onNodeWithTag("attachment-preview", useUnmergedTree = true)
                 .assertDoesNotExist()
-            writeReceipt { put("deleteConfirmed", true) }
+            returnToLibraryListAndRefresh()
+            awaitNoCardThumbnail()
+            compose.onNodeWithTag("detail-${fixtureItemId()}").assertExists()
+            openSearch()
+            submitSearch(argument("fixtureUrl"))
+            awaitTag("search-item-${fixtureItemId()}", timeoutMillis = SERVER_TIMEOUT_MILLIS)
+            awaitNoCardThumbnail()
+            writeReceipt {
+                put("deleteConfirmed", true)
+                put("deletedLibraryThumbnailAbsent", true)
+                put("deletedSearchThumbnailAbsent", true)
+            }
         }
     }
 

@@ -9,8 +9,10 @@ import com.linkvault.app.auth.AccountClient
 import com.linkvault.app.auth.AccountClientException
 import com.linkvault.app.storage.CachedItem
 import com.linkvault.app.storage.OutboxEntry
+import com.linkvault.app.storage.OutboxPolicy
 import com.linkvault.app.storage.OutboxRepository
 import com.linkvault.app.storage.OutboxState
+import com.linkvault.app.storage.SaveRecoveryAction
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -169,6 +171,7 @@ class LibraryViewModel internal constructor(
 
     fun retrySave() {
         val failure = mutableUiState.value.saveStatus as? LibrarySaveStatus.Failed ?: return
+        if (!failure.canRetrySameRequest || failure.needsReconfirmation) return
         val requestId = failure.requestId ?: return
         retryOperation(requestId)
     }
@@ -183,17 +186,20 @@ class LibraryViewModel internal constructor(
         }
     }
 
-    fun reconfirmExpiredSave(requestId: String): String? {
+    fun reconfirmSave(requestId: String): String? {
         if (saveJob?.isActive == true) return null
-        val entry = mutableUiState.value.outboxEntries.firstOrNull {
-            it.requestId == requestId && it.ownerId == ownerId && it.state == OutboxState.EXPIRED
-        } ?: return null
-        if (entry.method != "POST" || entry.path != "/items") return null
         val boundOwner = ownerId ?: return null
+        if (!identityMatches()) {
+            invalidateIdentity()
+            return null
+        }
+        val entry = mutableUiState.value.outboxEntries.firstOrNull {
+            it.requestId == requestId &&
+                OutboxPolicy.saveRecoveryAction(it, boundOwner) == SaveRecoveryAction.RECONFIRM
+        } ?: return null
         val newRequestId = UUID.randomUUID().toString()
         pendingSaveRequestId = newRequestId
         mutableUiState.value = mutableUiState.value.copy(saveStatus = LibrarySaveStatus.Saving)
-        replacedRequestIds += requestId
         val job = viewModelScope.launch {
             try {
                 outbox.enqueue(
@@ -203,6 +209,8 @@ class LibraryViewModel internal constructor(
                     path = entry.path,
                     payloadJson = entry.payloadJson,
                 )
+                if (!responseBelongsTo(boundOwner)) throw AccountAuthenticationRequiredException()
+                replacedRequestIds += requestId
                 val removalError = removeReplacedRequest(boundOwner, requestId)
                 mutableUiState.value = mutableUiState.value.copy(
                     saveStatus = LibrarySaveStatus.Queued(newRequestId),
@@ -850,7 +858,15 @@ class LibraryViewModel internal constructor(
     }
 
     fun retryOperation(requestId: String) {
-        mutateOutbox(requestId) { boundOwner -> outbox.retry(boundOwner, requestId) }
+        mutateOutbox(requestId) { boundOwner ->
+            val entry = outbox.observeOutbox(boundOwner).first()
+                .firstOrNull { it.requestId == requestId } ?: return@mutateOutbox
+            if (!responseBelongsTo(boundOwner)) throw AccountAuthenticationRequiredException()
+            if (entry.method == "POST" && entry.path == "/items" &&
+                OutboxPolicy.saveRecoveryAction(entry, boundOwner) != SaveRecoveryAction.RETRY_SAME_REQUEST
+            ) return@mutateOutbox
+            outbox.retry(boundOwner, requestId)
+        }
     }
 
     fun discardOperation(requestId: String) {
@@ -1512,6 +1528,7 @@ class LibraryViewModel internal constructor(
             ?.also { pendingSaveRequestId = it }
             ?: return
         val entry = entries.firstOrNull { it.requestId == requestId } ?: return
+        val recoveryAction = OutboxPolicy.saveRecoveryAction(entry, ownerId)
         val nextStatus = when (entry.state) {
             OutboxState.PENDING,
             OutboxState.RUNNING,
@@ -1522,7 +1539,8 @@ class LibraryViewModel internal constructor(
             OutboxState.FAILED -> LibrarySaveStatus.Failed(
                 requestId = entry.requestId,
                 message = entry.failureMessage(),
-                canRetrySameRequest = true,
+                canRetrySameRequest = recoveryAction == SaveRecoveryAction.RETRY_SAME_REQUEST,
+                needsReconfirmation = recoveryAction == SaveRecoveryAction.RECONFIRM,
             )
 
             OutboxState.CONFLICT -> LibrarySaveStatus.Failed(
@@ -1533,9 +1551,13 @@ class LibraryViewModel internal constructor(
 
             OutboxState.EXPIRED -> LibrarySaveStatus.Failed(
                 requestId = entry.requestId,
-                message = "저장 요청이 24시간을 지나 만료됐어요. 내용을 확인한 뒤 새 요청으로 보관해 주세요.",
+                message = if (recoveryAction == SaveRecoveryAction.EDIT_OR_REMOVE) {
+                    entry.failureMessage()
+                } else {
+                    "저장 요청이 24시간을 지나 만료됐어요. 내용을 확인한 뒤 새 요청으로 보관해 주세요."
+                },
                 canRetrySameRequest = false,
-                needsReconfirmation = true,
+                needsReconfirmation = recoveryAction == SaveRecoveryAction.RECONFIRM,
             )
 
             OutboxState.SAVED -> state.saveStatus
@@ -2703,7 +2725,8 @@ private fun OutboxEntry.failureMessage(): String = when (errorCode) {
     "ITEM_NOT_FOUND" -> "보관한 링크를 찾지 못했어요. 목록을 새로고침해 주세요."
     "INVALID_BODY", "INVALID_REQUEST_BODY" -> "보관할 내용을 서버가 받지 못했어요. 입력 내용을 확인해 주세요."
     "ITEM_LIMIT_REACHED" -> "보관 가능한 링크 수를 모두 사용했어요."
-    "IDEMPOTENCY_MISMATCH" -> "같은 요청 ID에 다른 내용이 연결되어 저장하지 않았어요."
+    "URL_HASH_COLLISION" -> "링크 주소가 기존 링크와 충돌했어요. 입력을 수정하거나 대기 요청을 제거해 주세요."
+    "IDEMPOTENCY_MISMATCH" -> "같은 요청 ID에 다른 내용이 연결되어 저장하지 않았어요. 입력을 수정하거나 대기 요청을 제거해 주세요."
     "ITEM_DELETED" -> "이미 삭제된 링크는 다시 처리할 수 없어요."
     "RATE_LIMITED" -> "요청이 너무 많아요. 잠시 후 다시 시도해 주세요."
     "DEPENDENCY_UNAVAILABLE" -> "서버가 일시적으로 요청을 처리할 수 없어요. 다시 시도해 주세요."

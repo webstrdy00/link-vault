@@ -63,10 +63,23 @@ export type SearchField =
 
 export type TopicField = Exclude<SearchField, "categories" | "url">;
 
+export const SOURCE_VALUES = [
+  "instagram",
+  "threads",
+  "naver_blog",
+  "x",
+  "facebook",
+  "bluesky",
+  "mastodon",
+  "other",
+] as const;
+
+export type ItemSource = typeof SOURCE_VALUES[number];
+
 export interface PreparedItem {
   normalized_url: string;
   url_hash: string;
-  source: "instagram" | "threads" | "naver_blog" | "other";
+  source: ItemSource;
   display_fallback: string;
   normalized_fields: Record<SearchField, string>;
   alias_concepts: Record<TopicField, string[]>;
@@ -498,6 +511,25 @@ function sourceFor(hostname: string): PreparedItem["source"] {
   }
   if (hostname === "blog.naver.com" || hostname === "m.blog.naver.com") {
     return "naver_blog";
+  }
+  if (
+    hostname === "x.com" || hostname.endsWith(".x.com") ||
+    hostname === "twitter.com" || hostname.endsWith(".twitter.com")
+  ) {
+    return "x";
+  }
+  if (
+    hostname === "facebook.com" || hostname.endsWith(".facebook.com") ||
+    hostname === "fb.com" || hostname.endsWith(".fb.com") ||
+    hostname === "fb.watch" || hostname.endsWith(".fb.watch")
+  ) {
+    return "facebook";
+  }
+  if (hostname === "bsky.app" || hostname.endsWith(".bsky.app")) {
+    return "bluesky";
+  }
+  if (hostname === "mastodon.social" || hostname.endsWith(".mastodon.social")) {
+    return "mastodon";
   }
   return "other";
 }

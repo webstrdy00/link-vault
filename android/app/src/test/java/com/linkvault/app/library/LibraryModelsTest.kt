@@ -128,6 +128,171 @@ class LibraryModelsTest {
     }
 
     @Test
+    fun acceptedEditReceiptUpdatesOnlineCardWithoutResettingOtherCardsOrPaging() {
+        val acceptedNote = "수정한 메모 " + "긴 내용 ".repeat(30)
+        val acceptedNoteExcerpt = acceptedNote.take(120)
+        val response = Json.parseToJsonElement(
+            """
+            {
+              "id":"$deleteItemId", "version":10, "url":"https://example.com/target",
+              "display_title":"수정한 제목", "user_title":"  수정한 제목  ",
+              "note":"$acceptedNote", "note_excerpt":"$acceptedNoteExcerpt",
+              "content_excerpt":"서버가 선택한 본문 미리보기",
+              "body_text":"서버가 선택한 본문 미리보기", "source":"other",
+              "category_refs":[{"id":"$otherItemId","name":"업무","origin":"manual"}],
+              "has_attachment":true, "metadata_state":"ready", "ocr_state":"ready",
+              "classification_state":"manual", "cue_state":"ready", "cue_flags":["review"],
+              "match_type":null, "created_at":"2026-10-31T10:00:00Z",
+              "updated_at":"2026-11-01T10:00:00Z",
+              "thumbnail_asset":{"id":"$otherItemId","mime_type":"image/png",
+                "byte_size":12345,"width":1024,"height":768}
+            }
+            """.trimIndent(),
+        ).jsonObject
+        val accepted = parseLibraryDetailResponse(response)
+        val preceding = LibraryItemSummary("preceding", 3, "https://example.com/before")
+        val following = LibraryItemSummary("following", 4, "https://example.com/after")
+        val original = LibraryItemSummary(
+            deleteItemId, 9, "https://example.com/target",
+            displayTitle = "이전 제목", noteExcerpt = "이전 메모", matchType = "literal",
+        )
+        val before = listDeleteState().copy(
+            items = listOf(preceding, original, following),
+            hasMore = true,
+            nextOffset = 60,
+            detail = LibraryDetailState.Loaded(accepted),
+            edit = editState(accepted).copy(
+                form = LibraryEditForm("아직 저장하지 않은 제목", "아직 저장하지 않은 내용"),
+            ),
+            receiptsAwaitingAcknowledgement = setOf(requestId),
+        )
+
+        val after = before.withReconciledEditSummary(accepted)
+
+        val expected = parseLibrarySummaryResponse(response).copy(matchType = "literal")
+        assertEquals(before.copy(items = listOf(preceding, expected, following)), after)
+        assertEquals("수정한 제목", compactLibraryTitle(after.items[1].displayTitle, after.items[1].url))
+        assertEquals(acceptedNoteExcerpt, after.items[1].cardPreview())
+        assertTrue(preceding === after.items.first())
+        assertTrue(following === after.items.last())
+    }
+
+    @Test
+    fun clearedEditReceiptRemovesOldTitleAndMemoAndUsesServerFallbacks() {
+        val original = listDeleteState().items.first().copy(
+            displayTitle = "삭제할 직접 입력 제목",
+            noteExcerpt = "삭제할 메모",
+            contentExcerpt = "이전 본문 미리보기",
+        )
+        val before = listDeleteState().copy(items = listOf(original))
+        listOf(
+            "서버가 선택한 수집 제목" to "서버가 선택한 본문 미리보기",
+            null to null,
+        ).forEach { (displayTitle, preview) ->
+            val accepted = parseLibraryDetailResponse(
+                buildJsonObject {
+                    put("id", deleteItemId)
+                    put("version", 10)
+                    put("url", original.url)
+                    put("user_title", JsonNull)
+                    put("display_title", displayTitle)
+                    put("note", JsonNull)
+                    put("note_excerpt", JsonNull)
+                    put("content_excerpt", preview)
+                },
+            )
+
+            val after = before.withReconciledEditSummary(accepted)
+            val card = after.items.single()
+
+            assertEquals(displayTitle ?: original.url, compactLibraryTitle(card.displayTitle, card.url))
+            assertNull(card.noteExcerpt)
+            assertEquals(preview, card.contentExcerpt)
+            assertEquals(preview, card.cardPreview())
+            assertEquals(10L, card.version)
+        }
+    }
+
+    @Test
+    fun delayedEditReceiptCannotRollBackNewerVisibleSummary() {
+        val before = listDeleteState().copy(hasMore = true, nextOffset = 40)
+        val firstReceipt = generatedEditDetail().copy(
+            version = 10,
+            displayTitle = "첫 번째 저장 제목",
+            noteExcerpt = "첫 번째 저장 메모",
+        )
+        val latestReceipt = firstReceipt.copy(
+            version = 11,
+            displayTitle = "최신 저장 제목",
+            noteExcerpt = "최신 저장 메모",
+        )
+        val latest = before.withReconciledEditSummary(firstReceipt)
+            .withReconciledEditSummary(latestReceipt)
+
+        val afterDelayedReceipt = latest.withReconciledEditSummary(firstReceipt)
+
+        assertEquals(latest, afterDelayedReceipt)
+        assertTrue(latest.items.first() === afterDelayedReceipt.items.first())
+        assertEquals(11L, afterDelayedReceipt.items.first().version)
+        assertEquals("최신 저장 제목", afterDelayedReceipt.items.first().displayTitle)
+        assertEquals("최신 저장 메모", afterDelayedReceipt.items.first().cardPreview())
+        assertEquals(listOf(deleteItemId, otherItemId), afterDelayedReceipt.items.map { it.id })
+        assertEquals(40, afterDelayedReceipt.nextOffset)
+        assertTrue(afterDelayedReceipt.hasMore)
+    }
+
+    @Test
+    fun equalVersionEditReceiptRepairsSummaryAndRetainsListMatchContext() {
+        val original = listDeleteState().items.first().copy(
+            displayTitle = "오래된 카드 제목",
+            noteExcerpt = "오래된 카드 메모",
+            matchType = "alias",
+        )
+        val before = listDeleteState().copy(items = listOf(original))
+        val accepted = generatedEditDetail().copy(
+            version = original.version,
+            displayTitle = "서버 표시 제목",
+            noteExcerpt = "서버 메모 미리보기",
+        )
+
+        val after = before.withReconciledEditSummary(accepted)
+
+        assertEquals("서버 표시 제목", after.items.single().displayTitle)
+        assertEquals("서버 메모 미리보기", after.items.single().cardPreview())
+        assertEquals("alias", after.items.single().matchType)
+        assertEquals(before, after.copy(items = before.items))
+        assertEquals(after, after.withReconciledEditSummary(accepted))
+    }
+
+    @Test
+    fun acceptedEditForMissingItemNeverReinsertsItIntoTheList() {
+        val base = listDeleteState().copy(hasMore = true, nextOffset = 40)
+        val accepted = generatedEditDetail().copy(version = 10)
+        listOf(emptyList(), base.items.filterNot { it.id == accepted.id }).forEach { items ->
+            val before = base.copy(items = items, detail = LibraryDetailState.Loaded(accepted))
+
+            val after = before.withReconciledEditSummary(accepted)
+
+            assertEquals(before, after)
+            assertFalse(after.items.any { it.id == accepted.id })
+        }
+    }
+
+    @Test
+    fun invalidEditDetailVersionsCannotEraseVisibleCard() {
+        val before = listDeleteState()
+        listOf(null, 0L, -1L).forEach { version ->
+            val rejected = generatedEditDetail().copy(
+                version = version,
+                displayTitle = "채택하면 안 되는 제목",
+                noteExcerpt = "채택하면 안 되는 메모",
+            )
+
+            assertEquals(before, before.withReconciledEditSummary(rejected))
+        }
+    }
+
+    @Test
     fun detailSeparatesBodyDescriptionSharedTextMemoAndEmptySources() {
         val detail = LibraryItemDetail("split", url = "https://example.com", bodyText = "원문", description = "설명", sharedText = "공유 글", note = "메모")
         assertEquals(LibrarySourceContent("본문", "원문"), detail.sourceContent())

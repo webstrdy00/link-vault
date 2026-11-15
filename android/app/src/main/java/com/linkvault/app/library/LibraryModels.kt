@@ -603,6 +603,35 @@ data class LibraryItemDetail(
     @SerialName("thumbnail_asset") val thumbnailAsset: LibraryThumbnailAsset? = null,
 )
 
+internal fun LibraryItemSummary.withReconciledDetail(detail: LibraryItemDetail): LibraryItemSummary {
+    if (id != detail.id) return this
+    val isPublishable = shouldPublishLibraryDetail(
+        requestedItemId = id,
+        candidate = LibraryDetailVersion(detail.id, detail.version),
+        knownVersions = listOf(LibraryDetailVersion(id, version)),
+    )
+    if (!isPublishable) return this
+    // Keep the list's matchType: detail receipts do not carry list-query context.
+    return copy(
+        version = detail.version,
+        url = detail.url,
+        displayTitle = detail.displayTitle,
+        source = detail.source,
+        noteExcerpt = detail.noteExcerpt,
+        contentExcerpt = detail.contentExcerpt,
+        categoryRefs = detail.categoryRefs,
+        hasAttachment = detail.hasAttachment,
+        metadataState = detail.metadataState,
+        ocrState = detail.ocrState,
+        classificationState = detail.classificationState,
+        cueState = detail.cueState,
+        cueFlags = detail.cueFlags,
+        createdAt = detail.createdAt,
+        updatedAt = detail.updatedAt,
+        thumbnailAsset = detail.thumbnailAsset,
+    )
+}
+
 fun LibraryItemDetail.editableTitle(): String =
     userTitle?.takeUnless(String::isBlank) ?: compactLibraryTitle(displayTitle, url)
 

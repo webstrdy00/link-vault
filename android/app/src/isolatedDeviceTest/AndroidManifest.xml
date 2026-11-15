@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.linkvault.app.titleiconqa" />
+    </queries>
+    <application>
+        <activity
+            android:name="com.linkvault.app.attachment.UriPermissionFixtureActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:process=":permissionfixture"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <provider
+            android:name="com.linkvault.app.attachment.UriPermissionFixtureProvider"
+            android:authorities="com.linkvault.app.titleiconqa.test.permissionfixture"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            android:process=":permissionfixture">
+            <grant-uri-permission android:path="/synthetic-permission-fixture.png" />
+        </provider>
+    </application>
+</manifest>

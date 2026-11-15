@@ -1894,7 +1894,7 @@ class LibraryViewModel internal constructor(
                     } else {
                         edit
                     }
-                    mutableUiState.value = state.copy(
+                    mutableUiState.value = state.withReconciledEditSummary(publication.item).copy(
                         detail = nextDetail,
                         edit = nextEdit,
                     )
@@ -2345,6 +2345,10 @@ data class LibraryUiState(
     val outboxEntries: List<OutboxEntry> = emptyList(),
     val receiptsAwaitingAcknowledgement: Set<String> = emptySet(),
     val completedCaptureRequestIds: Set<String> = emptySet(),
+)
+
+internal fun LibraryUiState.withReconciledEditSummary(detail: LibraryItemDetail): LibraryUiState = copy(
+    items = items.map { it.withReconciledDetail(detail) },
 )
 
 internal fun LibraryUiState.withListDeleteConfirmation(itemId: String): LibraryUiState {

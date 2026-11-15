@@ -97,6 +97,8 @@ android {
 
     if (providers.gradleProperty("isolatedDeviceTests").orNull == "true") {
         buildTypes.getByName("debug").applicationIdSuffix = ".titleiconqa"
+        sourceSets.getByName("androidTest").java.srcDir("src/isolatedDeviceTest/java")
+        sourceSets.getByName("androidTest").manifest.srcFile("src/isolatedDeviceTest/AndroidManifest.xml")
     }
 
     if (releaseStoreFile != null) {

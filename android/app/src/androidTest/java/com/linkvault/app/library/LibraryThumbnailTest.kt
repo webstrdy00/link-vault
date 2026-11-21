@@ -3,6 +3,7 @@ package com.linkvault.app.library
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Build
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -656,9 +657,14 @@ class LibraryThumbnailTest {
             awaitImage(item.id)
             compose.runOnIdle { loader.close() }
             compose.onNodeWithTag("library-thumbnail-${item.id}").assertDoesNotExist()
+        } catch (failure: Throwable) {
+            // A fatal error during rule teardown can hide the original assertion from JUnit.
+            Log.e("ThumbnailTeardown", "Snapshot removal/restore body failed", failure)
+            throw failure
         } finally {
             loader.close()
         }
+        Log.i("ThumbnailTeardown", "Snapshot removal/restore body completed before rule teardown")
     }
 
     @Test
@@ -673,7 +679,27 @@ class LibraryThumbnailTest {
     @Test
     fun generationAfterAppliedFrameThenDestroyActivity() = invalidateThenDestroy(true, true)
 
-    private fun invalidateThenDestroy(generationChange: Boolean, drain: Boolean) {
+    @Test
+    fun closeWithPendingFrameAfterOwnIdentityRestoreThenDestroyActivity() =
+        invalidateThenDestroy(false, false, restoreOwnIdentity = true)
+
+    @Test
+    fun closeAfterAppliedFrameAfterOwnIdentityRestoreThenDestroyActivity() =
+        invalidateThenDestroy(false, true, restoreOwnIdentity = true)
+
+    @Test
+    fun generationWithPendingFrameAfterOwnIdentityRestoreThenDestroyActivity() =
+        invalidateThenDestroy(true, false, restoreOwnIdentity = true)
+
+    @Test
+    fun generationAfterAppliedFrameAfterOwnIdentityRestoreThenDestroyActivity() =
+        invalidateThenDestroy(true, true, restoreOwnIdentity = true)
+
+    private fun invalidateThenDestroy(
+        generationChange: Boolean,
+        drain: Boolean,
+        restoreOwnIdentity: Boolean = false,
+    ) {
         val image = image()
         val original = item(image)
         val other = item(image, id = "other")
@@ -707,6 +733,22 @@ class LibraryThumbnailTest {
             compose.onNodeWithTag("library-thumbnail-${original.id}", useUnmergedTree = true)
                 .assertIsDisplayed()
             assertEquals(1, calls.get())
+            if (restoreOwnIdentity) {
+                val renderedIdentity = checkNotNull(loader.currentIdentity(original))
+                compose.runOnIdle { loader.updateItems(emptyList()) }
+                compose.onNodeWithTag("library-thumbnail-${original.id}", useUnmergedTree = true)
+                    .assertDoesNotExist()
+                assertNull(loader.currentIdentity(original))
+                assertEquals(1, calls.get())
+                compose.runOnIdle { loader.updateItems(listOf(original)) }
+                awaitImage(original.id)
+                compose.onNodeWithTag("library-thumbnail-${original.id}", useUnmergedTree = true)
+                    .assertIsDisplayed()
+                val restoredIdentity = checkNotNull(loader.currentIdentity(original))
+                assertNotSame(renderedIdentity, restoredIdentity)
+                assertEquals(renderedIdentity.asset, restoredIdentity.asset)
+                assertEquals(2, calls.get())
+            }
             compose.mainClock.autoAdvance = false
             compose.runOnUiThread {
                 if (generationChange) sessions.value = session(generation = GENERATION + 1)
@@ -782,7 +824,7 @@ class LibraryThumbnailTest {
     private fun awaitImage(itemId: String) {
         compose.waitUntil(5_000) {
             compose.onAllNodesWithTag("library-thumbnail-$itemId", useUnmergedTree = true)
-                .fetchSemanticsNodes().isNotEmpty()
+                .fetchSemanticsNodes(atLeastOneRootRequired = false).isNotEmpty()
         }
     }
 

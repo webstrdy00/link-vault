@@ -74,6 +74,16 @@ set CLASSPATH=%APP_HOME%\gradle\wrapper\gradle-wrapper.jar
 
 
 @rem Execute Gradle
+@rem Coordinate finite local builds with the other development projects.
+@rem Other machines keep the standard Gradle invocation below.
+if not exist "%ProgramFiles%\nodejs\node.exe" goto executeNormally
+if not exist "%USERPROFILE%\.local\share\agent-tools\dev-memory.mjs" goto executeNormally
+set "DEV_MEMORY_JAVA_NODE_OPTIONS=%NODE_OPTIONS%"
+set "NODE_OPTIONS="
+"%ProgramFiles%\nodejs\node.exe" "%USERPROFILE%\.local\share\agent-tools\dev-memory.mjs" --label gradle -- "%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -classpath "%CLASSPATH%" org.gradle.wrapper.GradleWrapperMain %*
+goto end
+
+:executeNormally
 "%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -classpath "%CLASSPATH%" org.gradle.wrapper.GradleWrapperMain %*
 
 :end

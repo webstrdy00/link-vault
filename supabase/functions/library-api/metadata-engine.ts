@@ -465,6 +465,7 @@ async function requestOnce(
       !Number.isInteger(response.status) || response.status < 100 ||
       response.status > 599
     ) {
+      response.cancel?.();
       throw new MetadataFetchFailure("INTERNAL_ERROR");
     }
     return response;

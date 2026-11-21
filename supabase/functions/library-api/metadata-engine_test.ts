@@ -225,6 +225,60 @@ Deno.test("a complete keep-alive response releases its owned client after parsin
   assertEquals(owner.destroyErrors, [null]);
 });
 
+Deno.test("invalid response statuses release the owned body and client without reading", async () => {
+  for (const status of [99, 600, 200.5, NaN, Infinity]) {
+    const owner = new FakeResponseOwner();
+    let reads = 0;
+    const body = new Readable({
+      read() {
+        reads++;
+      },
+    });
+    const closed = new Promise<void>((resolve) => body.once("close", resolve));
+    const transport = new FakeTransport([
+      ownUndiciMetadataResponse({
+        statusCode: status,
+        headers: { "content-type": "text/html" },
+        body,
+      }, owner),
+    ]);
+    try {
+      const failure = await metadataFailure(fetchMetadataWithAdapters(
+        "https://example.com/article",
+        fakeAdapters(transport),
+      ));
+      assertEquals(failure.code, "INTERNAL_ERROR");
+      assertEquals(body.destroyed, true, `status ${status}`);
+      assertEquals(reads, 0);
+      assertEquals(owner.destroyErrors.length, 1);
+      assert(owner.destroyErrors[0] instanceof Error);
+    } finally {
+      body.destroy();
+      await closed;
+    }
+  }
+});
+
+Deno.test("response status domain boundaries retain their normal handling", async () => {
+  for (const status of [100, 599]) {
+    let cancellations = 0;
+    const boundaryResponse = response(status);
+    boundaryResponse.cancel = () => cancellations++;
+    const operation = fetchMetadataWithAdapters(
+      "https://example.com/article",
+      fakeAdapters(new FakeTransport([boundaryResponse])),
+    );
+    if (status === 100) {
+      const result = await operation;
+      assertEquals(result.metadata_state, "failed");
+      assertEquals(result.extraction_meta.error_code, "INVALID_CONTENT");
+    } else {
+      assertEquals((await metadataFailure(operation)).code, "NETWORK_ERROR");
+    }
+    assertEquals(cancellations, 1);
+  }
+});
+
 Deno.test("Naver parser decodes entities and prefers real OG metadata", async () => {
   const transport = new FakeTransport([htmlResponse(`<!doctype html>
     <html><head>

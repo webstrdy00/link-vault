@@ -80,8 +80,7 @@ class LocalLibraryIntegrationTest {
             while (!predicate(currentItem())) delay(500)
         }
         fun openEditor() {
-            compose.onNodeWithTag("detail-more").performScrollTo().performClick()
-            compose.onNodeWithText("제목/메모 수정").performClick()
+            compose.onNodeWithTag("detail-edit").performScrollTo().performClick()
             awaitText("변경 사항 저장")
         }
 
@@ -109,7 +108,7 @@ class LocalLibraryIntegrationTest {
 
         openEditor()
         compose.onNodeWithText("제목").assertTextContains("상세 편집 검증")
-        compose.onNodeWithText("내용").assertTextContains(originalContent)
+        compose.onNodeWithTag("detail-edit-content").assertTextContains(originalContent)
         compose.onNodeWithText("수정 취소").performScrollTo().performClick()
         assertEquals(originalContent, currentItem().getValue("note").jsonPrimitive.content)
         openEditor()
@@ -117,15 +116,15 @@ class LocalLibraryIntegrationTest {
         compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
         awaitItem { it.getValue("user_title").jsonPrimitive.content == "수정한 제목" }
         assertEquals(originalContent, currentItem().getValue("note").jsonPrimitive.content)
-        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        awaitText("수정")
         awaitText(originalContent)
         openEditor()
-        compose.onNodeWithText("내용").assertTextContains(originalContent)
+        compose.onNodeWithTag("detail-edit-content").assertTextContains(originalContent)
             .performScrollTo().performTextReplacement("수정한 내용\n줄바꿈도 보존합니다.")
         compose.onNodeWithText("변경 사항 저장").performScrollTo().performClick()
         awaitItem { it.getValue("note").jsonPrimitive.content == "수정한 내용\n줄바꿈도 보존합니다." }
         assertEquals("수정한 제목", currentItem().getValue("user_title").jsonPrimitive.content)
-        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        awaitText("수정")
         awaitText("수정한 내용\n줄바꿈도 보존합니다.")
         scenario.recreate()
         clickRoot("root-library")

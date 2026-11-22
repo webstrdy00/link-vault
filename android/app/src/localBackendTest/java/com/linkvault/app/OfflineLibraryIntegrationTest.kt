@@ -186,8 +186,7 @@ class OfflineLibraryIntegrationTest {
             }.exceptionOrNull()
             assertTrue(rejected is com.linkvault.app.auth.AccountClientException)
             assertEquals(owner, app.accountClient.sessionUserId())
-            compose.onNodeWithTag("detail-more").performScrollTo().performClick()
-            compose.onNodeWithText("제목/메모 수정").performScrollTo().performClick()
+            compose.onNodeWithTag("detail-edit").performScrollTo().performClick()
             val current = app.accountClient.libraryRequest(owner, "/items/${argument("fixtureItemId")}")
             app.accountClient.libraryRequest(
                 expectedOwnerId = owner,
@@ -206,8 +205,7 @@ class OfflineLibraryIntegrationTest {
             compose.onAllNodesWithText("최신 내용 확인")[0].performScrollTo().performClick()
             awaitText("외부에서 먼저 수정한 메모", substring = true)
             compose.onNodeWithText("다시 저장").performScrollTo().performClick()
-            awaitText("제목·내용을 저장했어요.")
-            compose.onNodeWithText("상세로 돌아가기").performScrollTo().performClick()
+            awaitText("재시작 후 편집 검증")
             scenario.recreate()
             awaitText("재시작 후 편집 검증")
             compose.onNodeWithTag("detail-back").performScrollTo().performClick()

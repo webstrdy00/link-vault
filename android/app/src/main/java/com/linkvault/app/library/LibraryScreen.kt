@@ -1622,6 +1622,13 @@ internal fun DetailContent(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            TextButton(
+                onClick = onBeginEdit,
+                enabled = item.version != null && delete == null,
+                modifier = Modifier.testTag("detail-edit"),
+            ) {
+                Text("수정")
+            }
             Box {
                 IconButton(
                     onClick = { showMoreMenu = true },
@@ -1634,14 +1641,6 @@ internal fun DetailContent(
                     expanded = showMoreMenu,
                     onDismissRequest = { showMoreMenu = false },
                 ) {
-                    DropdownMenuItem(
-                        text = { Text("제목/메모 수정") },
-                        onClick = {
-                            showMoreMenu = false
-                            onBeginEdit()
-                        },
-                        enabled = item.version != null,
-                    )
                     if (onManageCategories != null) {
                         DropdownMenuItem(
                             text = { Text("분류 수정") },
@@ -1941,13 +1940,6 @@ private fun EditContent(
                     }
                 }
 
-                is LibraryEditStatus.Saved -> {
-                    Text(
-                        text = status.message,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                }
             }
 
             edit.latestError?.let { message ->
@@ -2052,7 +2044,6 @@ private fun LibraryEditStatus.requestIdForScreen(): String? = when (this) {
     LibraryEditStatus.Idle,
     LibraryEditStatus.Queuing,
     is LibraryEditStatus.Invalid,
-    is LibraryEditStatus.Saved,
     -> null
 }
 

@@ -968,8 +968,7 @@ class LibraryPresentationTest {
             assertEquals(0, editActions)
         }
         compose.onNodeWithTag("detail-manage-categories").assertDoesNotExist()
-        compose.onNodeWithTag("detail-more").performClick()
-        compose.onNodeWithText("제목/메모 수정").performClick()
+        compose.onNodeWithTag("detail-edit").assertTextEquals("수정").performClick()
         compose.runOnIdle { assertEquals(1, editActions) }
     }
 

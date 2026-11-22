@@ -422,7 +422,7 @@ class LibraryViewModel internal constructor(
 
     fun cancelEdit() {
         val edit = mutableUiState.value.edit ?: return
-        if (!edit.status.allowsEditing() && edit.status !is LibraryEditStatus.Saved) return
+        if (!edit.status.allowsEditing()) return
         editJob?.cancel()
         editJob = null
         releaseAllEditRequestOwnership()
@@ -745,15 +745,7 @@ class LibraryViewModel internal constructor(
                             } else {
                                 state.detail
                             },
-                            edit = edit.copy(
-                                expectedVersion = latestVersion,
-                                originalTitle = ready.latest.userTitle,
-                                originalNote = ready.latest.note,
-                                form = ready.latest.editForm(),
-                                baselineForm = ready.latest.editForm(),
-                                submittedPatch = null,
-                                status = LibraryEditStatus.Saved("최신 내용과 이미 같아요."),
-                            ),
+                            edit = null,
                         )
                     }
                     releaseEditRequestOwnership(boundOwner, ready.requestId)
@@ -1881,22 +1873,9 @@ class LibraryViewModel internal constructor(
                     } else {
                         state.detail
                     }
-                    val nextEdit = if (appliesToEditor && edit != null) {
-                        edit.copy(
-                            expectedVersion = publication.item.version ?: edit.expectedVersion,
-                            originalTitle = publication.item.userTitle,
-                            originalNote = publication.item.note,
-                            form = publication.item.editForm(),
-                            baselineForm = publication.item.editForm(),
-                            submittedPatch = null,
-                            status = LibraryEditStatus.Saved("제목·내용을 저장했어요."),
-                        )
-                    } else {
-                        edit
-                    }
                     mutableUiState.value = state.withReconciledEditSummary(publication.item).copy(
                         detail = nextDetail,
-                        edit = nextEdit,
+                        edit = if (appliesToEditor) null else edit,
                     )
                     if (appliesToEditor) {
                         releaseEditRequestOwnership(entry.ownerId, entry.requestId)
@@ -2642,7 +2621,6 @@ sealed interface LibraryEditStatus {
         val latest: LibraryItemDetail,
     ) : LibraryEditStatus
 
-    data class Saved(val message: String) : LibraryEditStatus
 }
 
 enum class LibraryEditBlockReason {
@@ -2664,7 +2642,6 @@ private fun LibraryEditStatus.requestIdOrNull(): String? = when (this) {
     LibraryEditStatus.Idle,
     LibraryEditStatus.Queuing,
     is LibraryEditStatus.Invalid,
-    is LibraryEditStatus.Saved,
     -> null
 }
 

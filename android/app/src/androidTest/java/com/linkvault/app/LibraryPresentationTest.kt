@@ -991,6 +991,28 @@ class LibraryPresentationTest {
     }
 
     @Test
+    fun leavingChangedNoteRequiresExplicitDiscard() {
+        val item = publicTextDetail()
+        val form = LibraryEditForm("제목", "원래 메모")
+        var exits = 0
+        showDetail(
+            item,
+            edit = LibraryEditUiState(
+                itemId = item.id, expectedVersion = 1, originalTitle = form.title,
+                originalNote = form.note, baselineForm = form, form = form.copy(note = "작성 중"),
+            ),
+            onCancelEdit = { exits++ },
+        )
+        compose.onNodeWithTag("detail-back").performScrollTo().performClick()
+        compose.onNodeWithText("계속 수정").performClick()
+        compose.onNodeWithTag("detail-edit-content").assertTextContains("작성 중")
+        compose.runOnIdle { assertEquals(0, exits) }
+        compose.onNodeWithText("수정 취소").performScrollTo().performClick()
+        compose.onNodeWithText("변경 버리기").performClick()
+        compose.runOnIdle { assertEquals(1, exits) }
+    }
+
+    @Test
     fun editorShowsTheFullPrefilledTitleAndContentWithClearEmptyContentHint() {
         val title = "내가 정한 전체 제목 " + "뒷부분도 수정할 수 있어요. ".repeat(8)
         val content = "내가 수정한 내용\n두 번째 줄"
@@ -1619,6 +1641,7 @@ class LibraryPresentationTest {
         onBack: () -> Unit = {},
         onManageCategories: () -> Unit = {},
         onBeginEdit: () -> Unit = {},
+        onCancelEdit: () -> Unit = {},
         edit: LibraryEditUiState? = null,
         attachmentContent: @Composable () -> Unit = {},
     ) {
@@ -1645,7 +1668,7 @@ class LibraryPresentationTest {
                             onEditTitleChange = {},
                             onEditNoteChange = {},
                             onSaveEdit = {},
-                            onCancelEdit = {},
+                            onCancelEdit = onCancelEdit,
                             onLoadLatest = {},
                             onConfirmAgain = {},
                             onBeginDelete = {},

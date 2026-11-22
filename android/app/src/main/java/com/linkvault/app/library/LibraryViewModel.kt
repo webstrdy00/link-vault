@@ -2628,7 +2628,7 @@ enum class LibraryEditBlockReason {
     EXPIRED,
 }
 
-private fun LibraryEditStatus.allowsEditing(): Boolean =
+internal fun LibraryEditStatus.allowsEditing(): Boolean =
     this is LibraryEditStatus.Idle ||
         this is LibraryEditStatus.Invalid ||
         (this is LibraryEditStatus.Failed && requestId == null)

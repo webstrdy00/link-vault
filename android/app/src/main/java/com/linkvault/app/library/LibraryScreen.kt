@@ -1599,8 +1599,34 @@ internal fun DetailContent(
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         if (edit != null) {
+            val canLeave = edit.status.allowsEditing()
+            val dirty = edit.form != edit.baselineForm
+            var confirmDiscard by rememberSaveable(edit.itemId) { mutableStateOf(false) }
+            val requestExit: () -> Unit = {
+                if (canLeave) {
+                    if (dirty) confirmDiscard = true else onCancelEdit()
+                }
+            }
+            BackHandler(onBack = requestExit)
+            if (confirmDiscard && dirty && canLeave) {
+                AlertDialog(
+                    onDismissRequest = { confirmDiscard = false },
+                    title = { Text("수정한 내용을 버릴까요?") },
+                    text = { Text("저장하지 않은 제목과 메모는 사라져요.") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            confirmDiscard = false
+                            onCancelEdit()
+                        }) { Text("변경 버리기") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmDiscard = false }) { Text("계속 수정") }
+                    },
+                )
+            }
             TextButton(
-                onClick = onCancelEdit,
+                onClick = requestExit,
+                enabled = canLeave,
                 modifier = Modifier.align(Alignment.End).testTag("detail-back"),
             ) {
                 Text("상세로 돌아가기")
@@ -1610,7 +1636,7 @@ internal fun DetailContent(
                 onTitleChange = onEditTitleChange,
                 onNoteChange = onEditNoteChange,
                 onSave = onSaveEdit,
-                onCancel = onCancelEdit,
+                onCancel = requestExit,
                 onLoadLatest = onLoadLatest,
                 onConfirmAgain = onConfirmAgain,
             )
@@ -1817,9 +1843,7 @@ private fun EditContent(
     onConfirmAgain: () -> Unit,
 ) {
     val issues = remember(edit.form) { validateLibraryEditForm(edit.form) }
-    val canEdit = edit.status is LibraryEditStatus.Idle ||
-        edit.status is LibraryEditStatus.Invalid ||
-        (edit.status is LibraryEditStatus.Failed && edit.status.requestId == null)
+    val canEdit = edit.status.allowsEditing()
 
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerLow,
